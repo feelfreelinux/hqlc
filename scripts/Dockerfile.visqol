@@ -1,0 +1,47 @@
+# Builder on ubuntu 22.04 for compat
+FROM ubuntu:22.04 AS builder
+
+ENV DEBIAN_FRONTEND=noninteractive
+
+ARG TARGETARCH
+
+RUN apt-get update && apt-get install -y \
+    git \
+    wget \
+    python3 \
+    python3-pip \
+    build-essential \
+    && rm -rf /var/lib/apt/lists/*
+
+# Bazelisk for bazel
+RUN wget https://github.com/bazelbuild/bazelisk/releases/download/v1.28.1/bazelisk-linux-${TARGETARCH} -O /usr/local/bin/bazel && \
+    chmod +x /usr/local/bin/bazel
+
+WORKDIR /build
+
+RUN git clone https://github.com/google/visqol.git .
+
+RUN pip3 install numpy scipy
+
+# Build the C++ binary
+RUN bazel build :visqol -c opt
+
+# Copy the binary and model files into a new 24.04 image
+FROM ubuntu:24.04
+
+ENV DEBIAN_FRONTEND=noninteractive
+
+# Install the necessary runtime library
+RUN apt-get update && apt-get install -y \
+    libstdc++6 \
+    && rm -rf /var/lib/apt/lists/*
+
+WORKDIR /app
+
+# Copy the binary compiled in 22.04 into our new 24.04 environment
+COPY --from=builder /build/bazel-bin/visqol /usr/local/bin/visqol
+
+# Copy the required machine learning model files
+COPY --from=builder /build/model /app/model
+
+ENTRYPOINT ["visqol"]

@@ -1,0 +1,16 @@
+[mapping:hqlc_hot_iram]
+archive: libhqlc.a
+entries:
+    # Hot inner loops in IRAM (fft_scaled is inlined into dct_iv)
+    mdct:dct_iv (noflash)
+    entropy (noflash)
+    # FFT twiddles + digit-rev in DRAM (butterfly inner loop)
+    mdct_tables:lut_fft_twiddle_q31 (noflash_data)
+    mdct_tables:lut_digit_rev (noflash_data)
+    # Pre/post twiddles in DRAM (linear pass per MDCT)
+    mdct_tables:lut_pre_twiddle_q31 (noflash_data)
+    mdct_tables:lut_post_twiddle_q31 (noflash_data)
+    # kbd_window_half_q31: stays in flash (one linear pass per frame)
+    # Entropy tables in DRAM (rANS inner loop)
+    entropy_tables (noflash_data)
+    # hqlc, quant, psy, tns: default flash placement

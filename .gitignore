@@ -1,0 +1,7 @@
+datasets/
+build/
+__pycache__
+.cache/
+.DS_Store
+managed_components/
+test_pcm.h
