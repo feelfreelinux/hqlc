@@ -5,6 +5,7 @@ Usage:
     python scripts/ci_visqol.py                     # test all test-clips/
     python scripts/ci_visqol.py /path/to/track.wav  # score a single track
 """
+
 import os
 import re
 import subprocess
@@ -17,18 +18,29 @@ HQLC_ENC = os.path.join(REPO, "build", "hqlc_enc")
 DOCKER_IMAGE = "visqol-local"
 DOCKERFILE = os.path.join(SCRIPTS, "Dockerfile.visqol")
 BITRATE = 96000
-MIN_MOS = 4.2
+MIN_MOS = 4.5
 
 
 def run_visqol_mono(ref, deg, tmpdir):
     """Run ViSQOL on a mono pair via docker, return MOS-LQO."""
     # Copy files into tmpdir so docker can see them
     r = subprocess.run(
-        ["docker", "run", "--rm", "-v", f"{tmpdir}:/work", DOCKER_IMAGE,
-         "--reference_file", f"/work/{os.path.basename(ref)}",
-         "--degraded_file", f"/work/{os.path.basename(deg)}",
-         "--similarity_to_quality_model", "/app/model/libsvm_nu_svr_model.txt"],
-        capture_output=True, text=True,
+        [
+            "docker",
+            "run",
+            "--rm",
+            "-v",
+            f"{tmpdir}:/work",
+            DOCKER_IMAGE,
+            "--reference_file",
+            f"/work/{os.path.basename(ref)}",
+            "--degraded_file",
+            f"/work/{os.path.basename(deg)}",
+            "--similarity_to_quality_model",
+            "/app/model/libsvm_nu_svr_model.txt",
+        ],
+        capture_output=True,
+        text=True,
     )
     # Parse MOS-LQO from stdout (more reliable than CSV with docker path mapping)
     for line in (r.stdout + r.stderr).splitlines():
@@ -41,9 +53,21 @@ def run_visqol_mono(ref, deg, tmpdir):
 
 def to_mono(src, dst, channel):
     subprocess.run(
-        ["ffmpeg", "-y", "-loglevel", "error", "-i", src,
-         "-af", f"pan=mono|c0=c{channel}", "-acodec", "pcm_s16le", dst],
-        check=True, capture_output=True,
+        [
+            "ffmpeg",
+            "-y",
+            "-loglevel",
+            "error",
+            "-i",
+            src,
+            "-af",
+            f"pan=mono|c0=c{channel}",
+            "-acodec",
+            "pcm_s16le",
+            dst,
+        ],
+        check=True,
+        capture_output=True,
     )
 
 
@@ -66,8 +90,9 @@ def encode_decode(src, tmpdir):
     """Encode through HQLC and return decoded path."""
     name = os.path.splitext(os.path.basename(src))[0]
     decoded = os.path.join(tmpdir, f"{name}_dec.wav")
-    subprocess.run([HQLC_ENC, src, decoded, "-b", str(BITRATE)],
-                   check=True, capture_output=True)
+    subprocess.run(
+        [HQLC_ENC, src, decoded, "-b", str(BITRATE)], check=True, capture_output=True
+    )
     return decoded
 
 
