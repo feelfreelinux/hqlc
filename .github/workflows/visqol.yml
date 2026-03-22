@@ -7,8 +7,6 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v6
-        with:
-          submodules: recursive
 
       - name: Install ffmpeg
         run: sudo apt-get update && sudo apt-get install -y ffmpeg
@@ -24,6 +22,7 @@ jobs:
       - name: Build ViSQOL image
         uses: docker/build-push-action@v7
         with:
+          context: .
           file: scripts/Dockerfile.visqol
           tags: visqol-local
           load: true
