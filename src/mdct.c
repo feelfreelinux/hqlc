@@ -259,45 +259,133 @@ hqlc_error mdct_forward(const uint8_t *restrict prev_pcm,
   return HQLC_OK;
 }
 
-hqlc_error mdct_inverse(const int32_t *restrict spec_q31,
-                        size_t spec_q31_len,
-                        int loss_bits_in,
-                        int32_t *restrict windowed_q31,
-                        size_t windowed_q31_len,
-                        void *restrict scratch,
-                        size_t scratch_len,
-                        int *restrict loss_bits_out) {
-  if (!spec_q31 || !windowed_q31 || !scratch || !loss_bits_out) {
+hqlc_error mdct_inverse_ola(const int32_t *restrict spec_q31,
+                            size_t spec_q31_len,
+                            int loss_bits_in,
+                            mdct_ola_state *restrict ola,
+                            uint8_t *restrict pcm_out,
+                            hqlc_pcm_format fmt,
+                            int stride,
+                            int channel_idx,
+                            void *restrict scratch,
+                            size_t scratch_len) {
+  if (!spec_q31 || !ola || !pcm_out || !scratch) {
     return HQLC_ERR_INVALID_ARG;
   }
   if (spec_q31_len < (size_t)MDCT_N) {
     return HQLC_ERR_BUFFER_TOO_SMALL;
   }
-  if (windowed_q31_len < (size_t)MDCT_BLOCK_LEN) {
-    return HQLC_ERR_BUFFER_TOO_SMALL;
-  }
   if (scratch_len < (size_t)MDCT_SCRATCH_BYTES) {
     return HQLC_ERR_BUFFER_TOO_SMALL;
+  }
+  if (fmt != HQLC_PCM16 && fmt != HQLC_PCM24) {
+    return HQLC_ERR_INVALID_ARG;
+  }
+  if (stride < 1 || channel_idx < 0 || channel_idx >= stride) {
+    return HQLC_ERR_INVALID_ARG;
   }
 
   const int N = MDCT_N;
   const int N2 = N / 2;
 
+  // DCT-IV in scratch (preserves const input)
   int32_t *u = (int32_t *)scratch;
   int32_t *fft_work = &u[N];
-
   memcpy(u, spec_q31, (size_t)N * sizeof(int32_t));
+
   dct_iv(u, fft_work);
 
-  // Unfold + window (>>32 approximation, costs 1 bit)
-  const int32_t *wh = kbd_window_half_q31;
-  for (int n = 0; n < N2; n++) {
-    windowed_q31[n] = (int32_t)((int64_t)u[N2 + n] * wh[n] >> 32);
-    windowed_q31[N2 + n] = -(int32_t)((int64_t)u[N - 1 - n] * wh[N2 + n] >> 32);
-    windowed_q31[N + n] = -(int32_t)((int64_t)u[N2 - 1 - n] * wh[N - 1 - n] >> 32);
-    windowed_q31[N + N2 + n] = -(int32_t)((int64_t)u[n] * wh[N2 - 1 - n] >> 32);
+  // DCT-IV output exponent (before window multiply)
+  int curr_exp = loss_bits_in + MDCT_DCT_BITS - MDCT_MATH_GAIN_BITS;
+
+  // First frame: match overlap exponent so BFP alignment is a no-op
+  if (!ola->has_overlap) {
+    ola->loss_bits = curr_exp;
+    ola->has_overlap = true;
   }
 
-  *loss_bits_out = loss_bits_in + MDCT_DCT_BITS - MDCT_MATH_GAIN_BITS + 1;
+  // BFP alignment between previous and current frames.
+  // Both sides get >>32 window multiply (+1 bit), which factors out.
+  int prev_exp = ola->loss_bits;
+  int common = (prev_exp > curr_exp) ? prev_exp : curr_exp;
+  int ov_shift = (common - prev_exp) + 1; // +1 overflow guard
+  int cu_shift = (common - curr_exp) + 1;
+  int adj = common + 2; // +1 window >>32, +1 overflow guard
+
+  // Fused unfold + window + OLA.
+  // Previous frame's overlap u_prev[0..N2-1] produces windowed[N..2N-1].
+  // Current frame's u[N2..N-1] produces windowed[0..N-1].
+  // We combine them into N PCM samples in one pass.
+  const int32_t *wh = kbd_window_half_q31;
+  const int32_t *prev = ola->overlap;
+
+  if (fmt == HQLC_PCM16) {
+    int16_t *out = (int16_t *)pcm_out;
+    for (int n = 0; n < N2; n++) {
+      // pcm[n] = -prev[N2-1-n]*wh[N-1-n] + u[N2+n]*wh[n]
+      int32_t ov = -(int32_t)((int64_t)prev[N2 - 1 - n] * wh[N - 1 - n] >> 32);
+      int32_t cu = (int32_t)((int64_t)u[N2 + n] * wh[n] >> 32);
+      int32_t o = (ov_shift < 31) ? fxp_shr_rnd_i32(ov, ov_shift) : 0;
+      int32_t c = (cu_shift < 31) ? fxp_shr_rnd_i32(cu, cu_shift) : 0;
+      int32_t y = fxp_sat_i64_to_i32((int64_t)o + c);
+      int32_t pcm_val = (adj > 0) ? fxp_shl_sat_i32(y, adj)
+                                  : fxp_shr_rnd_i32(y, -adj);
+      int32_t pcm16 = (pcm_val >> 16) + ((pcm_val >> 15) & 1);
+      out[n * stride + channel_idx] = pcm_clamp_i16(pcm16);
+
+      // pcm[N2+n] = -prev[n]*wh[N2-1-n] - u[N-1-n]*wh[N2+n]
+      ov = -(int32_t)((int64_t)prev[n] * wh[N2 - 1 - n] >> 32);
+      cu = -(int32_t)((int64_t)u[N - 1 - n] * wh[N2 + n] >> 32);
+      o = (ov_shift < 31) ? fxp_shr_rnd_i32(ov, ov_shift) : 0;
+      c = (cu_shift < 31) ? fxp_shr_rnd_i32(cu, cu_shift) : 0;
+      y = fxp_sat_i64_to_i32((int64_t)o + c);
+      pcm_val = (adj > 0) ? fxp_shl_sat_i32(y, adj)
+                          : fxp_shr_rnd_i32(y, -adj);
+      pcm16 = (pcm_val >> 16) + ((pcm_val >> 15) & 1);
+      out[(N2 + n) * stride + channel_idx] = pcm_clamp_i16(pcm16);
+    }
+  } else {
+    for (int n = 0; n < N2; n++) {
+      int32_t ov = -(int32_t)((int64_t)prev[N2 - 1 - n] * wh[N - 1 - n] >> 32);
+      int32_t cu = (int32_t)((int64_t)u[N2 + n] * wh[n] >> 32);
+      int32_t o = (ov_shift < 31) ? fxp_shr_rnd_i32(ov, ov_shift) : 0;
+      int32_t c = (cu_shift < 31) ? fxp_shr_rnd_i32(cu, cu_shift) : 0;
+      int32_t y = fxp_sat_i64_to_i32((int64_t)o + c);
+      int32_t pcm_val;
+      if (adj > 0) pcm_val = fxp_shl_sat_i32(y, adj);
+      else if (adj < 0) pcm_val = fxp_shr_rnd_i32(y, -adj);
+      else pcm_val = y;
+      pcm_store_q31(pcm_out, fmt, n * stride + channel_idx, pcm_val);
+
+      ov = -(int32_t)((int64_t)prev[n] * wh[N2 - 1 - n] >> 32);
+      cu = -(int32_t)((int64_t)u[N - 1 - n] * wh[N2 + n] >> 32);
+      o = (ov_shift < 31) ? fxp_shr_rnd_i32(ov, ov_shift) : 0;
+      c = (cu_shift < 31) ? fxp_shr_rnd_i32(cu, cu_shift) : 0;
+      y = fxp_sat_i64_to_i32((int64_t)o + c);
+      if (adj > 0) pcm_val = fxp_shl_sat_i32(y, adj);
+      else if (adj < 0) pcm_val = fxp_shr_rnd_i32(y, -adj);
+      else pcm_val = y;
+      pcm_store_q31(pcm_out, fmt, (N2 + n) * stride + channel_idx, pcm_val);
+    }
+  }
+
+  // Save new overlap: u[0..N2-1], normalized for headroom
+  uint32_t or_acc = 0;
+  for (int i = 0; i < N2; i++) {
+    int32_t v = u[i];
+    or_acc |= (uint32_t)(v ^ (v >> 31));
+  }
+  int hr = fxp_headroom_u32(or_acc);
+  if (hr > 0) {
+    for (int i = 0; i < N2; i++) {
+      ola->overlap[i] = u[i] << hr;
+    }
+  } else {
+    for (int i = 0; i < N2; i++) {
+      ola->overlap[i] = u[i];
+    }
+  }
+  ola->loss_bits = curr_exp - hr;
+
   return HQLC_OK;
 }

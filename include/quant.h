@@ -3,43 +3,49 @@
 
 #include <stdint.h>
 
+#include "fxp.h"
+
 #ifdef __cplusplus
 extern "C" {
 #endif
 
-// Params of the quantized gain codes
+// Gain code: 7-bit, 8 codes per octave, bias at gain=1.0
 #define QUANT_GAIN_BITS     7
-#define QUANT_GAIN_Q        8  // codes per octave
-#define QUANT_GAIN_BIAS     48 // code for gain=1.0
+#define QUANT_GAIN_Q        8
+#define QUANT_GAIN_BIAS     27
 #define QUANT_GAIN_MAX_CODE 127
-#define QUANT_GAIN_RC_MAX   72 // GAIN_BIAS + GAIN_Q * 3
+#define QUANT_GAIN_RC_MAX   67  // GAIN_BIAS + GAIN_Q * 5
 
-// Combined exponent offset: 2*PSY_EXP_INDEX_BIAS - QUANT_GAIN_BIAS.
-// E = 2*exp_idx - gain_code - QUANT_EXP_OFFSET encodes the quantizer
-// step size as step = 2^(E/8) * BW[b].
-#define QUANT_EXP_OFFSET 38
+// Step exponent offset: E = 2*exp - gain_code - 59
+// step = 2^(E/8), split into octave + fractional pow2 LUT
+#define QUANT_EXP_OFFSET 59
 
-// Quantizer Q-format shift: Q31(spec) + Q28(inv_step) - Q8(output) = 51
+// Q-format: Q31(spec) * Q28(inv_step) needs TOTAL_Q bits of shift to get Q8
 #define QUANT_TOTAL_Q 51
 
-// Deadzone: coefficients below 0.65 quantize to zero, rounding bias = 1 - 0.65 = 0.35
+// Deadzone: |scaled| < 0.65 → zero. Rounding bias = 1 - 0.65 = 0.35
 #define QUANT_DZ_THRESH_Q8 ((int32_t)(0.65 * 256 + 1)) // ceil(0.65 * 256)
 #define QUANT_DZ_BIAS_Q8   Q8(0.35)
 
-// 2^(f/8) for f=0..7, in Q30
+// Centroid: MMSE-optimal reconstruction offset for Laplacian source
+#define QUANT_CENTROID 0.15
+
+// 2^(f/8) for f=0..7, Q30 — shared between quantizer and psy
 extern const int32_t quant_pow2_eighth_q30[8];
 
-// 1 / BW[b] in Q28, where BW[b] = log2(bin_count[b]) / log2(81), clipped to [0.10, 1.0]
-extern const int32_t quant_inv_bw_q28[20];
+/**
+ * @brief Interpolate 20 coarse-band exponent indices to per-bin values.
+ *
+ * Output: bin_exp[PSY_ACTIVE_BINS]. Caller may reuse across quant/NF calls
+ * for the same channel to avoid redundant computation.
+ */
+void quant_interp_bin_exp(const int32_t *exp_indices, int32_t *bin_exp);
 
 /**
- * @brief Quantize spectral coefficients to int symbols
+ * @brief Forward quantizer: MDCT spectrum → integer symbols.
  *
- * @param spec_q31    MDCT coefficients
- * @param loss_bits   BFP exponent of the coeffs
- * @param exp_indices Exponent indices from the psy
- * @param gain_code   Gain code to quantize under
- * @param quant_out   Output for the quantized symbols
+ * Per bin: scaled = |X| / step, then deadzone + round.
+ * step = 2^((2*interp_exp - gain_code - 59) / 8).
  */
 void quant_forward(const int32_t *spec_q31,
                    int loss_bits,
@@ -48,52 +54,52 @@ void quant_forward(const int32_t *spec_q31,
                    int16_t *quant_out);
 
 /**
- * @brief Reconstruct spectral coefficients from quantized symbols
+ * @brief Forward quantizer fused with NF estimation.
  *
- * @param quant_in      Quantized symbol
- * @param exp_indices   Exponent indices
- * @param gain_code     Gain code to dequant from
- * @param spec_q31      Output reconstructed spectral coefficients
- * @param loss_bits_out Output BFP exponent for the reconstructed signal
- * @param work          int64_t * HQLC_FRAME_SAMPLES scratch buffer.
+ * Same as quant_forward but also computes the noise factor in the same pass,
+ * avoiding a redundant interp_bin_exp + scale_to_q8 sweep.
+ * Returns the 3-bit noise factor (0..7).
+ */
+int quant_forward_nf(const int32_t *spec_q31,
+                     int loss_bits,
+                     const int32_t *exp_indices,
+                     int gain_code,
+                     int16_t *quant_out);
+
+/**
+ * @brief Inverse quantizer: integer symbols → reconstructed spectrum.
+ *
+ * Per bin: x_hat = sign(q) * (|q| + 0.15) * step.
+ * Output is Q31 BFP; loss_bits_out gives the exponent.
+ * Uses flat per-band exponents (same as encoder quantizer).
  */
 void quant_inverse(const int16_t *quant_in,
                    const int32_t *exp_indices,
                    int gain_code,
                    int32_t *spec_q31,
-                   int *loss_bits_out,
-                   int64_t *work);
+                   int *loss_bits_out);
 
 /**
- * @brief Encode a floating-point gain value to a gain code.
- *
- * @param gain Linear gain value.
- * @return Gain code
+ * @brief Encode a floating-point gain to a 7-bit gain code.
  */
 int quant_gain_encode(float gain);
 
-// Noise fill seed bias
+// Noise fill seed
 #define NF_SEED_BIAS 0x9E3779B9u
 
 /**
- * @brief Compute noise-fill amplitude, in the BFP loss domain
+ * @brief Fill runs of zeros with shaped pseudorandom noise.
  *
- * @param exp_idx  Band exponent index
- * @param loss_bits BFP exponent for the frame
- * @return NF amplitude in Q31
+ * Runs of >4 consecutive zeros get filled at ±nf_amp * step.
+ * Operates on the already-dequantized BFP spectrum.
+ * Uses flat per-band exponents (same as encoder quantizer).
  */
-int32_t nf_compute_amp_q31(int exp_idx, int loss_bits);
-
-/**
- * @brief Fill a spectral band with L1-normalized LCG noise
- *
- * @param spec        Spectral coefficient buffer
- * @param start       First bin of the band
- * @param end         Last bin of the band
- * @param nf_amp_q31  Noise-fill amplitude in Q31
- * @param seed        LCG seed value
- */
-void nf_fill_band(int32_t *spec, int start, int end, int32_t nf_amp_q31, uint32_t seed);
+void nf_run_length_fill(int16_t *quant,
+                        const int32_t *exp_indices,
+                        int gain_code,
+                        int nf,
+                        int32_t *spec_q31,
+                        int *loss_bits_io);
 
 #ifdef __cplusplus
 }

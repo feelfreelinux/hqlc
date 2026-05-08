@@ -14,8 +14,21 @@ extern "C" {
 #define RANS_M_BITS    10
 #define RANS_L         (1u << 16)
 #define RANS_MAX_SYM   16 // 0-14 magnitudes + 15 ESC
-#define RANS_LUT_NBINS 32
 #define RANS_N_PAIRS   10
+
+// Division-pipeline: 12 alpha x 4 activity = 48 tables
+#define RANS_ALPHA_NBINS   12
+#define RANS_ACT_NBINS     4
+#define RANS_DIV_NTABLES   48
+#define RANS_ALPHA_LO_Q8   (-1271)
+#define RANS_ALPHA_HI_Q8   1375
+#define RANS_ALPHA_RANGE_Q8 2647
+
+// 48 division-pipeline rANS tables
+extern const uint16_t rans_div_freq[RANS_DIV_NTABLES][RANS_MAX_SYM];
+extern const uint32_t rans_div_rcp[RANS_DIV_NTABLES][RANS_MAX_SYM];
+extern const int16_t rans_div_cost_q8[RANS_DIV_NTABLES][RANS_MAX_SYM];
+extern const int16_t rans_log2_sigma_q8[RANS_N_PAIRS];
 
 // Zigzag encoding, mapping signed integers to unsigned for variable-length coding
 static inline uint32_t zigzag_enc(int32_t v) {
@@ -215,22 +228,6 @@ typedef struct {
 void rans_enc_init(hqlc_rans_enc *enc, uint8_t *buf, size_t cap);
 
 /**
- * @brief Encode one symbol into the rANS stream. Essentially unused, as the codec uses
- * specialized versions - but kept for API.
- *
- * @param enc  Encoder state
- * @param sym  Symbol to encode
- * @param freq Symbol frequency table
- * @param cf   Cumulative frequency table
- * @param rcp  Reciprocal table for division free encoding
- */
-void rans_enc_put(hqlc_rans_enc *enc,
-                  uint8_t sym,
-                  const uint16_t *freq,
-                  const uint16_t *cf,
-                  const uint32_t *rcp);
-
-/**
  * @brief Flush the rANS encoder and return the encoded byte count
  *
  * @param enc Encoder state
@@ -248,24 +245,34 @@ size_t rans_enc_flush(hqlc_rans_enc *enc);
 void rans_dec_init(hqlc_rans_dec *dec, const uint8_t *buf, size_t len);
 
 /**
- * @brief Decode one symbol from the rANS stream
+ * @brief Build one band's rANS table from alpha bin and activity.
  *
- * @param dec  Decoder state
- * @param freq Symbol frequency table
- * @param cf   Cumulative frequency table
- * @param nsym Number of symbols
- * @return Decoded symbol
+ * @param alpha_bin Alpha bin [0..11] from gain and pair sigma
+ * @param activity  Activity bin [0..3] from previous band's nonzero fraction
+ * @param out       Output band table
  */
-uint8_t
-rans_dec_get(hqlc_rans_dec *dec, const uint16_t *freq, const uint16_t *cf, int nsym);
+/**
+ * @brief Compute rANS symbol cost in Q8 fractional bits from frequency.
+ */
+int16_t rans_freq_cost_q8(uint16_t freq_val);
 
 /**
- * @brief Build per-band rANS frequency tables for a given gain code
+ * @brief Compute alpha bin for a band given a gain code.
  *
+ * @param band      Band index [0..19]
  * @param gain_code Global gain code
- * @param tables    Output array of RANS_N_PAIRS band tables
+ * @return Alpha bin [0..11]
  */
-void rans_build_band_tables(int gain_code, hqlc_rans_band_tables tables[RANS_N_PAIRS]);
+int rans_alpha_bin(int band, int gain_code);
+
+/**
+ * @brief Compute activity bin from previous band's decoded coefficients.
+ *
+ * @param quant     Quantized coefficients (one channel)
+ * @param band      Current band index
+ * @return Activity bin [0..3]
+ */
+int rans_activity_bin(const int16_t *quant, int band);
 
 /**
  * @brief Estimate the rANS coding cost of a quantized coefficient in Q8 bits
@@ -290,19 +297,19 @@ int32_t rans_coeff_cost_q8(const hqlc_rans_band_tables *tbl, int16_t value);
 size_t rans_encode_coeffs(const int16_t *quant,
                           const uint8_t *nf_mask,
                           int n_ch,
-                          const hqlc_rans_band_tables *tables,
+                          int gain_code,
                           uint8_t *out,
                           size_t out_cap);
 
 /**
  * @brief Decode quantized spectral coefficients from a byte buffer
  *
- * @param data     Input byte buffer
- * @param len      Input buffer length in bytes
+ * @param data      Input byte buffer
+ * @param len       Input buffer length in bytes
  * @param quant_out Output quantized coefficients
- * @param nf_mask  Noise-fill mask per band
- * @param n_ch     Number of channels
- * @param tables   Per-band rANS tables
+ * @param nf_mask   Noise-fill mask per band
+ * @param n_ch      Number of channels
+ * @param gain_code Gain code for alpha-activity table selection
  * @return true on success, false on error
  */
 bool rans_decode_coeffs(const uint8_t *data,
@@ -310,7 +317,7 @@ bool rans_decode_coeffs(const uint8_t *data,
                         int16_t *quant_out,
                         const uint8_t *nf_mask,
                         int n_ch,
-                        const hqlc_rans_band_tables *tables);
+                        int gain_code);
 
 #ifdef __cplusplus
 }

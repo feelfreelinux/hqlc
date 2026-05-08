@@ -21,11 +21,13 @@ extern "C" {
 // Enough scratch space for MDCT + overlap-add
 #define MDCT_SCRATCH_BYTES ((MDCT_N + 2 * MDCT_FFT_N) * (int)sizeof(int32_t))
 
-// Overlap-add state for the decoder IMDCT
+// Overlap-add state for the decoder IMDCT.
+// Stores N/2 raw DCT-IV values from the previous frame;
+// the window multiply and OLA happen together in mdct_inverse_ola().
 typedef struct {
   bool has_overlap;
-  int loss_td_bits;
-  int32_t overlap_q31[MDCT_N];
+  int loss_bits;                        // BFP exponent of stored overlap
+  int32_t overlap[MDCT_N / 2];         // first half of previous DCT-IV output
 } mdct_ola_state;
 
 static inline void mdct_ola_init(mdct_ola_state *state) {
@@ -33,9 +35,9 @@ static inline void mdct_ola_init(mdct_ola_state *state) {
     return;
   }
   state->has_overlap = false;
-  state->loss_td_bits = 0;
-  for (int i = 0; i < MDCT_N; i++) {
-    state->overlap_q31[i] = 0;
+  state->loss_bits = 0;
+  for (int i = 0; i < MDCT_N / 2; i++) {
+    state->overlap[i] = 0;
   }
 }
 
@@ -68,26 +70,33 @@ hqlc_error mdct_forward(const uint8_t *restrict prev_pcm,
                         int *restrict loss_bits_out);
 
 /**
- * @brief Inverse MDCT, spectral coefficients to windowed time samples (Q31
- * BFP).
+ * @brief Fused inverse MDCT + overlap-add + PCM write.
  *
- * @param spec_q31         Input spectral coefficients, MDCT_N elements
- * @param spec_q31_len     spec_q31 count
- * @param loss_bits_in     BFP exponent of the input spectrum
- * @param windowed_q31     Output windowed samples MDCT_BLOCK_LEN elements.
- * @param windowed_q31_len Capacity of windowed_q31 in elements.
- * @param scratch          scratch buffer
- * @param scratch_len      scratch buffer bytes
- * @param loss_bits_out    BFP exponent of the output time samples
+ * Performs DCT-IV, then combines the windowed result with the previous frame's
+ * overlap in a single pass, writing interleaved PCM directly.  Replaces the
+ * old mdct_inverse() + manual OLA pattern.
+ *
+ * @param spec_q31     Input spectral coefficients, MDCT_N elements
+ * @param spec_q31_len spec_q31 count
+ * @param loss_bits_in BFP exponent of the input spectrum
+ * @param ola          Overlap-add state (updated in-place)
+ * @param pcm_out      Output PCM buffer (interleaved)
+ * @param fmt          PCM sample format (HQLC_PCM16 or HQLC_PCM24)
+ * @param stride       Channel interleave stride (total channels)
+ * @param channel_idx  Channel index to write
+ * @param scratch      Scratch buffer (MDCT_SCRATCH_BYTES)
+ * @param scratch_len  Scratch buffer bytes
  */
-hqlc_error mdct_inverse(const int32_t *restrict spec_q31,
-                        size_t spec_q31_len,
-                        int loss_bits_in,
-                        int32_t *restrict windowed_q31,
-                        size_t windowed_q31_len,
-                        void *restrict scratch,
-                        size_t scratch_len,
-                        int *restrict loss_bits_out);
+hqlc_error mdct_inverse_ola(const int32_t *restrict spec_q31,
+                            size_t spec_q31_len,
+                            int loss_bits_in,
+                            mdct_ola_state *restrict ola,
+                            uint8_t *restrict pcm_out,
+                            hqlc_pcm_format fmt,
+                            int stride,
+                            int channel_idx,
+                            void *restrict scratch,
+                            size_t scratch_len);
 
 #ifdef __cplusplus
 }

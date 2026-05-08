@@ -7,7 +7,7 @@
 
 // TNS parameters
 #define TNS_ATTACK_RATIO 2
-#define TNS_MAX_K_Q30    Q30(0.85)
+#define TNS_MAX_K_Q30    Q30(0.75)
 #define TNS_K_THRESH_Q30 Q30(0.1)
 #define TNS_K_CLAMP_Q30  Q30(0.999)
 
@@ -66,7 +66,7 @@ bool tns_detect_transient(const uint8_t *prev_pcm,
                           hqlc_pcm_format fmt,
                           int stride,
                           int ch) {
-  uint64_t e1 = 1; // +1 avoids div-by-zero
+  uint64_t e1 = 1;
   uint64_t e2 = 0;
 
   if (fmt == HQLC_PCM16) {
@@ -103,7 +103,6 @@ static void tns_autocorrelation(const int32_t *spec, int n, int64_t *r) {
       r[k] += (int64_t)si * spec[i + k];
     }
   }
-  // Tail: guard against out-of-bounds reads
   for (int i = main_end; i < n; i++) {
     int32_t si = spec[i] >> 9;
     for (int k = 0; k <= TNS_MAX_ORDER && i + k < n; k++) {
@@ -189,7 +188,6 @@ static int tns_levinson_durbin(const int64_t *r_raw, int max_order, int32_t *k_o
 
 void tns_analyze(const int32_t *spec_q31, tns_info *out) {
   int64_t r[TNS_MAX_ORDER + 1];
-  // Autocorrelation on HF bins only (above TNS_START_BIN)
   tns_autocorrelation(spec_q31 + TNS_START_BIN, HQLC_FRAME_SAMPLES - TNS_START_BIN, r);
 
   int32_t k_raw[TNS_MAX_ORDER];
@@ -198,7 +196,6 @@ void tns_analyze(const int32_t *spec_q31, tns_info *out) {
     return;
   }
 
-  // Clip, quantize, and dequantize
   int8_t q_lar[TNS_MAX_ORDER];
   int32_t k_dq[TNS_MAX_ORDER];
   for (int i = 0; i < order; i++) {
@@ -208,7 +205,6 @@ void tns_analyze(const int32_t *spec_q31, tns_info *out) {
     k_dq[i] = tns_dequant_k(q_lar[i]);
   }
 
-  // Trim trailing zeros
   while (order > 0 && q_lar[order - 1] == 0) {
     order--;
   }

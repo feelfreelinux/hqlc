@@ -2,6 +2,7 @@
 #include "entropy_tables.h"
 #include "fxp.h"
 #include "hqlc.h"
+#include "hqlc_bench.h"
 #include "psy.h"
 #include "quant.h"
 
@@ -71,36 +72,11 @@ void rans_enc_init(hqlc_rans_enc *enc, uint8_t *buf, size_t cap) {
   enc->pos = cap; // write cursor starts at end
 }
 
-void rans_enc_put(hqlc_rans_enc *enc,
-                  uint8_t sym,
-                  const uint16_t *freq,
-                  const uint16_t *cf,
-                  const uint32_t *rcp) {
-  uint16_t f = freq[sym];
-  uint32_t upper = (uint32_t)f << RANS_RENORM_SHIFT;
-  uint32_t state = enc->state;
-
-  while (state >= upper) {
-    enc->buf[--enc->pos] = (uint8_t)(state & 0xFF);
-    state >>= 8;
-  }
-
-  uint32_t q = (uint32_t)(((uint64_t)state * rcp[sym]) >> 32);
-  uint32_t r = state - q * f;
-  if (r >= f) {
-    q++;
-    r -= f;
-  }
-
-  enc->state = (q << RANS_M_BITS) + r + cf[sym];
-}
-
 // Specialized sign encode for the fixed {RANS_M/2, RANS_M/2} split used by the sign bit.
 // This path is fully shift/mask based, so it avoids general freq/cf/rcp table lookups.
 static inline void rans_enc_sign(hqlc_rans_enc *enc, uint8_t sign) {
   uint32_t state = enc->state;
 
-  // Renorm threshold for the fixed sign distribution {RANS_M/2, RANS_M/2}.
   if (state >= RANS_SIGN_RENORM_UPPER) {
     enc->buf[--enc->pos] = (uint8_t)(state & 0xFF);
     state >>= RANS_BYTE_BITS;
@@ -110,9 +86,6 @@ static inline void rans_enc_sign(hqlc_rans_enc *enc, uint8_t sign) {
     }
   }
 
-  // For the fixed {RANS_SIGN_FREQ, RANS_SIGN_FREQ} split:
-  //   q = state / RANS_SIGN_FREQ = state >> RANS_SIGN_SLOT_SHIFT
-  //   r = state % RANS_SIGN_FREQ = state & RANS_SIGN_SLOT_MASK
   enc->state = ((state >> RANS_SIGN_SLOT_SHIFT) << RANS_M_BITS) +
                (state & RANS_SIGN_SLOT_MASK) + (sign ? RANS_SIGN_FREQ : 0u);
 }
@@ -173,31 +146,6 @@ void rans_dec_init(hqlc_rans_dec *dec, const uint8_t *buf, size_t len) {
   }
 }
 
-uint8_t
-rans_dec_get(hqlc_rans_dec *dec, const uint16_t *freq, const uint16_t *cf, int nsym) {
-  uint32_t slot = dec->state & (RANS_M - 1);
-
-  int lo = 0, hi = nsym;
-  while (lo + 1 < hi) {
-    int mid = (lo + hi) >> 1;
-    if (cf[mid] <= slot) {
-      lo = mid;
-    } else {
-      hi = mid;
-    }
-  }
-  uint8_t s = (uint8_t)lo;
-
-  uint16_t f = freq[s];
-  dec->state = (uint32_t)f * (dec->state >> RANS_M_BITS) + slot - cf[s];
-
-  while (dec->state < RANS_L && dec->pos < dec->len) {
-    dec->state = (dec->state << 8) | dec->buf[dec->pos++];
-  }
-
-  return s;
-}
-
 // Specialized sign decode for the fixed {RANS_SIGN_FREQ, RANS_SIGN_FREQ} split.
 static inline uint8_t rans_dec_sign(hqlc_rans_dec *dec) {
   uint32_t state = dec->state;
@@ -248,7 +196,7 @@ rans_dec_sym(hqlc_rans_dec *dec, const uint16_t *freq, const uint16_t *cf) {
 
 // Estimate coding cost of a symbol at a frequency, essentially a log2 approximation with
 // a LUT
-static inline int16_t rans_freq_cost_q8(uint16_t freq_val) {
+int16_t rans_freq_cost_q8(uint16_t freq_val) {
   if (freq_val == 0) {
     return RANS_MAX_COST_Q8; // impossible symbol: clamp to the max finite cost
   }
@@ -271,77 +219,61 @@ static inline int16_t rans_freq_cost_q8(uint16_t freq_val) {
 // Sign coding uses the fixed uniform split {RANS_M/2, RANS_M/2} over total mass RANS_M.
 // Specialized rans_enc_sign / rans_dec_sign use shift-based arithmetic directly, so no
 // freq/cf/rcp tables are needed at runtime.
-void rans_build_band_tables(int gain_code, hqlc_rans_band_tables tables[RANS_N_PAIRS]) {
-  // inv_gain = 2^((QUANT_GAIN_BIAS - gain_code) / 8)
-  // alpha[b] = K * BW[b] * inv_gain
-  int gc = gain_code;
+int rans_alpha_bin(int band, int gain_code) {
+  // log2(alpha) = log2(gain) + log2(sigma_pair)
+  // log2(gain) = (gc - GAIN_BIAS) / 8, in Q8: (gc - GAIN_BIAS) * 32
+  int pair = band >> 1;
+  int32_t log2_alpha_q8 = (gain_code - QUANT_GAIN_BIAS) * 32 + rans_log2_sigma_q8[pair];
+  // Linear map to [0, ALPHA_NBINS): bin = (la - LO) * 12 / RANGE
+  int32_t bin = (int32_t)(log2_alpha_q8 - RANS_ALPHA_LO_Q8) * RANS_ALPHA_NBINS /
+                RANS_ALPHA_RANGE_Q8;
+  if (bin < 0) {
+    bin = 0;
+  }
+  if (bin >= RANS_ALPHA_NBINS) {
+    bin = RANS_ALPHA_NBINS - 1;
+  }
+  return (int)bin;
+}
 
-  // Clamp to range where LUT alpha stays in bounds
-  // the 21 and 67 are derived from the gain_code range
-  gc = fxp_clamp_i32(gc, 21, 67);
-
-  int neg_E = QUANT_GAIN_BIAS - gc;
-  int int_part = (neg_E >= 0) ? (neg_E / 8) : ((neg_E - 7) / 8);
-  int frac = neg_E - 8 * int_part;
-  int32_t inv_gain_m_q30 = quant_pow2_eighth_q30[frac];
-
-  // shift to go from Q16 * Q30 = Q46 down to Q16. That'd be 30, but inv_gain has extra
-  // 2^int_part factor, so shift = 30 - int_part.
-  int shift = 30 - int_part;
-
-  for (int pi = 0; pi < RANS_N_PAIRS; pi++) {
-    int b0 = 2 * pi;
-    int b1 = 2 * pi + 1;
-
-    // Per-band alpha in Q16
-    uint32_t a0_q16, a1_q16;
-    if (shift > 0) {
-      a0_q16 = (uint32_t)(((int64_t)rans_k_bw_q16[b0] * inv_gain_m_q30) >> shift);
-      a1_q16 = (uint32_t)(((int64_t)rans_k_bw_q16[b1] * inv_gain_m_q30) >> shift);
-    } else {
-      a0_q16 = (uint32_t)(((int64_t)rans_k_bw_q16[b0] * inv_gain_m_q30) << (-shift));
-      a1_q16 = (uint32_t)(((int64_t)rans_k_bw_q16[b1] * inv_gain_m_q30) << (-shift));
-    }
-
-    // Pair alpha = BW-weighted mean of band alphas
-    // pair_alpha = (a0 * bw0 + a1 * bw1) / (bw0 + bw1)
-    // All in Q16, bw values are small integers
-    int bw0 = psy_band_edges[b0 + 1] - psy_band_edges[b0];
-    int bw1 = psy_band_edges[b1 + 1] - psy_band_edges[b1];
-    uint32_t pair_alpha_q16 =
-        (uint32_t)((uint64_t)a0_q16 * bw0 + (uint64_t)a1_q16 * bw1) /
-        (uint32_t)(bw0 + bw1);
-
-    // Binary search alpha_edges for bin index
-    int bin = 0;
-    {
-      int lo = 0, hi = RANS_LUT_NBINS;
-      while (lo + 1 < hi) {
-        int mid = (lo + hi) >> 1;
-        if (rans_lut_alpha_edges_q16[mid] <= pair_alpha_q16) {
-          lo = mid;
-        } else {
-          hi = mid;
-        }
-      }
-      bin = lo;
-      if (bin >= RANS_LUT_NBINS) {
-        bin = RANS_LUT_NBINS - 1;
-      }
-    }
-
-    // One table per pair (paired bands share the same distribution)
-    hqlc_rans_band_tables *t = &tables[pi];
-
-    // Copy freq + precomputed rcp from LUT, build cf[], compute cost_q8[]
-    t->cf[0] = 0;
-    for (int s = 0; s < RANS_MAX_SYM; s++) {
-      t->freq[s] = rans_lut_freq[bin][s];
-      t->cf[s + 1] = t->cf[s] + t->freq[s];
-      t->cost_q8[s] = rans_freq_cost_q8(t->freq[s]);
-      t->rcp[s] = rans_lut_rcp[bin][s];
+int rans_activity_bin(const int16_t *quant, int band) {
+  if (band == 0) {
+    return 0;
+  }
+  int s = psy_band_edges[band - 1];
+  int e = psy_band_edges[band];
+  int w = e - s;
+  int nz = 0;
+  for (int i = s; i < e; i++) {
+    if (quant[i] != 0) {
+      nz++;
     }
   }
+  // nz/w thresholds: <0.1→0, <0.3→1, <0.6→2, else 3
+  if (nz * 10 < w) {
+    return 0;
+  }
+  if (nz * 10 < 3 * w) {
+    return 1;
+  }
+  if (nz * 10 < 6 * w) {
+    return 2;
+  }
+  return 3;
+}
+
+static inline int rans_table_idx(int alpha_bin, int activity) {
+  int tidx = alpha_bin * RANS_ACT_NBINS + activity;
+  if (tidx < 0) tidx = 0;
+  if (tidx >= RANS_DIV_NTABLES) tidx = RANS_DIV_NTABLES - 1;
+  return tidx;
+}
+
+// Build cf (cumulative frequencies) from freq inline
+static inline void build_cf(const uint16_t *freq, uint16_t *cf) {
+  cf[0] = 0;
+  for (int s = 0; s < RANS_MAX_SYM; s++)
+    cf[s + 1] = cf[s] + freq[s];
 }
 
 int32_t rans_coeff_cost_q8(const hqlc_rans_band_tables *tbl, int16_t value) {
@@ -373,37 +305,45 @@ int32_t rans_coeff_cost_q8(const hqlc_rans_band_tables *tbl, int16_t value) {
 size_t rans_encode_coeffs(const int16_t *quant,
                           const uint8_t *nf_mask,
                           int n_ch,
-                          const hqlc_rans_band_tables *tables,
+                          int gain_code,
                           uint8_t *out,
                           size_t out_cap) {
   hqlc_rans_enc enc;
   rans_enc_init(&enc, out, out_cap);
 
-  // Due to nature of rANS, we encode in reverse order. Backward channels, bands and bins.
-  // For each coefficient: put sign, then overflow, then magnitude (reversed).
-  // Decoder reads forward naturally
+  // rANS encodes in reverse order; decoder reads forward.
   for (int ch = n_ch - 1; ch >= 0; ch--) {
+    const int16_t *ch_q = &quant[ch * HQLC_FRAME_SAMPLES];
+
     for (int b = PSY_N_BANDS - 1; b >= 0; b--) {
       if (nf_mask[ch * PSY_N_BANDS + b]) {
         continue;
       }
 
-      const hqlc_rans_band_tables *tbl = &tables[b >> 1];
+      // Per-band table from alpha + activity (decoder-symmetric)
+      HQLC_BENCH_BEGIN();
+      int abin = rans_alpha_bin(b, gain_code);
+      int act = rans_activity_bin(ch_q, b);
+      int tidx = rans_table_idx(abin, act);
+      const uint16_t *freq = rans_div_freq[tidx];
+      const uint32_t *rcp = rans_div_rcp[tidx];
+      uint16_t cf[RANS_MAX_SYM + 1];
+      build_cf(freq, cf);
+      HQLC_BENCH_END(HQLC_BENCH_ENC_RANS_TBL);
+
       int s = psy_band_edges[b];
       int e = psy_band_edges[b + 1];
 
       for (int i = e - 1; i >= s; i--) {
-        int16_t v = quant[ch * HQLC_FRAME_SAMPLES + i];
+        int16_t v = ch_q[i];
         int mag = (v < 0) ? -v : v;
         uint8_t sym =
             (mag < RANS_MAX_SYM - 1) ? (uint8_t)mag : (uint8_t)(RANS_MAX_SYM - 1);
 
-        // Sign (if nonzero, put last so it's decoded first)
         if (v != 0) {
           rans_enc_sign(&enc, (v > 0) ? 0 : 1);
         }
 
-        // Overflow: EG(0) coding via sign channel
         if (mag >= RANS_MAX_SYM - 1) {
           int overflow = mag - (RANS_MAX_SYM - 1);
           int nbits = 0;
@@ -415,7 +355,6 @@ size_t rans_encode_coeffs(const int16_t *quant,
             }
           }
           int val = overflow + 1;
-
           for (int bit_idx = 0; bit_idx < nbits; bit_idx++) {
             rans_enc_sign(&enc, (val >> bit_idx) & 1);
           }
@@ -425,8 +364,7 @@ size_t rans_encode_coeffs(const int16_t *quant,
           }
         }
 
-        // Magnitude symbol
-        rans_enc_sym(&enc, sym, tbl->freq, tbl->cf, tbl->rcp);
+        rans_enc_sym(&enc, sym, freq, cf, rcp);
       }
     }
   }
@@ -439,7 +377,7 @@ bool rans_decode_coeffs(const uint8_t *data,
                         int16_t *quant_out,
                         const uint8_t *nf_mask,
                         int n_ch,
-                        const hqlc_rans_band_tables *tables) {
+                        int gain_code) {
   if (len == 0) {
     memset(quant_out, 0, (size_t)n_ch * HQLC_FRAME_SAMPLES * sizeof(int16_t));
     return true;
@@ -449,27 +387,34 @@ bool rans_decode_coeffs(const uint8_t *data,
   rans_dec_init(&dec, data, len);
 
   for (int ch = 0; ch < n_ch; ch++) {
+    int16_t *ch_q = &quant_out[ch * HQLC_FRAME_SAMPLES];
+
     for (int b = 0; b < PSY_N_BANDS; b++) {
       int s = psy_band_edges[b];
       int e = psy_band_edges[b + 1];
 
       if (nf_mask[ch * PSY_N_BANDS + b]) {
         for (int i = s; i < e; i++) {
-          quant_out[ch * HQLC_FRAME_SAMPLES + i] = 0;
+          ch_q[i] = 0;
         }
         continue;
       }
 
-      const hqlc_rans_band_tables *tbl = &tables[b >> 1];
+      // Per-band table from alpha + activity (decoder-symmetric: uses
+      // already-decoded previous band)
+      HQLC_BENCH_BEGIN();
+      int abin = rans_alpha_bin(b, gain_code);
+      int act = rans_activity_bin(ch_q, b);
+      int tidx = rans_table_idx(abin, act);
+      const uint16_t *freq = rans_div_freq[tidx];
+      uint16_t cf[RANS_MAX_SYM + 1];
+      build_cf(freq, cf);
+      HQLC_BENCH_END(HQLC_BENCH_DEC_RANS_DEC);
 
       for (int i = s; i < e; i++) {
-        // Decode magnitude
-        // We use a linear scan, as naturally its ordered by frequency
-        // Quite convinient, isnt it?
-        uint8_t sym = rans_dec_sym(&dec, tbl->freq, tbl->cf);
+        uint8_t sym = rans_dec_sym(&dec, freq, cf);
         int mag = sym;
 
-        // If ESC (15), decode overflow via EG(0)
         if (sym >= RANS_MAX_SYM - 1) {
           int nbits = 0;
           while (rans_dec_sign(&dec) == 0) {
@@ -482,13 +427,11 @@ bool rans_decode_coeffs(const uint8_t *data,
           mag = (RANS_MAX_SYM - 1) + val - 1;
         }
 
-        // Decode sign (if nonzero)
         if (mag > 0) {
           uint8_t sign_val = rans_dec_sign(&dec);
-          quant_out[ch * HQLC_FRAME_SAMPLES + i] =
-              sign_val ? (int16_t)(-mag) : (int16_t)mag;
+          ch_q[i] = sign_val ? (int16_t)(-mag) : (int16_t)mag;
         } else {
-          quant_out[ch * HQLC_FRAME_SAMPLES + i] = 0;
+          ch_q[i] = 0;
         }
       }
     }

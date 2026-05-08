@@ -56,6 +56,7 @@ bool tns_detect_transient(const uint8_t *prev_pcm,
  */
 void tns_analyze(const int32_t *spec_q31, tns_info *out);
 
+
 /**
  * @brief Lattice FIR (encoder analysis filter, in-place)
  *

@@ -1,79 +1,71 @@
 #ifndef HQLC_PSY_H
 #define HQLC_PSY_H
 
-#include <stdbool.h>
 #include <stdint.h>
 
 #ifdef __cplusplus
 extern "C" {
 #endif
 
-// Band count
 #define PSY_N_BANDS 20
 
-// Band edges definition
 extern const uint16_t psy_band_edges[PSY_N_BANDS + 1];
 
-// Maximum width of any single band in bins (last band: 512 - 431 = 81)
-#define PSY_MAX_BAND_WIDTH 81
+// Only bins 0..426 are active (~20 kHz at 48 kHz sample rate)
+#define PSY_ACTIVE_BINS 427
+#define PSY_MAX_BAND_WIDTH 67
 
-// Exponent index bias - applied to the calculated exponent index, in order to move it
-// around the perceptually valid range Calculated empirically to minimize clipping It
-// further controls the quantizer step - step = 2^((idx - BIAS) / 4)
+// Exponent index: 6-bit log-scale energy descriptor per band.
+// Quantizer step = 2^((idx - BIAS) / 4), giving ~1.5 dB per index.
 #define PSY_EXP_INDEX_BIAS 43
 #define PSY_EXP_INDEX_MIN  0
 #define PSY_EXP_INDEX_MAX  63
 
-// Noise fill parameters
-#define PSY_NF_CREST_RATIO      100     // 10^(20/10) = 100 linear power ratio
-#define PSY_NF_EXP_MAX          7       // Tier 1 NF: crest-based
-#define PSY_NF_EXP_MAX_TIER2    24      // Tier 2 NF: envelope-driven
-#define PSY_NF_SMR_THRESHOLD_Q4 Q4(0.5) // SMR threshold for tier 2 noise fill
+// 48 fine bands for exponent computation (single-bin LF, ERB-spaced HF)
+#define PSY_N_FINE_BANDS 48
 
-/* ── Band analysis ── */
+extern const uint16_t psy_fine_band_edges[PSY_N_FINE_BANDS + 1];
 
-/**
- * @brief Spectral band analysis
- *
- * @param spec_q31    Spectral coeffs, taken from mdct
- * @param loss_bits   BFP exponent of the coeffs
- * @param exp_indices Output for 6-bit exponent index per band
- * @param band_energy Output of the band energies (sum of (|X|>>16)^2 per band)
- * @param band_peak   Output of the band peaks (max(|X|>>16) per band)
- */
-void psy_band_analysis(const int32_t *spec_q31,
-                       int loss_bits,
-                       int32_t *exp_indices,
-                       uint64_t *band_energy,
-                       uint32_t *band_peak);
+// Per-bin envelope interpolation tables (427 entries each)
+extern const uint8_t env_interp_lo[PSY_ACTIVE_BINS];
+extern const uint8_t env_interp_hi[PSY_ACTIVE_BINS];
+extern const uint16_t env_interp_t_q15[PSY_ACTIVE_BINS];
 
 /**
- * @brief Test whether a band's crest factor is below the noise-fill threshold
+ * @brief Compute tilt dB for a given bitrate.
  *
- * Returns 1 if peak^2 * w < PSY_NF_CREST_RATIO * sum_sq (non-tonal band
- * suitable for noise fill).
- *
- * @param band   Band index
- * @param sum_sq sum of squared scaled magnitudes for the band
- * @param peak   peak mag in the band
- * @return True if crest factor is below threshold, false otherwise
+ * 35 dB at >=128 kbps, linear ramp down to 15 dB floor.
  */
-static inline bool psy_nf_crest_below(int band, uint64_t sum_sq, uint32_t peak) {
-  int w = psy_band_edges[band + 1] - psy_band_edges[band];
-  uint64_t lhs = (uint64_t)peak * peak * (uint32_t)w;
-  uint64_t rhs = PSY_NF_CREST_RATIO * sum_sq;
-  return lhs < rhs;
-}
+int psy_tilt_for_bitrate(uint32_t bitrate);
 
 /**
- * @brief Calculates the Cross-band masking via ERB-rate spreading
+ * @brief Per-fine-band tilt step in EXP_Q7 (128 per exponent unit).
  *
- * Computes Signal-to-Mask Ratio per band in Q4 log2 units
- *
- * @param exp_indices Band exponent indices from psy_band_analysis()
- * @param smr_q4_out  Output SMR per band in Q4 (energy_q4 - mask_q4)
+ * In the log domain, tilt[fb] = 2^(fb * step / 128).
+ * The step is an exact integer — no accumulation error.
  */
-void psy_spreading_envelope(const int32_t *exp_indices, int32_t *smr_q4_out);
+int psy_tilt_step_q7(int tilt_db);
+
+/**
+ * @brief Compute 20 exponent indices from the MDCT spectrum.
+ *
+ * Pipeline per frame:
+ *   47 fine-band PSD → log2 + per-fine-band tilt (log domain) →
+ *   average per coarse band → round.
+ *
+ * Tilt accumulates per fine band so HF pre-emphasis is continuous
+ * across the spectrum.  All post-log arithmetic uses EXP_Q7
+ * (128 per exponent unit); fxp_log2_q8(x) = log2(x)*256 = EXP_Q7.
+ *
+ * @param spec_q31    MDCT spectrum (Q31 BFP, 512 bins)
+ * @param loss_bits   BFP exponent
+ * @param tilt_step   Per-fine-band tilt in EXP_Q7 (from psy_tilt_step_q7)
+ * @param exp_indices Output: 20 exponent indices [0..63]
+ */
+void psy_fine_band_exponents(const int32_t *spec_q31,
+                             int loss_bits,
+                             int tilt_step,
+                             int32_t *exp_indices);
 
 #ifdef __cplusplus
 }

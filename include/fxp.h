@@ -98,6 +98,11 @@ static inline int32_t fxp_clamp_i32(int32_t x, int32_t lo, int32_t hi) {
   return x;
 }
 
+// Convert a Q-format value to integer with rounding: round(x / 2^frac_bits)
+static inline int32_t fxp_round_to_int(int32_t x, int frac_bits) {
+  return (x + (1 << (frac_bits - 1))) >> frac_bits;
+}
+
 // Headroom of a uint32 OR-accumulator: number of safe left-shift bits.
 // Returns 31 for zero (all-silent), otherwise clz - 1 (sign bit guard).
 static inline int fxp_headroom_u32(uint32_t or_acc) {
@@ -114,6 +119,26 @@ static inline int32_t fxp_log2_q5_u64(uint64_t x) {
   int frac_idx =
       (msb >= 4) ? (int)((x >> (msb - 4)) & 0xF) : (int)((x << (4 - msb)) & 0xF);
   return msb * 32 + (int32_t)_fxp_log2_frac_q5[frac_idx];
+}
+
+// Higher-precision log2: 64-entry LUT, Q8 output (max error 0.14 dB).
+// Returns log2(x) * 256. x must be > 0.  64 bytes of ROM.
+static const uint8_t _fxp_log2_frac_q8[64] = {
+      0,   6,  11,  17,  22,  28,  33,  38,
+     44,  49,  54,  59,  63,  68,  73,  78,
+     82,  87,  92,  96, 100, 105, 109, 113,
+    118, 122, 126, 130, 134, 138, 142, 146,
+    150, 154, 157, 161, 165, 169, 172, 176,
+    179, 183, 186, 190, 193, 197, 200, 203,
+    207, 210, 213, 216, 220, 223, 226, 229,
+    232, 235, 238, 241, 244, 247, 250, 253,
+};
+
+static inline int32_t fxp_log2_q8_u64(uint64_t x) {
+  int msb = 63 - __builtin_clzll(x);
+  int frac_idx =
+      (msb >= 6) ? (int)((x >> (msb - 6)) & 0x3F) : (int)((x << (6 - msb)) & 0x3F);
+  return msb * 256 + (int32_t)_fxp_log2_frac_q8[frac_idx];
 }
 
 #ifdef __cplusplus
