@@ -5,6 +5,8 @@ set(HQLC_TESTS
     test_roundtrip
     test_mdct
     test_entropy
+    test_envelope
+    test_direct_roundtrip
 )
 
 foreach(TEST_NAME ${HQLC_TESTS})
@@ -14,3 +16,5 @@ foreach(TEST_NAME ${HQLC_TESTS})
     target_link_options(${TEST_NAME} PRIVATE -fsanitize=address)
     add_test(NAME ${TEST_NAME} COMMAND ${TEST_NAME})
 endforeach()
+
+target_include_directories(test_direct_roundtrip PRIVATE ${CMAKE_SOURCE_DIR}/external)

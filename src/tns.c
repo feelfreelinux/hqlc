@@ -6,7 +6,6 @@
 #include "pcm.h"
 
 // TNS parameters
-#define TNS_ATTACK_RATIO 2
 #define TNS_MAX_K_Q30    Q30(0.75)
 #define TNS_K_THRESH_Q30 Q30(0.1)
 #define TNS_K_CLAMP_Q30  Q30(0.999)
@@ -61,33 +60,62 @@ int tns_quant_k(int32_t k_q30) {
   return sign * q;
 }
 
-bool tns_detect_transient(const uint8_t *prev_pcm,
+bool tns_detect_transient(tns_detect_state *st,
                           const uint8_t *curr_pcm,
                           hqlc_pcm_format fmt,
                           int stride,
                           int ch) {
-  uint64_t e1 = 1;
-  uint64_t e2 = 0;
+  const int sub = HQLC_FRAME_SAMPLES / TNS_DETECT_SUBBLOCKS;
+  uint64_t e[TNS_DETECT_SUBBLOCKS];
+  int32_t last = st->last_sample;
 
+  // HP (first difference) energy per sub-block. 24-bit input is scaled to
+  // 16-bit range so energies and TNS_DETECT_FLOOR are format-independent.
   if (fmt == HQLC_PCM16) {
-    const int16_t *p1 = (const int16_t *)prev_pcm;
-    const int16_t *p2 = (const int16_t *)curr_pcm;
-    for (int i = 0; i < HQLC_FRAME_SAMPLES; i++) {
-      int32_t s1 = p1[i * stride + ch];
-      int32_t s2 = p2[i * stride + ch];
-      e1 += (uint64_t)(s1 * s1);
-      e2 += (uint64_t)(s2 * s2);
+    const int16_t *p = (const int16_t *)curr_pcm;
+    for (int b = 0; b < TNS_DETECT_SUBBLOCKS; b++) {
+      uint64_t acc = 0;
+      for (int i = b * sub; i < (b + 1) * sub; i++) {
+        int32_t s = p[i * stride + ch];
+        int32_t d = s - last;
+        last = s;
+        acc += (uint64_t)((int64_t)d * d);
+      }
+      e[b] = acc;
     }
   } else {
-    for (int i = 0; i < HQLC_FRAME_SAMPLES; i++) {
-      int32_t s1 = pcm_load_native(prev_pcm, fmt, i * stride + ch);
-      int32_t s2 = pcm_load_native(curr_pcm, fmt, i * stride + ch);
-      e1 += (uint64_t)((int64_t)s1 * s1);
-      e2 += (uint64_t)((int64_t)s2 * s2);
+    for (int b = 0; b < TNS_DETECT_SUBBLOCKS; b++) {
+      uint64_t acc = 0;
+      for (int i = b * sub; i < (b + 1) * sub; i++) {
+        int32_t s = pcm_load_native(curr_pcm, fmt, i * stride + ch) >> 8;
+        int32_t d = s - last;
+        last = s;
+        acc += (uint64_t)((int64_t)d * d);
+      }
+      e[b] = acc;
     }
   }
+  st->last_sample = last;
 
-  return e2 >= (uint64_t)TNS_ATTACK_RATIO * e1;
+  // Each current sub-block vs the mean of the preceding 8 (window slides
+  // from last frame's blocks into this frame's).
+  uint64_t win = 0;
+  for (int b = 0; b < TNS_DETECT_SUBBLOCKS; b++) {
+    win += st->sub_energy[b];
+  }
+
+  bool fire = false;
+  for (int b = 0; b < TNS_DETECT_SUBBLOCKS; b++) {
+    if (e[b] > TNS_DETECT_FLOOR &&
+        e[b] * TNS_DETECT_SUBBLOCKS > (uint64_t)TNS_DETECT_RATIO * win) {
+      fire = true;
+    }
+    // Slide: drop the oldest (last frame's block b), add current block b
+    win += e[b] - st->sub_energy[b];
+  }
+
+  memcpy(st->sub_energy, e, sizeof(e));
+  return fire;
 }
 
 // Autocorrelation of MDCT spectrum, pre-shifted to prevent overflow

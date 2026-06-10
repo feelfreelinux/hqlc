@@ -16,6 +16,27 @@
 hqlc_bench_ctx *hqlc_bench = NULL;
 #endif
 
+// Tilt applied on transient frames, as a percentage of the normal tilt.
+// Transient spectra are 8-13 dB flatter than sustained ones, so the full HF
+// pre-emphasis starves exactly the HF bits the attack needs (pre-echo lives
+// at 8-20 kHz). Encoder-only — the decoder sees the transmitted exponents.
+// Overridable via -D for experiments (scripts/transient_sweep.py).
+// NOTE: swept 2026-06-10 — every value below 100 lost on all metrics (RC
+// compensates by coarsening the whole frame; NF fill shrinks with the HF
+// envelope). Kept at 100; the knob remains for re-testing after RC changes.
+#ifndef HQLC_TILT_TRANSIENT_PCT
+#define HQLC_TILT_TRANSIENT_PCT 100
+#endif
+
+// TNS hangover: keep TNS analysis eligible for this many frames after a
+// detection. The frame AFTER an attack has the attack in the left half of
+// its MDCT window — its quantization noise smears up to 10 ms BEFORE the
+// attack, but the decay never trips the detector. Costs nothing and cannot
+// fire on sustained content (it only extends real detections).
+#ifndef HQLC_TNS_HANGOVER
+#define HQLC_TNS_HANGOVER 1
+#endif
+
 // Encoder scratch layout. Holds all temporary data needed across stages
 // It is allocated by the caller and passed to the encoder functions
 typedef struct {
@@ -78,7 +99,11 @@ struct hqlc_encoder {
   int prev_side_bits;
   int32_t res_bits;
   // (rANS tables computed per-band inline — no cached state needed)
-  int tilt_step_q7; // per-fine-band tilt increment in EXP_Q7
+  int tilt_step_q7;    // per-fine-band tilt increment in EXP_Q7
+  int tilt_step_tr_q7; // reduced tilt used on transient frames
+
+  tns_detect_state tns_det[HQLC_MAX_CHANNELS];
+  uint8_t tns_hang[HQLC_MAX_CHANNELS]; // frames of TNS eligibility left post-attack
 
   hqlc_frame_diag diag; // per-frame diagnostic (populated after each encode)
 };
@@ -128,14 +153,24 @@ hqlc_error hqlc_encoder_init(hqlc_encoder *enc, const hqlc_encoder_config *cfg) 
     enc->prev_side_bits = 150; // ~19 bytes: typical side info for first probe
     enc->res_bits = 0;
 
-    enc->tilt_step_q7 = psy_tilt_step_q7(psy_tilt_for_bitrate(cfg->bitrate));
+    {
+      int tilt_db = psy_tilt_for_bitrate(cfg->bitrate);
+      enc->tilt_step_q7 = psy_tilt_step_q7(tilt_db);
+      enc->tilt_step_tr_q7 =
+          psy_tilt_step_q7(tilt_db * HQLC_TILT_TRANSIENT_PCT / 100);
+    }
     break;
   case HQLC_MODE_FIXED:
     if (cfg->gain <= 0.0f) {
       return HQLC_ERR_INVALID_ARG;
     }
     enc->gain_code = quant_gain_encode(cfg->gain);
-    enc->tilt_step_q7 = psy_tilt_step_q7(psy_tilt_for_bitrate(96000));
+    {
+      int tilt_db = psy_tilt_for_bitrate(96000);
+      enc->tilt_step_q7 = psy_tilt_step_q7(tilt_db);
+      enc->tilt_step_tr_q7 =
+          psy_tilt_step_q7(tilt_db * HQLC_TILT_TRANSIENT_PCT / 100);
+    }
     break;
   default:
     return HQLC_ERR_INVALID_ARG;
@@ -398,6 +433,7 @@ hqlc_error hqlc_encode_frame(hqlc_encoder *enc,
   int16_t *quant = s->quant;
 
   int loss_bits[HQLC_MAX_CHANNELS];
+  int transients[HQLC_MAX_CHANNELS] = {0};
   tns_info tns[HQLC_MAX_CHANNELS];
   memset(tns, 0, sizeof(tns));
 
@@ -428,7 +464,12 @@ hqlc_error hqlc_encode_frame(hqlc_encoder *enc,
     }
 
     HQLC_BENCH_BEGIN();
-    if (tns_detect_transient(enc->prev_pcm, pcm, fmt, n_ch, ch)) {
+    bool tr = tns_detect_transient(&enc->tns_det[ch], pcm, fmt, n_ch, ch);
+    transients[ch] = tr ? 1 : 0;
+    bool tns_eligible = tr || enc->tns_hang[ch] > 0;
+    enc->tns_hang[ch] = tr ? HQLC_TNS_HANGOVER
+                           : (enc->tns_hang[ch] > 0 ? enc->tns_hang[ch] - 1 : 0);
+    if (tns_eligible) {
       tns_analyze(ch_spec, &tns[ch]);
       if (tns[ch].order > 0) {
         loss_bits[ch] += tns_fir_safe(ch_spec, tns[ch].k_q30, tns[ch].order);
@@ -437,7 +478,10 @@ hqlc_error hqlc_encode_frame(hqlc_encoder *enc,
     HQLC_BENCH_END(HQLC_BENCH_ENC_TNS);
 
     HQLC_BENCH_BEGIN();
-    psy_fine_band_exponents(ch_spec, loss_bits[ch], enc->tilt_step_q7, ch_exp);
+    psy_fine_band_exponents(ch_spec,
+                            loss_bits[ch],
+                            tr ? enc->tilt_step_tr_q7 : enc->tilt_step_q7,
+                            ch_exp);
     HQLC_BENCH_END(HQLC_BENCH_ENC_PSY);
   }
 
@@ -574,6 +618,7 @@ hqlc_error hqlc_encode_frame(hqlc_encoder *enc,
   for (int ch = 0; ch < n_ch; ch++) {
     enc->diag.noise_factors[ch] = s->noise_factors[ch];
     enc->diag.tns_orders[ch] = tns[ch].order;
+    enc->diag.transients[ch] = transients[ch];
   }
 
   return HQLC_OK;

@@ -80,6 +80,7 @@ typedef struct {
   int32_t exp_indices[HQLC_MAX_CHANNELS * HQLC_DIAG_MAX_BANDS];
   int noise_factors[HQLC_MAX_CHANNELS];
   int tns_orders[HQLC_MAX_CHANNELS];
+  int transients[HQLC_MAX_CHANNELS]; /**< transient detector fired this frame */
 } hqlc_frame_diag;
 
 // Fwd defs

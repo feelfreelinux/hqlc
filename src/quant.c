@@ -304,12 +304,53 @@ int quant_gain_encode(float gain) {
   return fxp_clamp_i32(code, 0, QUANT_GAIN_MAX_CODE);
 }
 
+/*
+ * NF experiment knobs (scripts/nf_sweep.py):
+ *   HQLC_NF_DISABLE      compile out the fill entirely (attribution runs)
+ *   HQLC_NF_DETILT_PCT   0..100: subtract this fraction of the envelope
+ *                        tilt from the fill amplitude. The transmitted
+ *                        exponents contain the encoder's HF pre-emphasis
+ *                        tilt (~29 dB at the top band at 96k), which
+ *                        inflates fill amplitude far above the true HF
+ *                        content in quiet passages. De-tilting the fill
+ *                        envelope (not the dequant step) compensates.
+ */
+#ifndef HQLC_NF_DETILT_PCT
+#define HQLC_NF_DETILT_PCT 0
+#endif
+
+#if HQLC_NF_DETILT_PCT > 0
+// Center fine-band index per coarse band (tilt accumulates per fine band)
+static const uint8_t nf_band_fine_center[20] = {
+    1, 5, 10, 15, 19, 22, 24, 26, 27, 29, 31, 32, 34, 36, 37, 39, 41, 42, 44, 46,
+};
+// Exponent-index reduction for the fill envelope. 54 = tilt_step at 96k
+// (30 dB tilt); /128 converts EXP_Q7 to exponent indices.
+static inline int nf_detilt_exp(int band) {
+  return (HQLC_NF_DETILT_PCT * (int)nf_band_fine_center[band] * 54 + 6400) / 12800;
+}
+#else
+static inline int nf_detilt_exp(int band) {
+  (void)band;
+  return 0;
+}
+#endif
+
 void nf_run_length_fill(int16_t *quant,
                         const int32_t *exp_indices,
                         int gain_code,
                         int nf,
                         int32_t *spec_q31,
                         int *loss_bits_io) {
+#ifdef HQLC_NF_DISABLE
+  (void)quant;
+  (void)exp_indices;
+  (void)gain_code;
+  (void)nf;
+  (void)spec_q31;
+  (void)loss_bits_io;
+  return;
+#else
   if (nf >= 8) {
     return;
   }
@@ -356,7 +397,7 @@ void nf_run_length_fill(int16_t *quant,
   for (int b = 0; b < PSY_N_BANDS; b++) {
     int s = psy_band_edges[b];
     int e = psy_band_edges[b + 1];
-    int E = 2 * (int)exp_indices[b] - E_bias;
+    int E = 2 * ((int)exp_indices[b] - nf_detilt_exp(b)) - E_bias;
     int octave = E >> 3;
     int32_t step_m = quant_pow2_eighth_q30[E & 7] >> 2;
     int32_t fill_m = (int32_t)((uint32_t)nf_scale * (uint32_t)step_m >> 4);
@@ -382,4 +423,5 @@ void nf_run_length_fill(int16_t *quant,
   }
 
   *loss_bits_io = loss_bits;
+#endif // HQLC_NF_DISABLE
 }

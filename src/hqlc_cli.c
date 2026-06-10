@@ -394,6 +394,9 @@ static void diag_write_frame(FILE *f, const hqlc_frame_diag *d, int frame, int c
   fprintf(f, "],\"tns\":[");
   for (int c = 0; c < ch; c++)
     fprintf(f, "%d%s", d->tns_orders[c], c < ch - 1 ? "," : "");
+  fprintf(f, "],\"tr\":[");
+  for (int c = 0; c < ch; c++)
+    fprintf(f, "%d%s", d->transients[c], c < ch - 1 ? "," : "");
   fprintf(f, "]}\n");
 }
 
