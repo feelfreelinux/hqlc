@@ -69,20 +69,6 @@ typedef struct {
   };
 } hqlc_encoder_config;
 
-// Per-frame diagnostic data (populated after each hqlc_encode_frame call)
-#define HQLC_DIAG_MAX_BANDS 20
-typedef struct {
-  int gain_code;
-  int frame_bits;
-  int target_bpf;
-  int32_t res_bits;
-  int quiet_frame;
-  int32_t exp_indices[HQLC_MAX_CHANNELS * HQLC_DIAG_MAX_BANDS];
-  int noise_factors[HQLC_MAX_CHANNELS];
-  int tns_orders[HQLC_MAX_CHANNELS];
-  int transients[HQLC_MAX_CHANNELS]; /**< transient detector fired this frame */
-} hqlc_frame_diag;
-
 // Fwd defs
 typedef struct hqlc_encoder hqlc_encoder;
 typedef struct hqlc_decoder hqlc_decoder;
@@ -166,14 +152,6 @@ hqlc_error hqlc_decode_frame(hqlc_decoder *dec,
                              uint8_t *pcm_out,
                              hqlc_pcm_format fmt,
                              void *scratch);
-
-/**
- * @brief Get diagnostic data from the most recently encoded frame.
- *
- * Returns a pointer to the encoder's internal diagnostic struct,
- * valid until the next hqlc_encode_frame call.
- */
-const hqlc_frame_diag *hqlc_encoder_get_diag(const hqlc_encoder *enc);
 
 #ifdef __cplusplus
 }

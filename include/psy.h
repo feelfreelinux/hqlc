@@ -26,11 +26,6 @@ extern const uint16_t psy_band_edges[PSY_N_BANDS + 1];
 
 extern const uint16_t psy_fine_band_edges[PSY_N_FINE_BANDS + 1];
 
-// Per-bin envelope interpolation tables (427 entries each)
-extern const uint8_t env_interp_lo[PSY_ACTIVE_BINS];
-extern const uint8_t env_interp_hi[PSY_ACTIVE_BINS];
-extern const uint16_t env_interp_t_q15[PSY_ACTIVE_BINS];
-
 /**
  * @brief Compute tilt dB for a given bitrate.
  *
@@ -60,11 +55,13 @@ int psy_tilt_step_q7(int tilt_db);
  * @param spec_q31    MDCT spectrum (Q31 BFP, 512 bins)
  * @param loss_bits   BFP exponent
  * @param tilt_step   Per-fine-band tilt in EXP_Q7 (from psy_tilt_step_q7)
+ * @param transient   Nonzero on TNS-eligible frames (gates analysis smoothing)
  * @param exp_indices Output: 20 exponent indices [0..63]
  */
 void psy_fine_band_exponents(const int32_t *spec_q31,
                              int loss_bits,
                              int tilt_step,
+                             int transient,
                              int32_t *exp_indices);
 
 #ifdef __cplusplus

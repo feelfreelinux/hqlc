@@ -374,38 +374,17 @@ static int do_decode(const char *in, const char *out) {
 
 // ── Roundtrip: WAV → encode → decode → WAV ──────────────────────────────
 
-// Write one JSONL line of diagnostic data for a frame
-static void diag_write_frame(FILE *f, const hqlc_frame_diag *d, int frame, int ch) {
-  fprintf(f, "{\"f\":%d,\"gc\":%d,\"bits\":%d,\"tgt\":%d,\"res\":%d,\"quiet\":%s,",
-          frame, d->gain_code, d->frame_bits, d->target_bpf, (int)d->res_bits,
-          d->quiet_frame ? "true" : "false");
-  fprintf(f, "\"exp\":[");
-  for (int c = 0; c < ch; c++) {
-    fprintf(f, "[");
-    for (int b = 0; b < HQLC_DIAG_MAX_BANDS; b++) {
-      fprintf(f, "%d%s", (int)d->exp_indices[c * HQLC_DIAG_MAX_BANDS + b],
-              b < HQLC_DIAG_MAX_BANDS - 1 ? "," : "");
-    }
-    fprintf(f, "]%s", c < ch - 1 ? "," : "");
-  }
-  fprintf(f, "],\"nf\":[");
-  for (int c = 0; c < ch; c++)
-    fprintf(f, "%d%s", d->noise_factors[c], c < ch - 1 ? "," : "");
-  fprintf(f, "],\"tns\":[");
-  for (int c = 0; c < ch; c++)
-    fprintf(f, "%d%s", d->tns_orders[c], c < ch - 1 ? "," : "");
-  fprintf(f, "],\"tr\":[");
-  for (int c = 0; c < ch; c++)
-    fprintf(f, "%d%s", d->transients[c], c < ch - 1 ? "," : "");
-  fprintf(f, "]}\n");
-}
-
 static int do_roundtrip(const char *in, const char *out,
-                        hqlc_mode mode, uint32_t bitrate, float gain,
-                        const char *diag_path) {
+                        hqlc_mode mode, uint32_t bitrate, float gain) {
   int ch;
   int32_t total_pcm;
-  int16_t *pcm;
+  int16_t *pcm = NULL;
+  hqlc_encoder *enc = NULL;
+  hqlc_decoder *dec = NULL;
+  void *enc_scratch = NULL, *dec_scratch = NULL;
+  int16_t *pcm_out = NULL;
+  int ret = 1;
+
   if (read_wav(in, &ch, &total_pcm, &pcm) != 0) {
     fprintf(stderr, "error: cannot read '%s'\n", in);
     return 1;
@@ -414,12 +393,14 @@ static int do_roundtrip(const char *in, const char *out,
   int n_frames = total_pcm / HQLC_FRAME_SAMPLES;
   if (n_frames < 2) {
     fprintf(stderr, "error: file too short (need >= %d samples)\n", HQLC_FRAME_SAMPLES * 2);
-    free(pcm);
-    return 1;
+    goto cleanup;
   }
 
-  hqlc_encoder *enc = (hqlc_encoder *)calloc(1, hqlc_encoder_size());
-  hqlc_decoder *dec = (hqlc_decoder *)calloc(1, hqlc_decoder_size());
+  enc = (hqlc_encoder *)calloc(1, hqlc_encoder_size());
+  dec = (hqlc_decoder *)calloc(1, hqlc_decoder_size());
+  enc_scratch = calloc(1, hqlc_encoder_scratch_size());
+  dec_scratch = calloc(1, hqlc_decoder_scratch_size());
+  pcm_out = (int16_t *)calloc((size_t)n_frames * HQLC_FRAME_SAMPLES * ch, sizeof(int16_t));
 
   hqlc_encoder_config cfg = {
       .channels = (uint8_t)ch, .sample_rate = HQLC_SAMPLE_RATE, .mode = mode,
@@ -429,33 +410,14 @@ static int do_roundtrip(const char *in, const char *out,
 
   if (hqlc_encoder_init(enc, &cfg) != HQLC_OK) {
     fprintf(stderr, "error: encoder init failed\n");
-    free(pcm); free(enc); free(dec);
-    return 1;
+    goto cleanup;
   }
   if (hqlc_decoder_init(dec, (uint8_t)ch, HQLC_SAMPLE_RATE) != HQLC_OK) {
     fprintf(stderr, "error: decoder init failed\n");
-    free(pcm); free(enc); free(dec);
-    return 1;
+    goto cleanup;
   }
 
-  void *enc_scratch = calloc(1, hqlc_encoder_scratch_size());
-  void *dec_scratch = calloc(1, hqlc_decoder_scratch_size());
-  int16_t *pcm_out =
-      (int16_t *)calloc((size_t)n_frames * HQLC_FRAME_SAMPLES * ch, sizeof(int16_t));
   uint8_t compressed[HQLC_MAX_FRAME_BYTES];
-
-  FILE *diag_f = NULL;
-  if (diag_path) {
-    diag_f = fopen(diag_path, "w");
-    if (!diag_f) {
-      fprintf(stderr, "error: cannot open diag file '%s'\n", diag_path);
-      free(pcm); free(enc); free(dec); free(enc_scratch); free(dec_scratch); free(pcm_out);
-      return 1;
-    }
-    fprintf(diag_f, "{\"v\":1,\"codec\":\"hqlc-c\",\"br\":%u,\"ch\":%d,\"n\":%d,\"sr\":%d}\n",
-            bitrate, ch, n_frames, HQLC_SAMPLE_RATE);
-  }
-
   size_t total_bytes = 0;
   for (int f = 0; f < n_frames; f++) {
     const uint8_t *fp = (const uint8_t *)&pcm[f * HQLC_FRAME_SAMPLES * ch];
@@ -465,26 +427,17 @@ static int do_roundtrip(const char *in, const char *out,
         enc, fp, HQLC_PCM16, compressed, HQLC_MAX_FRAME_BYTES, &comp_len, enc_scratch);
     if (err != HQLC_OK) {
       fprintf(stderr, "error: encode failed at frame %d\n", f);
-      if (diag_f) fclose(diag_f);
-      free(pcm); free(enc); free(dec); free(enc_scratch); free(dec_scratch); free(pcm_out);
-      return 1;
+      goto cleanup;
     }
     total_bytes += comp_len;
-
-    if (diag_f) {
-      diag_write_frame(diag_f, hqlc_encoder_get_diag(enc), f, ch);
-    }
 
     uint8_t *dp = (uint8_t *)&pcm_out[f * HQLC_FRAME_SAMPLES * ch];
     err = hqlc_decode_frame(dec, compressed, comp_len, dp, HQLC_PCM16, dec_scratch);
     if (err != HQLC_OK) {
       fprintf(stderr, "error: decode failed at frame %d\n", f);
-      if (diag_f) fclose(diag_f);
-      free(pcm); free(enc); free(dec); free(enc_scratch); free(dec_scratch); free(pcm_out);
-      return 1;
+      goto cleanup;
     }
   }
-  if (diag_f) fclose(diag_f);
 
   // Trim 1-frame latency: decoded[1..n_frames) ≈ orig[0..n_frames-1)
   int out_frames = n_frames - 1;
@@ -492,8 +445,7 @@ static int do_roundtrip(const char *in, const char *out,
 
   if (write_wav(out, trimmed, out_frames * HQLC_FRAME_SAMPLES, ch) != 0) {
     fprintf(stderr, "error: cannot write '%s'\n", out);
-    free(pcm); free(enc); free(dec); free(enc_scratch); free(dec_scratch); free(pcm_out);
-    return 1;
+    goto cleanup;
   }
 
   float duration = (float)(out_frames * HQLC_FRAME_SAMPLES) / HQLC_SAMPLE_RATE;
@@ -506,9 +458,11 @@ static int do_roundtrip(const char *in, const char *out,
   else fprintf(stderr, " (gain %.2f)", gain);
   fprintf(stderr, "\n");
   fprintf(stderr, "  avg bitrate: %.0f bps (%.1f:1)\n", avg_bps, raw_bps / avg_bps);
+  ret = 0;
 
+cleanup:
   free(pcm); free(enc); free(dec); free(enc_scratch); free(dec_scratch); free(pcm_out);
-  return 0;
+  return ret;
 }
 
 // ── Main ─────────────────────────────────────────────────────────────────
@@ -527,7 +481,6 @@ static void usage(const char *argv0) {
           "Encoder options:\n"
           "  -b <bps>      Rate-controlled mode (default: 128000)\n"
           "  -g <gain>     Fixed-gain mode\n"
-          "  --diag <path> Write per-frame diagnostic trace (JSONL)\n"
           "\n"
           "Use \"-\" for stdin/stdout.\n",
           argv0);
@@ -540,7 +493,6 @@ int main(int argc, char **argv) {
   float gain = 0.0f;
   const char *input_path = NULL;
   const char *output_path = NULL;
-  const char *diag_path = NULL;
 
   for (int i = 1; i < argc; i++) {
     if (strcmp(argv[i], "-e") == 0) {
@@ -553,8 +505,6 @@ int main(int argc, char **argv) {
     } else if (strcmp(argv[i], "-g") == 0 && i + 1 < argc) {
       mode = HQLC_MODE_FIXED;
       gain = (float)atof(argv[++i]);
-    } else if (strcmp(argv[i], "--diag") == 0 && i + 1 < argc) {
-      diag_path = argv[++i];
     } else if (strcmp(argv[i], "-h") == 0 || strcmp(argv[i], "--help") == 0) {
       usage(argv[0]);
       return 0;
@@ -576,7 +526,7 @@ int main(int argc, char **argv) {
   switch (op) {
     case OP_ENCODE:    return do_encode(input_path, output_path, mode, bitrate, gain);
     case OP_DECODE:    return do_decode(input_path, output_path);
-    case OP_ROUNDTRIP: return do_roundtrip(input_path, output_path, mode, bitrate, gain, diag_path);
+    case OP_ROUNDTRIP: return do_roundtrip(input_path, output_path, mode, bitrate, gain);
   }
   return 1;
 }

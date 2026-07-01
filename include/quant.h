@@ -23,8 +23,9 @@ extern "C" {
 // Q-format: Q31(spec) * Q28(inv_step) needs TOTAL_Q bits of shift to get Q8
 #define QUANT_TOTAL_Q 51
 
-// Deadzone: |scaled| < 0.65 → zero. Rounding bias = 1 - 0.65 = 0.35
-#define QUANT_DZ_THRESH_Q8 ((int32_t)(0.65 * 256 + 1)) // ceil(0.65 * 256)
+// Deadzone: |scaled| < DZ → zero, rounding bias = 1 - DZ. DZ = 0.65 (tuned);
+// encoder-only, the decoder never sees it.
+#define QUANT_DZ_THRESH_Q8 ((int32_t)(65 * 256 / 100 + 1))
 #define QUANT_DZ_BIAS_Q8   Q8(0.35)
 
 // Centroid: MMSE-optimal reconstruction offset for Laplacian source
@@ -42,23 +43,10 @@ extern const int32_t quant_pow2_eighth_q30[8];
 void quant_interp_bin_exp(const int32_t *exp_indices, int32_t *bin_exp);
 
 /**
- * @brief Forward quantizer: MDCT spectrum → integer symbols.
- *
- * Per bin: scaled = |X| / step, then deadzone + round.
- * step = 2^((2*interp_exp - gain_code - 59) / 8).
- */
-void quant_forward(const int32_t *spec_q31,
-                   int loss_bits,
-                   const int32_t *exp_indices,
-                   int gain_code,
-                   int16_t *quant_out);
-
-/**
  * @brief Forward quantizer fused with NF estimation.
  *
- * Same as quant_forward but also computes the noise factor in the same pass,
- * avoiding a redundant interp_bin_exp + scale_to_q8 sweep.
- * Returns the 3-bit noise factor (0..7).
+ * Per bin: scaled = |X| / step, then deadzone + round; also computes the
+ * noise factor in the same pass. Returns the 3-bit noise factor (0..7).
  */
 int quant_forward_nf(const int32_t *spec_q31,
                      int loss_bits,
@@ -78,6 +66,24 @@ void quant_inverse(const int16_t *quant_in,
                    int gain_code,
                    int32_t *spec_q31,
                    int *loss_bits_out);
+
+/*
+ * Per-bin interpolated variants: exponents are linearly interpolated between
+ * band centers instead of held flat per band. Used on non-transient frames
+ * (hqlc.c gates on the TNS flag); decoder-symmetric, so the bitstream is
+ * unchanged. Flat variants above are used on transient frames.
+ */
+int quant_forward_nf_interp(const int32_t *spec_q31,
+                            int loss_bits,
+                            const int32_t *exp_indices,
+                            int gain_code,
+                            int16_t *quant_out);
+
+void quant_inverse_interp(const int16_t *quant_in,
+                          const int32_t *exp_indices,
+                          int gain_code,
+                          int32_t *spec_q31,
+                          int *loss_bits_out);
 
 /**
  * @brief Encode a floating-point gain to a 7-bit gain code.

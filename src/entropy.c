@@ -8,16 +8,12 @@
 
 #include <string.h>
 
-// Byte-streaming rANS renormalization threshold.
-// Before encoding a symbol with frequency f, we emit bytes until
-// state < f << RANS_RENORM_SHIFT. This keeps state in [RANS_L, RANS_L*256)
-// after byte emission, preventing uint32 overflow in the encode step.
-// Derived from: RANS_L_BITS + BYTE_BITS - RANS_M_BITS = 16 + 8 - 10 = 14
+// rANS renorm: emit bytes until state < f << RANS_RENORM_SHIFT, keeping state
+// in [RANS_L, RANS_L*256). 14 = RANS_L_BITS(16) + BYTE_BITS(8) - RANS_M_BITS(10).
 #define RANS_RENORM_SHIFT    14
 #define RANS_BYTE_BITS       8
 #define RANS_COST_ONE_BIT_Q8 (1 << 8)
-// Sign coding uses a fixed equi-probable {M/2, M/2} distribution.
-// All sign encode/decode is done via shifts and masks, no table lookups.
+// Sign coding: fixed {M/2, M/2} split, done with shifts/masks (no tables).
 #define RANS_SIGN_FREQ         (RANS_M / 2)
 #define RANS_SIGN_SLOT_SHIFT   (RANS_M_BITS - 1)
 #define RANS_SIGN_SLOT_MASK    (RANS_SIGN_FREQ - 1)
@@ -72,8 +68,7 @@ void rans_enc_init(hqlc_rans_enc *enc, uint8_t *buf, size_t cap) {
   enc->pos = cap; // write cursor starts at end
 }
 
-// Specialized sign encode for the fixed {RANS_M/2, RANS_M/2} split used by the sign bit.
-// This path is fully shift/mask based, so it avoids general freq/cf/rcp table lookups.
+// Sign encode for the fixed {M/2, M/2} split — shift/mask only, no tables.
 static inline void rans_enc_sign(hqlc_rans_enc *enc, uint8_t sign) {
   uint32_t state = enc->state;
 
@@ -90,7 +85,7 @@ static inline void rans_enc_sign(hqlc_rans_enc *enc, uint8_t sign) {
                (state & RANS_SIGN_SLOT_MASK) + (sign ? RANS_SIGN_FREQ : 0u);
 }
 
-// Inlined general encode for mag / overflow
+// General symbol encode (division-free via the precomputed reciprocal).
 static inline void rans_enc_sym(hqlc_rans_enc *enc,
                                 uint8_t sym,
                                 const uint16_t *freq,
@@ -120,7 +115,7 @@ static inline void rans_enc_sym(hqlc_rans_enc *enc,
 }
 
 size_t rans_enc_flush(hqlc_rans_enc *enc) {
-  // Flush the encoder state to the buffer, writes 4 bytes
+  // Emit the 4-byte final state, then left-align the stream to buf[0].
   uint32_t state = enc->state;
   enc->buf[--enc->pos] = (uint8_t)(state & 0xFF);
   state >>= 8;
@@ -141,28 +136,37 @@ void rans_dec_init(hqlc_rans_dec *dec, const uint8_t *buf, size_t len) {
   dec->len = len;
   dec->pos = 0;
   dec->state = 0;
+  dec->overrun = false;
   for (int i = 0; i < 4 && dec->pos < len; i++) {
     dec->state = (dec->state << 8) | buf[dec->pos++];
   }
 }
 
-// Specialized sign decode for the fixed {RANS_SIGN_FREQ, RANS_SIGN_FREQ} split.
+// Pull one renorm byte, flagging (and returning 0) past the buffer end so a
+// corrupt or truncated stream can never read out of bounds.
+static inline uint8_t rans_dec_byte(hqlc_rans_dec *dec) {
+  if (dec->pos < dec->len) {
+    return dec->buf[dec->pos++];
+  }
+  dec->overrun = true;
+  return 0;
+}
+
+// Sign decode for the fixed {M/2, M/2} split.
 static inline uint8_t rans_dec_sign(hqlc_rans_dec *dec) {
   uint32_t state = dec->state;
   uint32_t slot = state & (RANS_M - 1);
-  uint8_t s =
-      (uint8_t)(slot >> RANS_SIGN_SLOT_SHIFT); // 0 if slot < RANS_SIGN_FREQ, 1 otherwise
+  uint8_t s = (uint8_t)(slot >> RANS_SIGN_SLOT_SHIFT); // 0 = low half, 1 = high half
 
-  // Inverse update for the fixed sign distribution:
-  //   state = RANS_SIGN_FREQ * floor(state / RANS_M) + (slot % RANS_SIGN_FREQ)
+  // Inverse update: state = (M/2)*floor(state/M) + slot%(M/2)
   dec->state =
       ((state >> RANS_M_BITS) << RANS_SIGN_SLOT_SHIFT) + (slot & RANS_SIGN_SLOT_MASK);
 
-  // Renorm (unrolled, at most 2 bytes)
+  // Renorm (at most 2 bytes)
   if (dec->state < RANS_L) {
-    dec->state = (dec->state << 8) | dec->buf[dec->pos++];
+    dec->state = (dec->state << 8) | rans_dec_byte(dec);
     if (dec->state < RANS_L) {
-      dec->state = (dec->state << 8) | dec->buf[dec->pos++];
+      dec->state = (dec->state << 8) | rans_dec_byte(dec);
     }
   }
   return s;
@@ -173,9 +177,8 @@ rans_dec_sym(hqlc_rans_dec *dec, const uint16_t *freq, const uint16_t *cf) {
   uint32_t state = dec->state;
   uint32_t slot = state & (RANS_M - 1);
 
-  // Linear scan — symbol 0 is most probable (Laplacian), so this
-  // typically terminates in 1-2 iterations vs 4 for binary search.
-  // cf[RANS_MAX_SYM] == RANS_M > any slot, so loop always terminates.
+  // Linear scan: symbol 0 is most probable (Laplacian), so 1-2 iters typical.
+  // cf[RANS_MAX_SYM] == RANS_M > slot guarantees termination.
   int s = 0;
   while (cf[s + 1] <= slot) {
     s++;
@@ -186,16 +189,15 @@ rans_dec_sym(hqlc_rans_dec *dec, const uint16_t *freq, const uint16_t *cf) {
 
   // Renorm
   if (dec->state < RANS_L) {
-    dec->state = (dec->state << 8) | dec->buf[dec->pos++];
+    dec->state = (dec->state << 8) | rans_dec_byte(dec);
     if (dec->state < RANS_L) {
-      dec->state = (dec->state << 8) | dec->buf[dec->pos++];
+      dec->state = (dec->state << 8) | rans_dec_byte(dec);
     }
   }
   return (uint8_t)s;
 }
 
-// Estimate coding cost of a symbol at a frequency, essentially a log2 approximation with
-// a LUT
+// Symbol cost in Q8 bits = log2(M/freq), via a LUT-based log2 approximation.
 int16_t rans_freq_cost_q8(uint16_t freq_val) {
   if (freq_val == 0) {
     return RANS_MAX_COST_Q8; // impossible symbol: clamp to the max finite cost
@@ -207,18 +209,11 @@ int16_t rans_freq_cost_q8(uint16_t freq_val) {
   } else {
     idx = (freq_val << (7 - n)) & 0x7F;
   }
-  // Ideal symbol cost is log2(RANS_M / freq), in bits.
-  // Since RANS_M = 2^RANS_M_BITS and this function returns Q8 fractional bits:
-  //   cost_q8 = (RANS_M_BITS - log2(freq)) * RANS_COST_ONE_BIT_Q8
-  // We approximate log2(freq) in Q8 as:
-  //   n * RANS_COST_ONE_BIT_Q8 + log2_frac_q8[idx],
-  // where n = floor(log2(freq)).
+  // cost_q8 = (RANS_M_BITS - log2(freq)) << 8, with log2(freq) in Q8 ≈
+  // n<<8 + log2_frac_q8[idx], n = floor(log2(freq)).
   return (int16_t)(RANS_MAX_COST_Q8 - (n * RANS_COST_ONE_BIT_Q8 + log2_frac_q8[idx]));
 }
 
-// Sign coding uses the fixed uniform split {RANS_M/2, RANS_M/2} over total mass RANS_M.
-// Specialized rans_enc_sign / rans_dec_sign use shift-based arithmetic directly, so no
-// freq/cf/rcp tables are needed at runtime.
 int rans_alpha_bin(int band, int gain_code) {
   // log2(alpha) = log2(gain) + log2(sigma_pair)
   // log2(gain) = (gc - GAIN_BIAS) / 8, in Q8: (gc - GAIN_BIAS) * 32
@@ -264,16 +259,21 @@ int rans_activity_bin(const int16_t *quant, int band) {
 
 static inline int rans_table_idx(int alpha_bin, int activity) {
   int tidx = alpha_bin * RANS_ACT_NBINS + activity;
-  if (tidx < 0) tidx = 0;
-  if (tidx >= RANS_DIV_NTABLES) tidx = RANS_DIV_NTABLES - 1;
+  if (tidx < 0) {
+    tidx = 0;
+  }
+  if (tidx >= RANS_DIV_NTABLES) {
+    tidx = RANS_DIV_NTABLES - 1;
+  }
   return tidx;
 }
 
-// Build cf (cumulative frequencies) from freq inline
+// Cumulative frequencies from per-symbol frequencies.
 static inline void build_cf(const uint16_t *freq, uint16_t *cf) {
   cf[0] = 0;
-  for (int s = 0; s < RANS_MAX_SYM; s++)
+  for (int s = 0; s < RANS_MAX_SYM; s++) {
     cf[s + 1] = cf[s] + freq[s];
+  }
 }
 
 int32_t rans_coeff_cost_q8(const hqlc_rans_band_tables *tbl, int16_t value) {
@@ -416,8 +416,10 @@ bool rans_decode_coeffs(const uint8_t *data,
         int mag = sym;
 
         if (sym >= RANS_MAX_SYM - 1) {
+          // Unary prefix; bounded so a corrupt stream can't spin forever
+          // (valid int16 magnitudes never reach 24 bits).
           int nbits = 0;
-          while (rans_dec_sign(&dec) == 0) {
+          while (rans_dec_sign(&dec) == 0 && nbits < 24 && !dec.overrun) {
             nbits++;
           }
           int val = 1;
@@ -437,5 +439,5 @@ bool rans_decode_coeffs(const uint8_t *data,
     }
   }
 
-  return true;
+  return !dec.overrun;
 }

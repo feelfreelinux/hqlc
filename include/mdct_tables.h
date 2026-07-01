@@ -15,11 +15,6 @@ extern "C" {
 // Lookup table for the half-size KBD window, mirrored across the center to save memory
 extern const int32_t kbd_window_half_q31[MDCT_KBD_WINDOW_HALF];
 
-// Returns the full-size KBD window value at index i, mirrored across the center
-static inline int32_t kbd_window_q31(int i) {
-  return kbd_window_half_q31[(i < 512) ? i : (1023 - i)];
-}
-
 // Lookup tables for MDCT pre/post twiddle factors and FFT twiddle factors
 extern const int32_t lut_pre_twiddle_q31[MDCT_PRE_TWIDDLE_LEN];
 

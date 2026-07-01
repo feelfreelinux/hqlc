@@ -7,6 +7,11 @@
 #include "mdct_tables.h"
 #include "pcm.h"
 
+// Full-overlap KBD long window (1024-sample window, 512-sample overlap).
+static inline int32_t mdct_win_q31(int i) {
+  return kbd_window_half_q31[(i < 512) ? i : (1023 - i)];
+}
+
 // Lookup a twiddle factor W_256^k from the half-period table.
 // As an optimization, for k >= 128 we use W^k = -W^(k-128) to derive the negative value
 static inline void tw_lookup(int k, int32_t *re, int32_t *im) {
@@ -219,8 +224,8 @@ hqlc_error mdct_forward(const uint8_t *restrict prev_pcm,
     for (int n = 0; n < N2; n++) {
       int32_t s1 = pcm_load_q31(curr_pcm, fmt, (N2 + n) * stride + channel_idx);
       int32_t s2 = pcm_load_q31(curr_pcm, fmt, (N2 - 1 - n) * stride + channel_idx);
-      int32_t t1 = (int32_t)((int64_t)s1 * kbd_window_q31(3 * N2 + n) >> 32);
-      int32_t t2 = (int32_t)((int64_t)s2 * kbd_window_q31(3 * N2 - 1 - n) >> 32);
+      int32_t t1 = (int32_t)((int64_t)s1 * mdct_win_q31(3 * N2 + n) >> 32);
+      int32_t t2 = (int32_t)((int64_t)s2 * mdct_win_q31(3 * N2 - 1 - n) >> 32);
       int32_t v = -t1 - t2;
       folded[n] = v;
       or_acc |= (uint32_t)(v ^ (v >> 31));
@@ -228,8 +233,8 @@ hqlc_error mdct_forward(const uint8_t *restrict prev_pcm,
     for (int n = 0; n < N2; n++) {
       int32_t s1 = pcm_load_q31(prev_pcm, fmt, n * stride + channel_idx);
       int32_t s2 = pcm_load_q31(prev_pcm, fmt, (N - 1 - n) * stride + channel_idx);
-      int32_t t1 = (int32_t)((int64_t)s1 * kbd_window_q31(n) >> 32);
-      int32_t t2 = (int32_t)((int64_t)s2 * kbd_window_q31(N - 1 - n) >> 32);
+      int32_t t1 = (int32_t)((int64_t)s1 * mdct_win_q31(n) >> 32);
+      int32_t t2 = (int32_t)((int64_t)s2 * mdct_win_q31(N - 1 - n) >> 32);
       int32_t v = t1 - t2;
       folded[N2 + n] = v;
       or_acc |= (uint32_t)(v ^ (v >> 31));

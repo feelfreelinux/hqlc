@@ -16,26 +16,13 @@
 hqlc_bench_ctx *hqlc_bench = NULL;
 #endif
 
-// Tilt applied on transient frames, as a percentage of the normal tilt.
-// Transient spectra are 8-13 dB flatter than sustained ones, so the full HF
-// pre-emphasis starves exactly the HF bits the attack needs (pre-echo lives
-// at 8-20 kHz). Encoder-only — the decoder sees the transmitted exponents.
-// Overridable via -D for experiments (scripts/transient_sweep.py).
-// NOTE: swept 2026-06-10 — every value below 100 lost on all metrics (RC
-// compensates by coarsening the whole frame; NF fill shrinks with the HF
-// envelope). Kept at 100; the knob remains for re-testing after RC changes.
-#ifndef HQLC_TILT_TRANSIENT_PCT
-#define HQLC_TILT_TRANSIENT_PCT 100
-#endif
-
-// TNS hangover: keep TNS analysis eligible for this many frames after a
-// detection. The frame AFTER an attack has the attack in the left half of
-// its MDCT window — its quantization noise smears up to 10 ms BEFORE the
-// attack, but the decay never trips the detector. Costs nothing and cannot
-// fire on sustained content (it only extends real detections).
-#ifndef HQLC_TNS_HANGOVER
-#define HQLC_TNS_HANGOVER 1
-#endif
+// Per-bin interpolated quantizer steps are used on tonal frames but disabled
+// on TNS-active (transient) frames, where flat steps avoid smearing the
+// attack across the window. The TNS flag is transmitted, so encoder and
+// decoder gate identically; the bitstream format is unchanged.
+static inline bool env_interp_active(int tns_order) {
+  return tns_order == 0;
+}
 
 // Encoder scratch layout. Holds all temporary data needed across stages
 // It is allocated by the caller and passed to the encoder functions
@@ -99,19 +86,15 @@ struct hqlc_encoder {
   int prev_side_bits;
   int32_t res_bits;
   // (rANS tables computed per-band inline — no cached state needed)
-  int tilt_step_q7;    // per-fine-band tilt increment in EXP_Q7
-  int tilt_step_tr_q7; // reduced tilt used on transient frames
+  int tilt_step_q7; // per-fine-band tilt increment in EXP_Q7
 
   tns_detect_state tns_det[HQLC_MAX_CHANNELS];
   uint8_t tns_hang[HQLC_MAX_CHANNELS]; // frames of TNS eligibility left post-attack
-
-  hqlc_frame_diag diag; // per-frame diagnostic (populated after each encode)
 };
 
 struct hqlc_decoder {
   uint8_t channels;
   uint32_t sample_rate;
-  uint32_t frame_idx; // NF seed requires frame index
   mdct_ola_state ola[HQLC_MAX_CHANNELS];
 };
 
@@ -152,25 +135,14 @@ hqlc_error hqlc_encoder_init(hqlc_encoder *enc, const hqlc_encoder_config *cfg) 
     enc->ema_gain_q8 = enc->prev_gain_code << 8;
     enc->prev_side_bits = 150; // ~19 bytes: typical side info for first probe
     enc->res_bits = 0;
-
-    {
-      int tilt_db = psy_tilt_for_bitrate(cfg->bitrate);
-      enc->tilt_step_q7 = psy_tilt_step_q7(tilt_db);
-      enc->tilt_step_tr_q7 =
-          psy_tilt_step_q7(tilt_db * HQLC_TILT_TRANSIENT_PCT / 100);
-    }
+    enc->tilt_step_q7 = psy_tilt_step_q7(psy_tilt_for_bitrate(cfg->bitrate));
     break;
   case HQLC_MODE_FIXED:
     if (cfg->gain <= 0.0f) {
       return HQLC_ERR_INVALID_ARG;
     }
     enc->gain_code = quant_gain_encode(cfg->gain);
-    {
-      int tilt_db = psy_tilt_for_bitrate(96000);
-      enc->tilt_step_q7 = psy_tilt_step_q7(tilt_db);
-      enc->tilt_step_tr_q7 =
-          psy_tilt_step_q7(tilt_db * HQLC_TILT_TRANSIENT_PCT / 100);
-    }
+    enc->tilt_step_q7 = psy_tilt_step_q7(psy_tilt_for_bitrate(96000));
     break;
   default:
     return HQLC_ERR_INVALID_ARG;
@@ -197,17 +169,15 @@ static int32_t log2_q8_u32(uint32_t x) {
   return msb * 256 + (int32_t)log2_frac_q8[frac_idx];
 }
 
-// Estimate how many bits a frame would cost at a given gain_code, without
 // Estimate rANS coefficient cost for a candidate gain_code without
-// actually writing the quantized output.  Uses per-bin envelope
-// interpolation (same as quant_forward).
+// actually writing the quantized output. Uses flat per-band steps even
+// when the quantizer interpolates — the small estimate error is absorbed
+// by the RC res_bits feedback (verified: bitrate parity to a few bps).
 static int probe_frame_bits(const int32_t *spec_q31,
                             const int *loss_bits,
                             const int32_t *exp_indices,
                             int gain_code,
-                            int n_ch,
-                            int16_t *probe_quant) {
-  (void)probe_quant;
+                            int n_ch) {
   int32_t total_q8 = 0;
 
   for (int ch = 0; ch < n_ch; ch++) {
@@ -348,8 +318,7 @@ static int select_gain(hqlc_encoder *enc,
                        const int32_t *exp_indices,
                        int n_ch,
                        bool *quiet_frame_out,
-                       int *target_bpf_out,
-                       int16_t *probe_quant) {
+                       int *target_bpf_out) {
   *quiet_frame_out = false;
   *target_bpf_out = 0;
 
@@ -372,7 +341,7 @@ static int select_gain(hqlc_encoder *enc,
   if (gc0 > QUANT_GAIN_RC_MAX) {
     gc0 = QUANT_GAIN_RC_MAX;
   }
-  int b0 = probe_frame_bits(spec_q31, loss_bits, exp_indices, gc0, n_ch, probe_quant) +
+  int b0 = probe_frame_bits(spec_q31, loss_bits, exp_indices, gc0, n_ch) +
            enc->prev_side_bits;
 
   int err0 = b0 - effective_target;
@@ -391,7 +360,7 @@ static int select_gain(hqlc_encoder *enc,
   }
 
   int gc1 = fxp_clamp_i32(gc0 + delta, 0, QUANT_GAIN_RC_MAX);
-  int b1 = probe_frame_bits(spec_q31, loss_bits, exp_indices, gc1, n_ch, probe_quant) +
+  int b1 = probe_frame_bits(spec_q31, loss_bits, exp_indices, gc1, n_ch) +
            enc->prev_side_bits;
 
   if (gc1 > gc0 && b0 < effective_target && (b1 - b0) < tol * (gc1 - gc0) / 2) {
@@ -433,7 +402,6 @@ hqlc_error hqlc_encode_frame(hqlc_encoder *enc,
   int16_t *quant = s->quant;
 
   int loss_bits[HQLC_MAX_CHANNELS];
-  int transients[HQLC_MAX_CHANNELS] = {0};
   tns_info tns[HQLC_MAX_CHANNELS];
   memset(tns, 0, sizeof(tns));
 
@@ -442,45 +410,51 @@ hqlc_error hqlc_encode_frame(hqlc_encoder *enc,
     int32_t *ch_spec = &spec_q31[ch * HQLC_FRAME_SAMPLES];
     int32_t *ch_exp = &exp_indices[ch * PSY_N_BANDS];
 
-    HQLC_BENCH_BEGIN();
-    hqlc_error err = mdct_forward(enc->prev_pcm,
-                                  pcm,
-                                  frame_pcm_bytes,
-                                  fmt,
-                                  n_ch,
-                                  ch,
-                                  ch_spec,
-                                  HQLC_FRAME_SAMPLES,
-                                  s->stage.analysis.mdct_work,
-                                  MDCT_SCRATCH_BYTES,
-                                  &loss_bits[ch]);
-    HQLC_BENCH_END(HQLC_BENCH_ENC_MDCT);
-    if (err != HQLC_OK) {
-      return err;
-    }
-
-    for (int i = PSY_ACTIVE_BINS; i < HQLC_FRAME_SAMPLES; i++) {
-      ch_spec[i] = 0;
-    }
-
-    HQLC_BENCH_BEGIN();
     bool tr = tns_detect_transient(&enc->tns_det[ch], pcm, fmt, n_ch, ch);
-    transients[ch] = tr ? 1 : 0;
     bool tns_eligible = tr || enc->tns_hang[ch] > 0;
-    enc->tns_hang[ch] = tr ? HQLC_TNS_HANGOVER
-                           : (enc->tns_hang[ch] > 0 ? enc->tns_hang[ch] - 1 : 0);
-    if (tns_eligible) {
-      tns_analyze(ch_spec, &tns[ch]);
-      if (tns[ch].order > 0) {
-        loss_bits[ch] += tns_fir_safe(ch_spec, tns[ch].k_q30, tns[ch].order);
+    // 1-frame TNS hangover: the frame after an attack still carries it in the
+    // left half of its window, smearing noise up to 10 ms before the attack,
+    // but the decay never trips the detector. Only extends real detections.
+    enc->tns_hang[ch] =
+        tr ? 1 : (enc->tns_hang[ch] > 0 ? enc->tns_hang[ch] - 1 : 0);
+
+    {
+      HQLC_BENCH_BEGIN();
+      hqlc_error err = mdct_forward(enc->prev_pcm,
+                                    pcm,
+                                    frame_pcm_bytes,
+                                    fmt,
+                                    n_ch,
+                                    ch,
+                                    ch_spec,
+                                    HQLC_FRAME_SAMPLES,
+                                    s->stage.analysis.mdct_work,
+                                    MDCT_SCRATCH_BYTES,
+                                    &loss_bits[ch]);
+      HQLC_BENCH_END(HQLC_BENCH_ENC_MDCT);
+      if (err != HQLC_OK) {
+        return err;
       }
+
+      for (int i = PSY_ACTIVE_BINS; i < HQLC_FRAME_SAMPLES; i++) {
+        ch_spec[i] = 0;
+      }
+
+      HQLC_BENCH_BEGIN();
+      if (tns_eligible) {
+        tns_analyze(ch_spec, &tns[ch]);
+        if (tns[ch].order > 0) {
+          loss_bits[ch] += tns_fir_safe(ch_spec, tns[ch].k_q30, tns[ch].order);
+        }
+      }
+      HQLC_BENCH_END(HQLC_BENCH_ENC_TNS);
     }
-    HQLC_BENCH_END(HQLC_BENCH_ENC_TNS);
 
     HQLC_BENCH_BEGIN();
     psy_fine_band_exponents(ch_spec,
                             loss_bits[ch],
-                            tr ? enc->tilt_step_tr_q7 : enc->tilt_step_q7,
+                            enc->tilt_step_q7,
+                            tns_eligible ? 1 : 0,
                             ch_exp);
     HQLC_BENCH_END(HQLC_BENCH_ENC_PSY);
   }
@@ -495,8 +469,6 @@ hqlc_error hqlc_encode_frame(hqlc_encoder *enc,
   int target_bpf = 0;
 
   // run the gain selection algorithm, will do two probes in case of RC mode
-  // Use rans_tmp as probe quant scratch (safe: analysis stage is done)
-  int16_t *probe_quant = (int16_t *)s->stage.coding.rans_tmp;
   HQLC_BENCH_BEGIN();
   gain_code = select_gain(enc,
                           spec_q31,
@@ -504,18 +476,24 @@ hqlc_error hqlc_encode_frame(hqlc_encoder *enc,
                           exp_indices,
                           n_ch,
                           &quiet_frame,
-                          &target_bpf,
-                          probe_quant);
+                          &target_bpf);
   HQLC_BENCH_END(HQLC_BENCH_ENC_SELECT_GAIN);
 
   // Quantize + NF estimate per channel
   HQLC_BENCH_BEGIN();
   for (int ch = 0; ch < n_ch; ch++) {
-    s->noise_factors[ch] = quant_forward_nf(&spec_q31[ch * HQLC_FRAME_SAMPLES],
-                                            loss_bits[ch],
-                                            &exp_indices[ch * PSY_N_BANDS],
-                                            gain_code,
-                                            &quant[ch * HQLC_FRAME_SAMPLES]);
+    bool interp = env_interp_active(tns[ch].order);
+    s->noise_factors[ch] = interp
+                               ? quant_forward_nf_interp(&spec_q31[ch * HQLC_FRAME_SAMPLES],
+                                                         loss_bits[ch],
+                                                         &exp_indices[ch * PSY_N_BANDS],
+                                                         gain_code,
+                                                         &quant[ch * HQLC_FRAME_SAMPLES])
+                               : quant_forward_nf(&spec_q31[ch * HQLC_FRAME_SAMPLES],
+                                                  loss_bits[ch],
+                                                  &exp_indices[ch * PSY_N_BANDS],
+                                                  gain_code,
+                                                  &quant[ch * HQLC_FRAME_SAMPLES]);
   }
   HQLC_BENCH_END(HQLC_BENCH_ENC_QUANT_FWD);
 
@@ -607,25 +585,7 @@ hqlc_error hqlc_encode_frame(hqlc_encoder *enc,
     enc->prev_side_bits = (int)(side_bytes * 8) + 32; // +32: rANS state flush overhead
   }
 
-  // Populate diagnostic struct
-  enc->diag.gain_code = gain_code;
-  enc->diag.frame_bits = (int)(*out_len * 8);
-  enc->diag.target_bpf = target_bpf;
-  enc->diag.res_bits = enc->res_bits;
-  enc->diag.quiet_frame = quiet_frame ? 1 : 0;
-  memcpy(
-      enc->diag.exp_indices, exp_indices, (size_t)n_ch * PSY_N_BANDS * sizeof(int32_t));
-  for (int ch = 0; ch < n_ch; ch++) {
-    enc->diag.noise_factors[ch] = s->noise_factors[ch];
-    enc->diag.tns_orders[ch] = tns[ch].order;
-    enc->diag.transients[ch] = transients[ch];
-  }
-
   return HQLC_OK;
-}
-
-const hqlc_frame_diag *hqlc_encoder_get_diag(const hqlc_encoder *enc) {
-  return enc ? &enc->diag : NULL;
 }
 
 hqlc_error hqlc_decoder_init(hqlc_decoder *dec, uint8_t channels, uint32_t sample_rate) {
@@ -740,8 +700,9 @@ hqlc_error hqlc_decode_frame(hqlc_decoder *dec,
 
   uint8_t no_nf_dec[HQLC_MAX_CHANNELS * PSY_N_BANDS];
   memset(no_nf_dec, 0, sizeof(no_nf_dec));
-  if (rans_len > 0) {
-    rans_decode_coeffs(rans_data, rans_len, quant_buf, no_nf_dec, n_ch, gain_code);
+  if (rans_len > 0 &&
+      !rans_decode_coeffs(rans_data, rans_len, quant_buf, no_nf_dec, n_ch, gain_code)) {
+    return HQLC_ERR_BITSTREAM_CORRUPT;
   }
   HQLC_BENCH_END(HQLC_BENCH_DEC_ENTROPY);
 
@@ -750,10 +711,15 @@ hqlc_error hqlc_decode_frame(hqlc_decoder *dec,
     int16_t *ch_quant = &quant_buf[ch * HQLC_FRAME_SAMPLES];
     int32_t *spec_q31 = s->stage.synthesis.spec_q31;
 
-    // Inverse quantize (flat per-band exponents)
+    // Inverse quantize (envelope mode must mirror the encoder's gate)
     HQLC_BENCH_BEGIN();
     int loss_bits;
-    quant_inverse(ch_quant, ch_exp, gain_code, spec_q31, &loss_bits);
+    bool interp = env_interp_active(tns[ch].order);
+    if (interp) {
+      quant_inverse_interp(ch_quant, ch_exp, gain_code, spec_q31, &loss_bits);
+    } else {
+      quant_inverse(ch_quant, ch_exp, gain_code, spec_q31, &loss_bits);
+    }
     HQLC_BENCH_END(HQLC_BENCH_DEC_DEQUANT);
 
     // Noise fill
@@ -787,6 +753,5 @@ hqlc_error hqlc_decode_frame(hqlc_decoder *dec,
     HQLC_BENCH_END(HQLC_BENCH_DEC_IMDCT_OLA);
   }
 
-  dec->frame_idx++;
   return HQLC_OK;
 }

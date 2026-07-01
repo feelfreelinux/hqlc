@@ -95,40 +95,57 @@ static inline int32_t scale_to_q8(int32_t abs_spec, int32_t inv_step_m, int tota
   return fxp_sat_i64_to_i32((int64_t)abs_spec * inv_step_m << (-total_shift));
 }
 
-// Forward quantizer
-void quant_forward(const int32_t *spec_q31,
-                   int loss_bits,
-                   const int32_t *exp_indices,
-                   int gain_code,
-                   int16_t *quant_out) {
+/* ── Forward quantizer + NF with per-bin interpolated exponents.
+ * Decoder-symmetric (quant_inverse_interp interpolates identically from the
+ * transmitted band exponents), so the bitstream format is unchanged. ── */
+int quant_forward_nf_interp(const int32_t *spec_q31,
+                            int loss_bits,
+                            const int32_t *exp_indices,
+                            int gain_code,
+                            int16_t *quant_out) {
   for (int i = PSY_ACTIVE_BINS; i < HQLC_FRAME_SAMPLES; i++) {
     quant_out[i] = 0;
   }
 
+  HQLC_BENCH_BEGIN();
   int32_t bin_exp[PSY_ACTIVE_BINS];
   quant_interp_bin_exp(exp_indices, bin_exp);
 
-  for (int i = 0; i < PSY_ACTIVE_BINS; i++) {
-    // Decompose -E for inv_step: -E = 8*int_part + frac, frac in 0..7
-    int E = 2 * bin_exp[i] - gain_code - QUANT_EXP_OFFSET;
-    int neg_E = -E;
-    int int_part = neg_E >> 3;
-    int frac = neg_E & 7;
+  int z = 0;
+  int32_t nf_total = 0, nf_ns = 0;
+  int32_t recent[8] = {0};
+  int E_bias = gain_code + QUANT_EXP_OFFSET;
 
-    int32_t inv_step_m = quant_pow2_eighth_q30[frac] >> 2; // Q28
-    int total_shift = QUANT_TOTAL_Q - loss_bits - int_part;
+  for (int i = 0; i < PSY_ACTIVE_BINS; i++) {
+    int neg_E = E_bias - 2 * (int)bin_exp[i];
+    int32_t inv_step_m = quant_pow2_eighth_q30[neg_E & 7] >> 2;
+    int total_shift = QUANT_TOTAL_Q - loss_bits - (neg_E >> 3);
 
     int32_t x = spec_q31[i];
     int32_t sign = x >> 31;
     int32_t abs_spec = (x ^ sign) - sign;
-
     int32_t scaled_q8 = scale_to_q8(abs_spec, inv_step_m, total_shift);
-
-    // Deadzone, zero if |scaled| < 0.65, else q = floor(|scaled| - 0.65 + 1)
     int32_t dz_mask = ~((scaled_q8 - QUANT_DZ_THRESH_Q8) >> 31);
     int32_t q = ((scaled_q8 + QUANT_DZ_BIAS_Q8) >> 8) & dz_mask;
     quant_out[i] = (int16_t)((q ^ sign) - sign);
+
+    recent[i & 7] = scaled_q8;
+    if (i >= 6) {
+      z = (scaled_q8 < QUANT_DZ_THRESH_Q8) ? z + 1 : 0;
+      if (z > 4) {
+        nf_total += recent[(i - 2) & 7];
+        nf_ns++;
+      }
+    }
   }
+  HQLC_BENCH_END(HQLC_BENCH_ENC_QLOOP);
+
+  if (nf_ns == 0) {
+    return 7;
+  }
+  int32_t avg_q8 = nf_total / nf_ns;
+  int nf = (128 - avg_q8 + 8) >> 4;
+  return fxp_clamp_i32(nf, 0, 7);
 }
 
 /* ── Forward quantizer + NF estimation (flat per-band exponents) ── */
@@ -219,6 +236,78 @@ int quant_forward_nf(const int32_t *spec_q31,
   return fxp_clamp_i32(nf, 0, 7);
 }
 
+/* ── Inverse quantizer with per-bin interpolated exponents
+ * (see quant_forward_nf_interp; decoder-symmetric, same bitstream). ── */
+void quant_inverse_interp(const int16_t *quant_in,
+                          const int32_t *exp_indices,
+                          int gain_code,
+                          int32_t *spec_q31,
+                          int *loss_bits_out) {
+  int max_exp = exp_indices[0];
+  for (int b = 1; b < PSY_N_BANDS; b++) {
+    if (exp_indices[b] > max_exp) {
+      max_exp = exp_indices[b];
+    }
+  }
+  int max_oct = (2 * max_exp - gain_code - QUANT_EXP_OFFSET) >> 3;
+
+  // Interpolated values are convex combinations of the band exponents, so
+  // max_oct from the band maximum still bounds every bin.
+  int32_t bin_exp[PSY_ACTIVE_BINS];
+  quant_interp_bin_exp(exp_indices, bin_exp);
+
+  // Find the max dequantized magnitude (for BFP headroom)
+  uint64_t max_val = 0;
+  for (int i = 0; i < PSY_ACTIVE_BINS; i++) {
+    if (quant_in[i] == 0) {
+      continue;
+    }
+    int mag = (quant_in[i] > 0) ? quant_in[i] : -quant_in[i];
+    int E = 2 * (int)bin_exp[i] - gain_code - QUANT_EXP_OFFSET;
+    int32_t step_m = quant_pow2_eighth_q30[E & 7] >> 2;
+    int oct_shift = max_oct - (E >> 3);
+    int32_t dq_q8 = mag * 256 + Q8(QUANT_CENTROID);
+    uint64_t val =
+        (oct_shift < 63) ? (uint64_t)((int64_t)dq_q8 * step_m >> oct_shift) : 0;
+    if (val > max_val) {
+      max_val = val;
+    }
+  }
+
+  if (max_val == 0) {
+    for (int i = 0; i < HQLC_FRAME_SAMPLES; i++) {
+      spec_q31[i] = 0;
+    }
+    *loss_bits_out = 0;
+    return;
+  }
+
+  int headroom = (int)__builtin_clzll(max_val) - 1;
+  int norm_shift = 32 - headroom;
+
+  for (int i = PSY_ACTIVE_BINS; i < HQLC_FRAME_SAMPLES; i++) {
+    spec_q31[i] = 0;
+  }
+
+  for (int i = 0; i < PSY_ACTIVE_BINS; i++) {
+    if (quant_in[i] == 0) {
+      spec_q31[i] = 0;
+      continue;
+    }
+    int sign = (quant_in[i] > 0) ? 1 : -1;
+    int mag = (quant_in[i] > 0) ? quant_in[i] : -quant_in[i];
+    int E = 2 * (int)bin_exp[i] - gain_code - QUANT_EXP_OFFSET;
+    int32_t step_m = quant_pow2_eighth_q30[E & 7] >> 2;
+    int total_shift = (max_oct - (E >> 3)) + norm_shift;
+    int32_t dq_q8 = mag * 256 + Q8(QUANT_CENTROID);
+    spec_q31[i] = (total_shift < 63)
+                      ? sign * (int32_t)((int64_t)dq_q8 * step_m >> total_shift)
+                      : 0;
+  }
+
+  *loss_bits_out = max_oct - headroom + 27;
+}
+
 // Perform inverse quantize
 void quant_inverse(const int16_t *quant_in,
                    const int32_t *exp_indices,
@@ -304,53 +393,15 @@ int quant_gain_encode(float gain) {
   return fxp_clamp_i32(code, 0, QUANT_GAIN_MAX_CODE);
 }
 
-/*
- * NF experiment knobs (scripts/nf_sweep.py):
- *   HQLC_NF_DISABLE      compile out the fill entirely (attribution runs)
- *   HQLC_NF_DETILT_PCT   0..100: subtract this fraction of the envelope
- *                        tilt from the fill amplitude. The transmitted
- *                        exponents contain the encoder's HF pre-emphasis
- *                        tilt (~29 dB at the top band at 96k), which
- *                        inflates fill amplitude far above the true HF
- *                        content in quiet passages. De-tilting the fill
- *                        envelope (not the dequant step) compensates.
- */
-#ifndef HQLC_NF_DETILT_PCT
-#define HQLC_NF_DETILT_PCT 0
-#endif
-
-#if HQLC_NF_DETILT_PCT > 0
-// Center fine-band index per coarse band (tilt accumulates per fine band)
-static const uint8_t nf_band_fine_center[20] = {
-    1, 5, 10, 15, 19, 22, 24, 26, 27, 29, 31, 32, 34, 36, 37, 39, 41, 42, 44, 46,
-};
-// Exponent-index reduction for the fill envelope. 54 = tilt_step at 96k
-// (30 dB tilt); /128 converts EXP_Q7 to exponent indices.
-static inline int nf_detilt_exp(int band) {
-  return (HQLC_NF_DETILT_PCT * (int)nf_band_fine_center[band] * 54 + 6400) / 12800;
-}
-#else
-static inline int nf_detilt_exp(int band) {
-  (void)band;
-  return 0;
-}
-#endif
-
-void nf_run_length_fill(int16_t *quant,
-                        const int32_t *exp_indices,
-                        int gain_code,
-                        int nf,
-                        int32_t *spec_q31,
-                        int *loss_bits_io) {
-#ifdef HQLC_NF_DISABLE
-  (void)quant;
-  (void)exp_indices;
-  (void)gain_code;
-  (void)nf;
-  (void)spec_q31;
-  (void)loss_bits_io;
-  return;
-#else
+// Fill runs of >4 consecutive zeros with shaped pseudorandom noise at
+// ±(8-nf)/16 * step; nf==8 means no fill. Operates on the dequantized BFP
+// spectrum, widening it first if the fill needs more headroom.
+static void nf_fill_impl(int16_t *quant,
+                         const int32_t *exp_indices,
+                         int gain_code,
+                         int nf,
+                         int32_t *spec_q31,
+                         int *loss_bits_io) {
   if (nf >= 8) {
     return;
   }
@@ -397,7 +448,7 @@ void nf_run_length_fill(int16_t *quant,
   for (int b = 0; b < PSY_N_BANDS; b++) {
     int s = psy_band_edges[b];
     int e = psy_band_edges[b + 1];
-    int E = 2 * ((int)exp_indices[b] - nf_detilt_exp(b)) - E_bias;
+    int E = 2 * (int)exp_indices[b] - E_bias;
     int octave = E >> 3;
     int32_t step_m = quant_pow2_eighth_q30[E & 7] >> 2;
     int32_t fill_m = (int32_t)((uint32_t)nf_scale * (uint32_t)step_m >> 4);
@@ -423,5 +474,13 @@ void nf_run_length_fill(int16_t *quant,
   }
 
   *loss_bits_io = loss_bits;
-#endif // HQLC_NF_DISABLE
+}
+
+void nf_run_length_fill(int16_t *quant,
+                        const int32_t *exp_indices,
+                        int gain_code,
+                        int nf,
+                        int32_t *spec_q31,
+                        int *loss_bits_io) {
+  nf_fill_impl(quant, exp_indices, gain_code, nf, spec_q31, loss_bits_io);
 }
