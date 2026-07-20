@@ -165,6 +165,7 @@ button:disabled { opacity: .5; cursor: default; border-color: var(--border); }
 #history .dot { width: 14px; height: 14px; border: 1px solid var(--border); background: var(--surface); }
 #history .dot.correct { background: var(--ok); border-color: var(--ok); }
 #history .dot.wrong   { background: var(--bad); border-color: var(--bad); }
+#history .dot.answered { background: var(--muted); border-color: var(--muted); }
 #history .dot.current { border-color: var(--accent); border-width: 2px; }
 
 #btn-abort { display: block; margin: 0 auto; }
