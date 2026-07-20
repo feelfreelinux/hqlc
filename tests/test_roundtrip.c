@@ -217,6 +217,27 @@ void test_decode_corrupt_frames(void) {
   free(dec_scratch);
 }
 
+void test_roundtrip_rc_mode(void) {
+  const int n_frames = 10;
+  const int n_samples = n_frames * HQLC_FRAME_SAMPLES;
+
+  int16_t *pcm_orig = (int16_t *)calloc(n_samples, sizeof(int16_t));
+  gen_sine_pcm16(pcm_orig, n_samples, 1, 1000.0f, 0.5f);
+
+  int16_t *pcm_dec = codec_roundtrip(pcm_orig, n_frames, 1, HQLC_MODE_RC, 0, 128000);
+
+  float snr = compute_snr(pcm_orig,
+                          2 * HQLC_FRAME_SAMPLES,
+                          pcm_dec,
+                          3 * HQLC_FRAME_SAMPLES,
+                          4 * HQLC_FRAME_SAMPLES,
+                          1);
+  TEST_ASSERT_GREATER_THAN_FLOAT(15.0f, snr);
+
+  free(pcm_orig);
+  free(pcm_dec);
+}
+
 int main(void) {
   UNITY_BEGIN();
   RUN_TEST(test_roundtrip_mono);
