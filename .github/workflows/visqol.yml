@@ -6,12 +6,12 @@ jobs:
   visqol:
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@v7
 
       - name: Install ffmpeg
         run: sudo apt-get update && sudo apt-get install -y ffmpeg
 
-      - name: Build hqlc_enc
+      - name: Build hqlc
         run: |
           cmake -B build -DHQLC_TOOLS=ON
           cmake --build build
