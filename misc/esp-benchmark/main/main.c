@@ -24,7 +24,7 @@
 // Set to 1 for HQLC-only per-stage profiling, 0 for multi-codec comparison
 #define HQLC_STAGE_PROFILE 1
 
-/* ── Shared buffers ── */
+/* Shared buffers */
 
 // Max PCM frame across codecs: AAC 1024 * 2ch * 2 = 4096
 #define MAX_PCM_FRAME_BYTES 4096
@@ -200,7 +200,7 @@ static void bench_codec(const codec_entry_t *codec, int cpu_mhz,
         esp_audio_dec_close(dec_hd);
     }
 
-    /* ── Results ── */
+    /* Results */
     {
         float actual_kbps = (float)total_encoded * 8.0f * 48000.0f /
                             (n_frames * (float)frame_samples) / 1000.0f;
@@ -412,7 +412,7 @@ static void bench_hqlc_stages(int cpu_mhz) {
         printf("  Bitrate: %.1f kbps\n\n", actual_kbps);
 
         // Print encoder stages
-        printf("  ── Encoder stages ──\n");
+        printf("  -- Encoder stages --\n");
         printf("  %-20s %10s %10s %10s %7s %7s\n",
                "Stage", "Avg cy", "Min cy", "Max cy", "Avg us", "% enc");
         printf("  %-20s %10s %10s %10s %7s %7s\n",
@@ -429,7 +429,7 @@ static void bench_hqlc_stages(int cpu_mhz) {
                    (unsigned long)s->max, (unsigned long)avg_us, pct);
         }
         // MDCT sub-stages + entropy sub-stages
-        printf("  ── MDCT breakdown ──\n");
+        printf("  -- MDCT breakdown --\n");
         for (int i = HQLC_BENCH_MDCT_FOLD; i < HQLC_BENCH_N_STAGES; i++) {
             const hqlc_bench_stage *s = &hb_ctx.stages[i];
             if (s->count == 0) continue;
@@ -503,7 +503,7 @@ static void bench_hqlc_stages(int cpu_mhz) {
         int frame_samples = in_size / (TEST_PCM_CHANNELS * 2);
         float frame_ms = (float)frame_samples / 48.0f;
 
-        printf("\n  ── Decoder stages ──\n");
+        printf("\n  -- Decoder stages --\n");
         printf("  %-20s %10s %10s %10s %7s %7s\n",
                "Stage", "Avg cy", "Min cy", "Max cy", "Avg us", "% dec");
         printf("  %-20s %10s %10s %10s %7s %7s\n",
@@ -520,7 +520,7 @@ static void bench_hqlc_stages(int cpu_mhz) {
                    (unsigned long)s->max, (unsigned long)avg_us, pct);
         }
         // IMDCT + other sub-stages
-        printf("  ── Sub-stage breakdown ──\n");
+        printf("  -- Sub-stage breakdown --\n");
         for (int i = HQLC_BENCH_MDCT_FOLD; i < HQLC_BENCH_N_STAGES; i++) {
             const hqlc_bench_stage *s = &hb_ctx.stages[i];
             if (s->count == 0) continue;
@@ -623,7 +623,7 @@ void app_main(void) {
         return;
     }
 
-    /* ── Build codec table ── */
+    /* Build codec table */
 
     codecs[0] = (codec_entry_t){
         .name = "HQLC",        .type = hqlc_type,

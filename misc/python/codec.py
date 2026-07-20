@@ -405,9 +405,7 @@ def encode_rc(channels, bitrate):
     return payloads, total_bits, n_frames
 
 
-# ── WAV I/O ──
-
-
+# WAV I/O
 def _wav_read(path):
     """Read a 16-bit PCM WAV and return (channels_list, sample_rate)."""
     with wave.open(path, "rb") as wf:
@@ -436,9 +434,7 @@ def _wav_write(path, channels, sample_rate):
         wf.writeframes(pcm.tobytes())
 
 
-# ── CLI ──
-
-
+# CLI
 def main():
     parser = argparse.ArgumentParser(
         prog="hqlc",

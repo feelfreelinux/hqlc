@@ -9,7 +9,7 @@ const uint16_t psy_band_edges[PSY_N_BANDS + 1] = {
     89, 107, 127, 152, 180, 215, 255, 303, 360, 427,
 };
 
-/* ── Fine-band exponent tables ── */
+/* Fine-band exponent tables */
 
 // 48 fine bands: single-bin below 844 Hz (18 bands), ERB-spaced above
 const uint16_t psy_fine_band_edges[PSY_N_FINE_BANDS + 1] = {

@@ -209,7 +209,7 @@ static esp_audio_err_t hqlc_dec_close(void *decoder) {
     return ESP_AUDIO_ERR_OK;
 }
 
-/* ── Registration ── */
+/* Registration */
 static const esp_audio_enc_ops_t hqlc_enc_ops = {
     .get_frame_info_by_cfg = hqlc_enc_get_frame_info,
     .open = hqlc_enc_open,

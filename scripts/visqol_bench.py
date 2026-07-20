@@ -29,8 +29,7 @@ LC3_ENC = None
 LC3_DEC = None
 
 
-# ── Audio helpers ──
-
+# Audio helpers
 def to_48k_wav(src, dst):
     subprocess.run(
         ["ffmpeg", "-y", "-loglevel", "error", "-i", str(src),
@@ -54,8 +53,7 @@ def extract_musdb_mix(src, dst):
         capture_output=True, check=True)
 
 
-# ── ViSQOL via docker ──
-
+# ViSQOL via docker
 def visqol_mono(ref, deg, tmpdir):
     r = subprocess.run(
         ["docker", "run", "--rm", "-v", f"{tmpdir}:/work", DOCKER_IMAGE,
@@ -82,7 +80,7 @@ def visqol_stereo(ref, deg, tmpdir):
     return (mos_l + mos_r) / 2.0
 
 
-# ── Zimtohrli via pyohrli ──
+# Zimtohrli via pyohrli
 # The prebuilt _pyohrli.so is a CPython extension linked against one specific
 # Python (3.14 on this machine); it must run under that interpreter. The metric
 # is lazily initialised once per worker process.
@@ -134,7 +132,7 @@ def _check_zim_python():
     """
     so = REPO / "mos" / "zimtohrli" / "build" / "_pyohrli.so"
     if not so.exists():
-        sys.exit(f"--zim: {so} not found — build pyohrli (cmake in mos/zimtohrli) first.")
+        sys.exit(f"--zim: {so} not found - build pyohrli (cmake in mos/zimtohrli) first.")
     want = None
     try:  # best-effort: read the linked Python framework version via otool (macOS)
         out = subprocess.run(["otool", "-L", str(so)], capture_output=True, text=True).stdout
@@ -152,8 +150,7 @@ def _check_zim_python():
             f"    /opt/homebrew/bin/python{want} {' '.join(sys.argv)}")
 
 
-# ── Codec encode/decode ──
-
+# Codec encode/decode
 def encode_hqlc(ref, deg, bitrate, tmp):
     subprocess.run([str(HQLC_ENC), str(ref), str(deg), "-b", str(bitrate)],
                    capture_output=True, check=True)
@@ -220,7 +217,7 @@ CODECS = {"hqlc": encode_hqlc, "opus": encode_opus, "aac": encode_aac,
           "mp3": encode_mp3, "lc3": encode_lc3}
 
 
-# ── Track processing ──
+# Track processing
 # prep_mode: "wav" = to_48k_wav, "musdb" = extract_musdb_mix
 
 def process_track(name, src_path, prep_mode, codec, bitrate, do_zim=False):
@@ -261,8 +258,7 @@ def process_track(name, src_path, prep_mode, codec, bitrate, do_zim=False):
         return name, codec, mos, zim, "ok"
 
 
-# ── Dataset loaders (each returns [(name, src_path, prep_mode), ...]) ──
-
+# Dataset loaders (each returns [(name, src_path, prep_mode), ...])
 def load_sqam():
     sqam_dir = REPO / "datasets" / "SQAM_FLAC_00s9l4"
     if not sqam_dir.exists():
@@ -307,8 +303,7 @@ def _init_pool_worker(lc3_enc, lc3_dec):
     LC3_ENC, LC3_DEC = lc3_enc, lc3_dec
 
 
-# ── Main ──
-
+# Main
 def main():
     parser = argparse.ArgumentParser(description="ViSQOL benchmark for HQLC")
     sub = parser.add_subparsers(dest="cmd")
@@ -408,7 +403,7 @@ def main():
         hdr += f"  {'Zim':>6s}  {'Min':>6s}  {'Max':>6s}"
     hdr += f"  {'N':>3s}"
     print(hdr)
-    print("─" * (len(hdr) - 1))
+    print("-" * (len(hdr) - 1))
     for codec in codec_list:
         rows = [(m, z) for _, c, m, z, s in results if c == codec and s == "ok" and m > 0]
         if not rows:
@@ -420,7 +415,7 @@ def main():
             if zs:
                 line += f"  {sum(zs)/len(zs):6.3f}  {min(zs):6.3f}  {max(zs):6.3f}"
             else:
-                line += f"  {'—':>6s}  {'—':>6s}  {'—':>6s}"
+                line += f"  {'-':>6s}  {'-':>6s}  {'-':>6s}"
         line += f"  {len(rows):3d}"
         print(line)
 

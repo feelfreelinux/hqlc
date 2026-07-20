@@ -29,7 +29,7 @@
 
 #include "hqlc.h"
 
-// ── HQLC container format ────────────────────────────────────────────────
+/* HQLC container format */
 //
 // Header (16 bytes):
 //   [0..3]   magic "HQLC"
@@ -46,7 +46,7 @@
 #define HQLC_FILE_VERSION  1
 #define HQLC_FILE_HDR_SIZE 16
 
-// ── Helpers ──────────────────────────────────────────────────────────────
+/* Helpers */
 
 static void put_le16(uint8_t *p, uint16_t v) {
   p[0] = v & 0xFF;
@@ -218,7 +218,7 @@ write_wav(const char *path, const int16_t *data, int32_t n_pcm_frames, int ch) {
   return 0;
 }
 
-// ── Encode: WAV → .hqlc ─────────────────────────────────────────────────
+/* Encode: WAV to .hqlc */
 
 static int
 do_encode(const char *in, const char *out, hqlc_mode mode, uint32_t bitrate, float gain) {
@@ -322,7 +322,7 @@ do_encode(const char *in, const char *out, hqlc_mode mode, uint32_t bitrate, flo
   return 0;
 }
 
-// ── Decode: .hqlc → WAV ─────────────────────────────────────────────────
+/* Decode: .hqlc to WAV */
 
 static int do_decode(const char *in, const char *out) {
   size_t file_len;
@@ -437,7 +437,7 @@ static int do_decode(const char *in, const char *out) {
   return 0;
 }
 
-// ── Roundtrip: WAV → encode → decode → WAV ──────────────────────────────
+/* Roundtrip: encode then decode a WAV */
 
 static int do_roundtrip(
     const char *in, const char *out, hqlc_mode mode, uint32_t bitrate, float gain) {
@@ -511,7 +511,7 @@ static int do_roundtrip(
     }
   }
 
-  // Trim 1-frame latency: decoded[1..n_frames) ≈ orig[0..n_frames-1)
+  // Trim 1-frame latency: decoded[1..n_frames) ~= orig[0..n_frames-1)
   int out_frames = n_frames - 1;
   int16_t *trimmed = &pcm_out[HQLC_FRAME_SAMPLES * ch];
 
@@ -545,7 +545,7 @@ cleanup:
   return ret;
 }
 
-// ── Main ─────────────────────────────────────────────────────────────────
+/* Main */
 
 enum op { OP_ROUNDTRIP, OP_ENCODE, OP_DECODE };
 

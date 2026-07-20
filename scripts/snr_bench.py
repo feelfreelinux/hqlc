@@ -63,8 +63,7 @@ PRE_REGION_MS = (20.0, 2.0)
 PRE_RATIO_CLAMP = 40.0  # dB cap when the reference is silent pre-attack
 
 
-# ── Signal loading / alignment ─────────────────────────────────────────
-
+# Signal loading / alignment
 def _read_norm(path: Path) -> tuple[int, np.ndarray]:
     sr, x = wavfile.read(str(path))
     if x.dtype.kind == "i":
@@ -81,7 +80,7 @@ def load_aligned(ref_path: Path, deg_path: Path) -> tuple[np.ndarray, np.ndarray
 
     Returns (ref, deg, sample_rate) trimmed to equal length, channels in
     columns. Lag is the peak cross-correlation on channel 0, searched coarse
-    (step 16) over [0, 1024] then refined ±16.
+    (step 16) over [0, 1024] then refined +/-16.
     """
     sr_r, ref = _read_norm(ref_path)
     _, deg = _read_norm(deg_path)
@@ -110,8 +109,7 @@ def _window_energy(x: np.ndarray) -> np.ndarray:
     return (x[:n] ** 2).sum(axis=1).reshape(-1, SEG_WIN).sum(axis=1)
 
 
-# ── Metrics (on aligned arrays) ────────────────────────────────────────
-
+# Metrics (on aligned arrays)
 def snr_db(ref: np.ndarray, deg: np.ndarray) -> float:
     err = ref - deg
     s = float(np.sum(ref * ref))
@@ -172,8 +170,7 @@ def pre_echo(ref: np.ndarray, deg: np.ndarray, sr: int):
     return float(max(ratios)), float(np.mean(ratios)), len(ratios)
 
 
-# ── Perceptual backends ────────────────────────────────────────────────
-
+# Perceptual backends
 def to_mono(src: Path, dst: Path, channel: int) -> None:
     subprocess.run(
         ["ffmpeg", "-y", "-loglevel", "error", "-i", str(src),
@@ -246,8 +243,7 @@ def zim_stereo(ref_path: Path, deg_path: Path) -> float:
     ))
 
 
-# ── Per-clip task ─────────────────────────────────────────────────────
-
+# Per-clip task
 def process_clip(args: tuple) -> dict:
     bitrate, clip_name, clip_path, hqlc_bin, duration, do_visqol, do_zim = args
     row = {"bitrate": bitrate, "clip": clip_name,
@@ -322,11 +318,10 @@ def _check_zim_python() -> None:
             f"    /opt/homebrew/bin/python{want} {' '.join(sys.argv)}")
 
 
-# ── Driver ─────────────────────────────────────────────────────────────
-
+# Driver
 def _fmt_pe(worst, n) -> str:
     if worst is None:
-        return "    —    "
+        return "    -    "
     return f"{worst:+6.1f}/{n:<3d}"
 
 
@@ -346,7 +341,7 @@ def main():
 
     hqlc_bin = Path(args.bin)
     if not hqlc_bin.exists():
-        sys.exit(f"Error: {hqlc_bin} not found — build it first (cmake --build build --target hqlc_cli)")
+        sys.exit(f"Error: {hqlc_bin} not found - build it first (cmake --build build --target hqlc_cli)")
     clips = sorted(Path(args.clips_dir).glob("*.wav"))
     if not clips:
         sys.exit(f"No .wav clips in {args.clips_dir}")
@@ -385,7 +380,7 @@ def main():
             + (f"  {'ViSQOL':>7s}" if args.visqol else "")
             + (f"  {'Zim':>7s}" if args.zim else "") + "   N")
     print(head)
-    print("─" * (len(head) - 1))
+    print("-" * (len(head) - 1))
     for br in bitrates:
         ok = [r for r in rows if r["bitrate"] == br and r["status"] == "ok"]
         if not ok:
@@ -394,7 +389,7 @@ def main():
         p5 = sum(r["seg_p5"] for r in ok) / len(ok)
         min_p5 = min(r["seg_p5"] for r in ok)
         pes = [r["pe_worst"] for r in ok if r["pe_worst"] is not None]
-        max_pe = f"{max(pes):+6.1f}" if pes else "     —"
+        max_pe = f"{max(pes):+6.1f}" if pes else "     -"
         line = f"{br:>7d}  {snr:>6.2f}  {p5:>6.2f}  {min_p5:>6.2f}  {max_pe}"
         if args.visqol:
             line += f"  {sum(r['visqol'] for r in ok) / len(ok):>7.3f}"

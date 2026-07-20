@@ -367,7 +367,7 @@ hqlc_error hqlc_encode_frame(hqlc_encoder *enc,
   tns_info tns[HQLC_MAX_CHANNELS];
   memset(tns, 0, sizeof(tns));
 
-  // Per channel: MDCT → TNS → exponents
+  // Per channel: MDCT -> TNS -> exponents
   for (int ch = 0; ch < n_ch; ch++) {
     int32_t *ch_spec = &spec_q31[ch * HQLC_FRAME_SAMPLES];
     int32_t *ch_exp = &exp_indices[ch * PSY_N_BANDS];
