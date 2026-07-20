@@ -1,0 +1,57 @@
+name: Release builds
+
+on:
+  release:
+    types: [published]
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    strategy:
+      matrix:
+        include:
+          - os: ubuntu-latest
+            name: linux-x86_64
+          - os: windows-latest
+            name: windows-x86_64
+          - os: macos-latest
+            name: macos-arm64
+
+    runs-on: ${{ matrix.os }}
+
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: Configure
+        run: cmake -B build -DCMAKE_BUILD_TYPE=Release -DHQLC_TOOLS=ON
+
+      - name: Build
+        run: cmake --build build --config Release
+
+      - name: Package (Unix)
+        if: runner.os != 'Windows'
+        run: |
+          mkdir -p dist
+          cp build/hqlc dist/
+          tar czf hqlc-${{ matrix.name }}.tar.gz -C dist hqlc
+
+      - name: Package (Windows)
+        if: runner.os == 'Windows'
+        shell: bash
+        run: |
+          mkdir -p dist
+          cp build/Release/hqlc.exe dist/
+          7z a hqlc-${{ matrix.name }}.zip dist/hqlc.exe
+
+      - name: Upload release asset
+        env:
+          GH_TOKEN: ${{ github.token }}
+        shell: bash
+        run: |
+          if [ "${{ runner.os }}" = "Windows" ]; then
+            gh release upload "${{ github.event.release.tag_name }}" hqlc-${{ matrix.name }}.zip
+          else
+            gh release upload "${{ github.event.release.tag_name }}" hqlc-${{ matrix.name }}.tar.gz
+          fi

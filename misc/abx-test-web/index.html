@@ -1,0 +1,151 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>HQLC ABX Listening Test</title>
+  <link rel="stylesheet" href="abx.css">
+</head>
+<body>
+  <div id="app">
+
+    <section id="step-file">
+      <h1>HQLC ABX Listening Test</h1>
+      <p>
+        Double-blind ABX test comparing codecs against the original. Load your own
+        lossless FLAC clips. Everything runs in your browser and nothing is uploaded.
+      </p>
+      <label class="file-pick" tabindex="0">
+        Choose FLAC files
+        <input type="file" id="file-input" accept=".flac,audio/flac,audio/x-flac" multiple>
+      </label>
+      <div id="file-list"></div>
+      <div id="load-error" class="error" hidden></div>
+    </section>
+
+    <section id="step-config" hidden>
+      <h2>Test settings</h2>
+
+      <div class="form-row">
+        <label>Bitrate
+          <select id="sel-bitrate">
+            <option value="96000">96 kbps</option>
+            <option value="128000" selected>128 kbps</option>
+            <option value="160000">160 kbps</option>
+            <option value="196000">196 kbps</option>
+            <option value="256000">256 kbps</option>
+          </select>
+        </label>
+        <label>Trials per track (each codec)
+          <input type="number" id="inp-trials" value="5" min="3" max="50">
+        </label>
+      </div>
+
+      <fieldset class="codec-checks">
+        <legend>Codecs to compare</legend>
+        <label><input type="checkbox" value="hqlc" checked> HQLC</label>
+        <label><input type="checkbox" value="opus" checked> Opus</label>
+        <label><input type="checkbox" value="mp3" checked> MP3 (LAME)</label>
+      </fieldset>
+
+      <label class="check-row">
+        <input type="checkbox" id="chk-resume">
+        Keep position when switching A/B/X (instead of restarting the fragment)
+      </label>
+
+      <p id="trial-plan" class="note"></p>
+
+      <button id="btn-start" class="primary">Start ABX test</button>
+      <div id="processing" hidden>
+        <div id="processing-text">Encoding...</div>
+        <div class="progress-bar"><div class="progress-fill" id="progress-fill"></div></div>
+        <div id="processing-detail"></div>
+      </div>
+    </section>
+
+    <section id="step-abx" hidden>
+      <div class="abx-head">
+        <h2>Trial <span id="trial-cur">1</span> / <span id="trial-tot">30</span></h2>
+        <div class="score-live" id="score-live">0 / 0 correct</div>
+      </div>
+      <div id="trial-file" class="trial-file"></div>
+
+      <!-- Transport: shared clock so A/B/X switch instantly at the same position -->
+      <div class="transport">
+        <button id="btn-play" class="tp-btn">Play</button>
+        <div class="seek" id="seek"><div class="seek-fill" id="seek-fill"></div></div>
+        <span class="time" id="time">0:00 / 0:00</span>
+      </div>
+
+      <div class="player-row">
+        <button class="play-btn" data-role="a">A<span class="sub">original</span></button>
+        <button class="play-btn" data-role="b">B<span class="sub">encoded</span></button>
+        <button class="play-btn accent active" data-role="x">X<span class="sub">?</span></button>
+      </div>
+
+      <p class="prompt">X is the same as...</p>
+      <div class="answer-row">
+        <button class="ans-btn" data-ans="a">X is A</button>
+        <button class="ans-btn" data-ans="b">X is B</button>
+      </div>
+
+      <div id="history"></div>
+      <button id="btn-abort" class="link-btn">Stop and see results so far</button>
+    </section>
+
+    <section id="step-results" hidden>
+      <h2>Results</h2>
+      <div id="results-by-codec"></div>
+
+      <div id="results-per-track"></div>
+
+      <div class="report-block">
+        <div class="report-head">
+          <h3>Copy for sharing</h3>
+          <button id="btn-copy" class="primary small">Copy report</button>
+        </div>
+        <pre id="report" class="report"></pre>
+      </div>
+
+      <details>
+        <summary>All trials (raw log)</summary>
+        <table id="results-table">
+          <thead><tr><th>#</th><th>Track</th><th>Codec</th><th>X was</th><th>Answer</th><th>Correct?</th></tr></thead>
+          <tbody></tbody>
+        </table>
+      </details>
+
+      <div id="submit-block" class="submit-block" hidden>
+        <h3>Contribute your results</h3>
+        <p class="note">
+            It's appreciated if you contribute your results to help gather ABX listening data for the codec.
+        </p>
+        <div class="form-row">
+          <label>Nickname (optional)
+            <input type="text" id="inp-nick" maxlength="40" placeholder="e.g. your HA username">
+          </label>
+        </div>
+        <label class="full-field">Comment (optional)
+          <textarea id="inp-comment" maxlength="500" rows="2" placeholder="Gear, listening notes, anything worth logging"></textarea>
+        </label>
+        <div class="submit-row">
+          <button id="btn-submit" class="primary">Submit results</button>
+          <span id="submit-status" class="submit-status"></span>
+        </div>
+      </div>
+
+      <div class="results-actions">
+        <button id="btn-again" class="primary">Run another test (same files)</button>
+        <button id="btn-newfiles" class="link-btn">Choose new files</button>
+      </div>
+    </section>
+
+    <footer id="app-footer" class="app-footer" hidden></footer>
+
+  </div>
+
+  <script src="abx_config.js"></script>
+  <script src="abx_codecs.js"></script>
+  <script type="module" src="js/main.js"></script>
+</body>
+</html>
