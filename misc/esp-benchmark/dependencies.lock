@@ -12,10 +12,10 @@ dependencies:
   idf:
     source:
       type: idf
-    version: 5.5.1
+    version: 6.0.2
 direct_dependencies:
 - espressif/esp_audio_codec
 - idf
 manifest_hash: c5b6b231d94a7c484d0c50a2e08693e293ea3fb16cef2d4f61f981c5828acb0a
 target: esp32
-version: 2.0.0
+version: 3.0.0

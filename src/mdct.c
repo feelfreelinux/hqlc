@@ -219,7 +219,7 @@ static void dct_iv(int32_t *data, int32_t *work) {
   const int N = MDCT_N;
   const int N_FFT = MDCT_FFT_N;
 
-  HQLC_BENCH_BEGIN();
+  HQLC_BENCH_BEGIN(HQLC_BENCH_MDCT_PRE_TW);
   for (int k = 0; k < N_FFT; k++) {
     int32_t even_sample = data[2 * k];
     int32_t odd_mirror = data[N - 1 - 2 * k];
@@ -232,11 +232,11 @@ static void dct_iv(int32_t *data, int32_t *work) {
   }
   HQLC_BENCH_END(HQLC_BENCH_MDCT_PRE_TW);
 
-  HQLC_BENCH_BEGIN();
+  HQLC_BENCH_BEGIN(HQLC_BENCH_MDCT_FFT);
   fft_scaled(work);
   HQLC_BENCH_END(HQLC_BENCH_MDCT_FFT);
 
-  HQLC_BENCH_BEGIN();
+  HQLC_BENCH_BEGIN(HQLC_BENCH_MDCT_POST_TW);
   for (int k = 0; k < N_FFT; k++) {
     int32_t fft_re = work[2 * k];
     int32_t fft_im = work[2 * k + 1];
@@ -287,7 +287,7 @@ hqlc_error mdct_forward(const uint8_t *prev_pcm,
   const int half_n = N / 2;
   int32_t *folded = spec_q31;
 
-  HQLC_BENCH_BEGIN();
+  HQLC_BENCH_BEGIN(HQLC_BENCH_MDCT_FOLD);
   uint32_t fold_mag = 0;
 
   // The 1024-sample MDCT window is [A B C D], four 256-sample quarters

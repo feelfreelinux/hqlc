@@ -166,7 +166,7 @@ static int probe_frame_bits(const int32_t *spec_q31,
     const int32_t *ch_exp = &exp_indices[ch * PSY_N_BANDS];
     int lb = loss_bits[ch];
 
-    HQLC_BENCH_BEGIN();
+    HQLC_BENCH_BEGIN(HQLC_BENCH_ENC_RC_QUANT);
     int prev_nz = 0, prev_w = 1;
 
     // Precompute alpha bins (gain_code constant, only sigma varies per pair)
@@ -190,7 +190,7 @@ static int probe_frame_bits(const int32_t *spec_q31,
       const int16_t *cost = rans_cost_q8[rans_table_idx(abins[b], act)];
 
       int nz = 0;
-      HQLC_BENCH_BEGIN();
+      HQLC_BENCH_BEGIN(HQLC_BENCH_ENC_PROBE_BAND);
       if (total_shift >= 64) {
         // everything quantizes to zero
       } else if (total_shift >= 32) {
@@ -223,7 +223,7 @@ static int probe_frame_bits(const int32_t *spec_q31,
           }
         }
       } else {
-        // Step so fine every nonzero bin escapes; RC never picks gains this
+        // Step so fine every nonzero bin escapes. RC never picks gains this
         // fine, so a flat ESC cost is close enough
         for (int i = s; i < e; i++) {
           if (ch_spec[i] != 0) {
@@ -378,7 +378,7 @@ hqlc_error hqlc_encode_frame(hqlc_encoder *enc,
     enc->tns_hang[ch] = tr ? 1 : (enc->tns_hang[ch] > 0 ? enc->tns_hang[ch] - 1 : 0);
 
     {
-      HQLC_BENCH_BEGIN();
+      HQLC_BENCH_BEGIN(HQLC_BENCH_ENC_MDCT);
       hqlc_error err = mdct_forward(enc->prev_pcm,
                                     pcm,
                                     frame_pcm_bytes,
@@ -399,7 +399,7 @@ hqlc_error hqlc_encode_frame(hqlc_encoder *enc,
         ch_spec[i] = 0;
       }
 
-      HQLC_BENCH_BEGIN();
+      HQLC_BENCH_BEGIN(HQLC_BENCH_ENC_TNS);
       if (tns_eligible) {
         tns_analyze(ch_spec, &tns[ch]);
         if (tns[ch].order > 0) {
@@ -409,7 +409,7 @@ hqlc_error hqlc_encode_frame(hqlc_encoder *enc,
       HQLC_BENCH_END(HQLC_BENCH_ENC_TNS);
     }
 
-    HQLC_BENCH_BEGIN();
+    HQLC_BENCH_BEGIN(HQLC_BENCH_ENC_PSY);
     psy_fine_band_exponents(
         ch_spec, loss_bits[ch], enc->tilt_step_q7, tns_eligible ? 1 : 0, ch_exp);
     HQLC_BENCH_END(HQLC_BENCH_ENC_PSY);
@@ -422,13 +422,13 @@ hqlc_error hqlc_encode_frame(hqlc_encoder *enc,
   bool quiet_frame = false;
   int target_bpf = 0;
 
-  HQLC_BENCH_BEGIN();
+  HQLC_BENCH_BEGIN(HQLC_BENCH_ENC_SELECT_GAIN);
   gain_code =
       select_gain(enc, spec_q31, loss_bits, exp_indices, n_ch, &quiet_frame, &target_bpf);
   HQLC_BENCH_END(HQLC_BENCH_ENC_SELECT_GAIN);
 
   // Quantize + NF estimate per channel
-  HQLC_BENCH_BEGIN();
+  HQLC_BENCH_BEGIN(HQLC_BENCH_ENC_QUANT_FWD);
   for (int ch = 0; ch < n_ch; ch++) {
     s->noise_factors[ch] = quant_forward_nf(&spec_q31[ch * HQLC_FRAME_SAMPLES],
                                             loss_bits[ch],
@@ -440,7 +440,7 @@ hqlc_error hqlc_encode_frame(hqlc_encoder *enc,
   HQLC_BENCH_END(HQLC_BENCH_ENC_QUANT_FWD);
 
   // Write side information bitstream
-  HQLC_BENCH_BEGIN();
+  HQLC_BENCH_BEGIN(HQLC_BENCH_ENC_SIDE_INFO);
   hqlc_bitwriter bw;
   bw_init(&bw, out, out_cap);
 
@@ -498,7 +498,7 @@ hqlc_error hqlc_encode_frame(hqlc_encoder *enc,
   HQLC_BENCH_END(HQLC_BENCH_ENC_SIDE_INFO);
 
   // rANS encode coefficients
-  HQLC_BENCH_BEGIN();
+  HQLC_BENCH_BEGIN(HQLC_BENCH_ENC_RANS_ENC);
   size_t rans_len =
       rans_encode_coeffs(quant, n_ch, gain_code, rans_tmp, HQLC_MAX_FRAME_BYTES);
   HQLC_BENCH_END(HQLC_BENCH_ENC_RANS_ENC);
@@ -577,7 +577,7 @@ hqlc_error hqlc_decode_frame(hqlc_decoder *dec,
   int32_t *exp_indices = s->exp_indices;
 
   // Read side information
-  HQLC_BENCH_BEGIN();
+  HQLC_BENCH_BEGIN(HQLC_BENCH_DEC_ENTROPY);
   hqlc_bitreader br;
   br_init(&br, payload, payload_len);
 
@@ -660,7 +660,7 @@ hqlc_error hqlc_decode_frame(hqlc_decoder *dec,
     int32_t *spec_q31 = s->stage.synthesis.spec_q31;
 
     // Inverse quantize (envelope mode must mirror the encoder's gate)
-    HQLC_BENCH_BEGIN();
+    HQLC_BENCH_BEGIN(HQLC_BENCH_DEC_DEQUANT);
     int loss_bits;
     quant_inverse(ch_quant,
                   ch_exp,
@@ -671,7 +671,7 @@ hqlc_error hqlc_decode_frame(hqlc_decoder *dec,
     HQLC_BENCH_END(HQLC_BENCH_DEC_DEQUANT);
 
     // Noise fill, seed varied per frame and channel so the noise differs accross frames
-    HQLC_BENCH_BEGIN();
+    HQLC_BENCH_BEGIN(HQLC_BENCH_DEC_NF);
     uint32_t nf_seed =
         NF_SEED_BIAS ^ (dec->frame_count * 0x9E37u) ^ ((uint32_t)ch * 0x51EDu);
     nf_run_length_fill(
@@ -679,14 +679,14 @@ hqlc_error hqlc_decode_frame(hqlc_decoder *dec,
     HQLC_BENCH_END(HQLC_BENCH_DEC_NF);
 
     // TNS synthesis / inverse filter
-    HQLC_BENCH_BEGIN();
+    HQLC_BENCH_BEGIN(HQLC_BENCH_DEC_TNS);
     if (tns[ch].order > 0) {
       loss_bits += tns_iir_safe(spec_q31, tns[ch].k_q30, tns[ch].order);
     }
     HQLC_BENCH_END(HQLC_BENCH_DEC_TNS);
 
     // IMDCT + overlap-add + PCM write
-    HQLC_BENCH_BEGIN();
+    HQLC_BENCH_BEGIN(HQLC_BENCH_DEC_IMDCT_OLA);
     hqlc_error err = mdct_inverse_ola(spec_q31,
                                       HQLC_FRAME_SAMPLES,
                                       loss_bits,

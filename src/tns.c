@@ -195,7 +195,7 @@ static int tns_levinson_durbin(const int64_t *r_raw, int max_order, int32_t *k_o
     }
 
     // Update prediction coefficients. On strong transients the update can
-    // exceed Q30 headroom; the filter is blowing up, so keep this reflection
+    // exceed Q30 headroom. The filter is blowing up, so keep this reflection
     // coefficient and stop extending the order.
     int32_t a_new[TNS_MAX_ORDER];
     bool overflowed = false;

@@ -8,8 +8,7 @@
 #include "psy.h"
 
 // Quantizer step: step = 2^(E/8) with E = 2*exp - gain_code - QUANT_EXP_OFFSET,
-// decomposed as pow2_eighth[E % 8] * 2^(E / 8). The forward quantizer needs
-// 1/step, the inverse needs step; both decompose the same way.
+// decomposed as pow2_eighth[E % 8] * 2^(E / 8)
 
 // 2^(f/8) for f=0..7, Q30
 const int32_t quant_pow2_eighth_q30[8] = {
@@ -66,22 +65,35 @@ static void bin_exp_flat(const int32_t *exp_indices, int32_t *bin_exp) {
   }
 }
 
-// |X| / step in Q8; total_shift aligns Q31 spectrum * Q28 mantissa to Q8
-static inline int32_t scale_to_q8(int32_t abs_spec, int32_t inv_step_m, int total_shift) {
-  if (total_shift >= 64) {
-    return 0;
-  }
-  if (total_shift >= 32) {
-    int32_t hi = (int32_t)((int64_t)abs_spec * inv_step_m >> 32);
-    return hi >> (total_shift - 32);
-  }
-  if (total_shift > 0) {
-    return (int32_t)((int64_t)abs_spec * inv_step_m >> total_shift);
-  }
-  return fxp_sat_i64_to_i32((int64_t)abs_spec * inv_step_m << (-total_shift));
+// NF estimate state, mirrors the decoder fill positions with a 2-bin lag
+typedef struct {
+  int32_t s1, s2; // scaled_q8 of the previous two bins
+  int32_t z;      // consecutive sub-deadzone bins
+  int32_t total, ns;
+} nf_est;
+
+// Branchless, below/take are all-ones condition masks
+static inline void nf_update(nf_est *nf, int32_t scaled_q8) {
+  int32_t below = (scaled_q8 - QUANT_DZ_THRESH_Q8) >> 31;
+  nf->z = (nf->z + 1) & below;
+  int32_t take = (4 - nf->z) >> 31;
+  nf->total += nf->s2 & take;
+  nf->ns -= take;
+  nf->s2 = nf->s1;
+  nf->s1 = scaled_q8;
 }
 
-// Forward quantizer fused with the NF estimate
+// Deadzone, round, restore sign, and feed the NF estimate
+static inline void quant_bin(int16_t *out, nf_est *nf, int32_t scaled_q8, int32_t sign) {
+  int32_t dz_mask = ~((scaled_q8 - QUANT_DZ_THRESH_Q8) >> 31);
+  int32_t q = ((scaled_q8 + QUANT_DZ_BIAS_Q8) >> 8) & dz_mask;
+  *out = (int16_t)((q ^ sign) - sign);
+  nf_update(nf, scaled_q8);
+}
+
+// Forward quantizer fused with the NF estimate. bin_exp comes in runs of
+// equal exponent, so the step setup is hoisted per run and the bin loops
+// stay branchless.
 int quant_forward_nf(const int32_t *spec_q31,
                      int loss_bits,
                      const int32_t *exp_indices,
@@ -92,7 +104,7 @@ int quant_forward_nf(const int32_t *spec_q31,
     quant_out[i] = 0;
   }
 
-  HQLC_BENCH_BEGIN();
+  HQLC_BENCH_BEGIN(HQLC_BENCH_ENC_QLOOP);
   int32_t bin_exp[PSY_ACTIVE_BINS];
   if (interp) {
     bin_exp_interp(exp_indices, bin_exp);
@@ -100,40 +112,64 @@ int quant_forward_nf(const int32_t *spec_q31,
     bin_exp_flat(exp_indices, bin_exp);
   }
 
-  int z = 0;
-  int32_t nf_total = 0, nf_ns = 0;
-  int32_t recent[8] = {0};
+  nf_est nf = {0, 0, 0, 0, 0};
   int E_bias = gain_code + QUANT_EXP_OFFSET;
 
-  for (int i = 0; i < PSY_ACTIVE_BINS; i++) {
-    int neg_E = E_bias - 2 * (int)bin_exp[i];
+  int i = 0;
+  while (i < PSY_ACTIVE_BINS) {
+    int32_t be = bin_exp[i];
+    int run_end = i + 1;
+    while (run_end < PSY_ACTIVE_BINS && bin_exp[run_end] == be) {
+      run_end++;
+    }
+
+    int neg_E = E_bias - 2 * (int)be;
     int32_t inv_step_m = quant_pow2_eighth_q30[neg_E & 7] >> 2;
     int total_shift = QUANT_TOTAL_Q - loss_bits - (neg_E >> 3);
 
-    int32_t x = spec_q31[i];
-    int32_t sign = x >> 31;
-    int32_t abs_spec = (x ^ sign) - sign;
-    int32_t scaled_q8 = scale_to_q8(abs_spec, inv_step_m, total_shift);
-    int32_t dz_mask = ~((scaled_q8 - QUANT_DZ_THRESH_Q8) >> 31);
-    int32_t q = ((scaled_q8 + QUANT_DZ_BIAS_Q8) >> 8) & dz_mask;
-    quant_out[i] = (int16_t)((q ^ sign) - sign);
-
-    // NF estimate mirrors the decoder fill positions (2-bin lag into runs)
-    recent[i & 7] = scaled_q8;
-    z = (scaled_q8 < QUANT_DZ_THRESH_Q8) ? z + 1 : 0;
-    if (z > 4) {
-      nf_total += recent[(i - 2) & 7];
-      nf_ns++;
+    if (total_shift >= 64) {
+      // Step too coarse: the whole run quantizes to zero
+      for (; i < run_end; i++) {
+        quant_bin(&quant_out[i], &nf, 0, 0);
+      }
+    } else if (total_shift >= 32) {
+      // Common case: only the high word of the product is needed
+      int small_shift = total_shift - 32;
+      for (; i < run_end; i++) {
+        int32_t x = spec_q31[i];
+        int32_t sign = x >> 31;
+        int32_t abs_spec = (x ^ sign) - sign;
+        int32_t hi = (int32_t)((int64_t)abs_spec * inv_step_m >> 32);
+        quant_bin(&quant_out[i], &nf, hi >> small_shift, sign);
+      }
+    } else if (total_shift > 0) {
+      for (; i < run_end; i++) {
+        int32_t x = spec_q31[i];
+        int32_t sign = x >> 31;
+        int32_t abs_spec = (x ^ sign) - sign;
+        int32_t scaled_q8 = (int32_t)((int64_t)abs_spec * inv_step_m >> total_shift);
+        quant_bin(&quant_out[i], &nf, scaled_q8, sign);
+      }
+    } else {
+      // Saturation path, should be quite rare
+      for (; i < run_end; i++) {
+        int32_t x = spec_q31[i];
+        int32_t sign = x >> 31;
+        int32_t abs_spec = (x ^ sign) - sign;
+        int32_t scaled_q8 =
+            fxp_sat_i64_to_i32((int64_t)abs_spec * inv_step_m << (-total_shift));
+        quant_bin(&quant_out[i], &nf, scaled_q8, sign);
+      }
     }
   }
   HQLC_BENCH_END(HQLC_BENCH_ENC_QLOOP);
 
-  if (nf_ns == 0) {
+  if (nf.ns == 0) {
     return 7;
   }
-  int32_t avg_q8 = nf_total / nf_ns;
-  int nf = (128 - avg_q8 + 8) >> 4;
-  return fxp_clamp_i32(nf, 0, 7);
+  int32_t avg_q8 = nf.total / nf.ns;
+  int nf_code = (128 - avg_q8 + 8) >> 4;
+  return fxp_clamp_i32(nf_code, 0, 7);
 }
 
 // Inverse quantizer: integer symbols to reconstructed BFP spectrum
@@ -216,10 +252,10 @@ int quant_gain_encode(float gain) {
   return fxp_clamp_i32(code, 0, QUANT_GAIN_MAX_CODE);
 }
 
-// Fill runs of >4 consecutive zeros with pseudorandom noise at
-// ±(8-nf)/16 * step (nf = transmitted 3-bit factor, 0 strongest). Operates
-// on the dequantized BFP spectrum, widening it first if the fill needs more
-// headroom. Always flat per-band steps; interp-envelope fill measured no better.
+// Fill runs of >4 consecutive zeros with pseudorandom noise at (8-nf)/16 * step (nf =
+// transmitted 3-bit factor, 0 strongest) Operates on the dequantized BFP spectrum,
+// widening it first if the fill needs more headroom. Always flat per-band steps, did not
+// get significant improvement with interp-envelope fill
 void nf_run_length_fill(const int16_t *quant,
                         const int32_t *exp_indices,
                         int gain_code,

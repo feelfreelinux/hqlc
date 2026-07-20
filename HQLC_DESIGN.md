@@ -76,6 +76,8 @@ TNS is only attempted on frames selected by the transient detector described abo
 
 Only bins from 20+ are filtered, so around 940 Hz at 48 kHz. Filtering the low-frequency bins tends to distort bass and pitched content without helping pre-echo much, so HQLC leaves them alone.
 
+TNS does not solve the pre-echo problem perfectly (and probably window-switching would be more-effective here), but it does reduce it by quite a bit.
+
 TNS was originally developed by Herre at Fraunhofer in the mid-90s for MPEG-2 AAC. The main patent, Herre US 5,781,888, filed in 1996, expired in 2016. The underlying pieces used here - autocorrelation, Levinson-Durbin, reflection coefficients, LAR quantization, and lattice filters - are standard DSP tools.
 
 ## Quantization

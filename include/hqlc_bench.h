@@ -11,8 +11,8 @@
 #ifdef HQLC_BENCH
 #include "hqlc_bench_impl.h"
 #else
-#define HQLC_BENCH_BEGIN()    ((void)0)
-#define HQLC_BENCH_END(stage) ((void)0)
+#define HQLC_BENCH_BEGIN(stage) ((void)0)
+#define HQLC_BENCH_END(stage)    ((void)0)
 #endif
 
 #endif // HQLC_BENCH_H

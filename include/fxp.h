@@ -20,10 +20,10 @@ extern "C" {
  * @return Absolute value, saturated to INT32_MAX for INT32_MIN.
  */
 static inline int32_t fxp_abs_i32(int32_t x) {
-  if (x == (int32_t)0x80000000) {
-    return (int32_t)0x7FFFFFFF;
-  }
-  return x < 0 ? -x : x;
+  // Branchless, the final xor maps the surviving INT32_MIN to INT32_MAX
+  int32_t sign = x >> 31;
+  int32_t a = (x ^ sign) - sign;
+  return a ^ (a >> 31);
 }
 
 /**

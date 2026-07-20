@@ -19,8 +19,8 @@ extern const uint16_t psy_band_edges[PSY_N_BANDS + 1];
 #define PSY_EXP_INDEX_MIN 0
 #define PSY_EXP_INDEX_MAX 63
 
-// 48 fine bands for exponent computation (single-bin LF, ERB-spaced HF);
-// the last band [427,512) is above the coded range and never analyzed
+// 48 fine bands for exponent computation (single-bin LF, ERB-spaced HF).
+// The last band [427,512) is above the coded range and never analyzed
 #define PSY_N_FINE_BANDS 48
 
 extern const uint16_t psy_fine_band_edges[PSY_N_FINE_BANDS + 1];

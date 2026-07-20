@@ -24,7 +24,7 @@ hqlc -d output.hqlc decoded.wav            # decode bitstream to WAV
 ffmpeg -i in.flac -f wav - | hqlc - out.wav  # pipe from ffmpeg
 ```
 
-The public API is in [`include/hqlc.h`](include/hqlc.h) and should be self-descriptive. See [`src/hqlc_cli.c`](src/hqlc_cli.c) for a complete usage example. For ESP-IDF integration, there's a sample component and linker script in `benchmark/esp-bench/components/hqlc`.
+The public API is in [`include/hqlc.h`](include/hqlc.h) and should be self-explanatory. See [`src/hqlc_cli.c`](src/hqlc_cli.c) for a complete usage example. For ESP-IDF integration, there's a sample component and linker script in `benchmark/esp-bench/components/hqlc`.
 
 ## Python reference
 
@@ -43,7 +43,7 @@ Measured on an ESP32 at 240 MHz, stereo 48 kHz, ~2.1s of audio. Other codecs mea
 | Codec | kbps | Enc (ms) | Dec (ms) |
 |-------|------|----------|----------|
 | SBC | 357 | 202 | 161 |
-| HQLC | 96 | 344 | 327 |
+| HQLC | 96 | 364 | 308 |
 | AAC | 129 | 1318 | 621 |
 | Opus (c1) | 96 | 1379 | 855 |
 | Opus (c5) | 96 | 1787 | 917 |

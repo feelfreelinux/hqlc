@@ -122,14 +122,15 @@ void test_rans_corrupt_input_safe(void) {
 }
 
 void test_rans_freq_tables_normalized(void) {
-  // Every (alpha x activity) frequency table must sum to RANS_M, or the rANS
-  // coder's renormalization is not exact and decode desyncs.
+  // Every (alpha x activity) table must be monotone with cf[0] = 0 and
+  // cf[MAX_SYM] = RANS_M, or the rANS renormalization is not exact and
+  // decode desyncs.
   for (int t = 0; t < RANS_NTABLES; t++) {
-    uint32_t sum = 0;
+    TEST_ASSERT_EQUAL_UINT32(0, rans_cf[t][0]);
     for (int s = 0; s < RANS_MAX_SYM; s++) {
-      sum += rans_freq[t][s];
+      TEST_ASSERT_TRUE(rans_cf[t][s] <= rans_cf[t][s + 1]);
     }
-    TEST_ASSERT_EQUAL_UINT32(RANS_M, sum);
+    TEST_ASSERT_EQUAL_UINT32(RANS_M, rans_cf[t][RANS_MAX_SYM]);
   }
 }
 

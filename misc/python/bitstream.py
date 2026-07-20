@@ -106,7 +106,7 @@ def encode_frame(gain, tns_orders, tns_q_ks, exp_indices, all_quants, noise_fact
         for d in ch_deltas:
             side.write_rice(zigzag_enc(d), k)
 
-    # Noise factors (3 bits per channel, 0-7; 8 = no noise, clamped to 7)
+    # Noise factors, 3 bits per channel (8 means no noise, clamped to 7)
     for ch in range(n_ch):
         side.write(min(noise_factors[ch], 7), 3)
 

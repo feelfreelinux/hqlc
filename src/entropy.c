@@ -81,14 +81,9 @@ static inline void rans_enc_sign(hqlc_rans_enc *enc, uint8_t sign) {
                (state & RANS_SIGN_SLOT_MASK) + (sign ? RANS_SIGN_FREQ : 0u);
 }
 
-// General symbol encode
-// Uses reciprocal lookup via rcp[] to avoid division
-static inline void rans_enc_sym(hqlc_rans_enc *enc,
-                                uint8_t sym,
-                                const uint16_t *freq,
-                                const uint16_t *cf,
-                                const uint32_t *rcp) {
-  uint16_t f = freq[sym];
+// General symbol encode, the reciprocal avoids division
+static inline void
+rans_enc_sym(hqlc_rans_enc *enc, uint16_t f, uint32_t rcp, uint16_t cf) {
   uint32_t upper = (uint32_t)f << RANS_RENORM_SHIFT;
   uint32_t state = enc->state;
 
@@ -101,14 +96,14 @@ static inline void rans_enc_sym(hqlc_rans_enc *enc,
     }
   }
 
-  uint32_t q = (uint32_t)(((uint64_t)state * rcp[sym]) >> 32);
+  uint32_t q = (uint32_t)(((uint64_t)state * rcp) >> 32);
   uint32_t r = state - q * f;
   if (r >= f) {
     q++;
     r -= f;
   }
 
-  enc->state = (q << RANS_M_BITS) + r + cf[sym];
+  enc->state = (q << RANS_M_BITS) + r + cf;
 }
 
 size_t rans_enc_flush(hqlc_rans_enc *enc) {
@@ -169,8 +164,7 @@ static inline uint8_t rans_dec_sign(hqlc_rans_dec *dec) {
   return s;
 }
 
-static inline uint8_t
-rans_dec_sym(hqlc_rans_dec *dec, const uint16_t *freq, const uint16_t *cf) {
+static inline uint8_t rans_dec_sym(hqlc_rans_dec *dec, const uint16_t *cf) {
   uint32_t state = dec->state;
   uint32_t slot = state & (RANS_M - 1);
 
@@ -181,7 +175,7 @@ rans_dec_sym(hqlc_rans_dec *dec, const uint16_t *freq, const uint16_t *cf) {
     s++;
   }
 
-  uint16_t f = freq[s];
+  uint16_t f = cf[s + 1] - cf[s];
   dec->state = (uint32_t)f * (state >> RANS_M_BITS) + slot - cf[s];
 
   // Renorm
@@ -217,47 +211,45 @@ int rans_activity_bin(const int16_t *quant, int band) {
   return rans_activity_from(nz, e - s);
 }
 
-// Cumulative frequencies from per-symbol frequencies.
-static inline void build_cf(const uint16_t *freq, uint16_t *cf) {
-  cf[0] = 0;
-  for (int s = 0; s < RANS_MAX_SYM; s++) {
-    cf[s + 1] = cf[s] + freq[s];
-  }
-}
-
 size_t rans_encode_coeffs(
     const int16_t *quant, int n_ch, int gain_code, uint8_t *out, size_t out_cap) {
   hqlc_rans_enc enc;
   rans_enc_init(&enc, out, out_cap);
 
-  // rANS encodes in reverse order; decoder reads forward.
+  // rANS encodes in reverse order, the decoder reads forward
   for (int ch = n_ch - 1; ch >= 0; ch--) {
     const int16_t *ch_q = &quant[ch * HQLC_FRAME_SAMPLES];
 
     for (int b = PSY_N_BANDS - 1; b >= 0; b--) {
       // Per-band table from alpha + activity of the previous band
-      HQLC_BENCH_BEGIN();
+      HQLC_BENCH_BEGIN(HQLC_BENCH_ENC_RANS_TBL);
       int abin = rans_alpha_bin(b, gain_code);
       int act = rans_activity_bin(ch_q, b);
       int tidx = rans_table_idx(abin, act);
-      const uint16_t *freq = rans_freq[tidx];
+      const uint16_t *cf = rans_cf[tidx];
       const uint32_t *rcp = rans_rcp[tidx];
-      uint16_t cf[RANS_MAX_SYM + 1];
-      build_cf(freq, cf);
       HQLC_BENCH_END(HQLC_BENCH_ENC_RANS_TBL);
 
       int s = psy_band_edges[b];
       int e = psy_band_edges[b + 1];
 
+      // Zeros dominate, keep the symbol 0 constants in locals so the
+      // compiler does not reload them every bin
+      uint16_t f0 = cf[1]; // cf[0] == 0
+      uint32_t rcp0 = rcp[0];
+
       for (int i = e - 1; i >= s; i--) {
         int16_t v = ch_q[i];
+        if (v == 0) {
+          rans_enc_sym(&enc, f0, rcp0, 0);
+          continue;
+        }
+
         int mag = (v < 0) ? -v : v;
         uint8_t sym =
             (mag < RANS_MAX_SYM - 1) ? (uint8_t)mag : (uint8_t)(RANS_MAX_SYM - 1);
 
-        if (v != 0) {
-          rans_enc_sign(&enc, (v > 0) ? 0 : 1);
-        }
+        rans_enc_sign(&enc, (v > 0) ? 0 : 1);
 
         // Escape: EG(0) overflow through the 50/50 sign coder (1 raw bit/call)
         if (mag >= RANS_MAX_SYM - 1) {
@@ -273,7 +265,7 @@ size_t rans_encode_coeffs(
           }
         }
 
-        rans_enc_sym(&enc, sym, freq, cf, rcp);
+        rans_enc_sym(&enc, cf[sym + 1] - cf[sym], rcp[sym], cf[sym]);
       }
     }
   }
@@ -299,21 +291,19 @@ bool rans_decode_coeffs(
       int e = psy_band_edges[b + 1];
 
       // Per-band table from alpha + activity of the already-decoded prev band
-      HQLC_BENCH_BEGIN();
+      HQLC_BENCH_BEGIN(HQLC_BENCH_DEC_RANS_DEC);
       int abin = rans_alpha_bin(b, gain_code);
       int act = rans_activity_bin(ch_q, b);
       int tidx = rans_table_idx(abin, act);
-      const uint16_t *freq = rans_freq[tidx];
-      uint16_t cf[RANS_MAX_SYM + 1];
-      build_cf(freq, cf);
+      const uint16_t *cf = rans_cf[tidx];
       HQLC_BENCH_END(HQLC_BENCH_DEC_RANS_DEC);
 
       for (int i = s; i < e; i++) {
-        uint8_t sym = rans_dec_sym(&dec, freq, cf);
+        uint8_t sym = rans_dec_sym(&dec, cf);
         int mag = sym;
 
         if (sym >= RANS_MAX_SYM - 1) {
-          // Unary prefix; bounded so a corrupt stream can't spin forever
+          // Unary prefix, bounded so a corrupt stream can't spin forever
           // (valid int16 magnitudes never reach 24 bits).
           int nbits = 0;
           while (rans_dec_sign(&dec) == 0 && nbits < 24 && !dec.overrun) {

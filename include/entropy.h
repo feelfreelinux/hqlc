@@ -23,8 +23,8 @@ extern "C" {
 #define RANS_ALPHA_LO_Q8    (-1271)
 #define RANS_ALPHA_RANGE_Q8 2647
 
-// 48 rANS probability tables
-extern const uint16_t rans_freq[RANS_NTABLES][RANS_MAX_SYM];
+// 48 rANS probability tables in cumulative form, freq[s] = cf[s + 1] - cf[s]
+extern const uint16_t rans_cf[RANS_NTABLES][RANS_MAX_SYM + 1];
 extern const uint32_t rans_rcp[RANS_NTABLES][RANS_MAX_SYM];
 extern const int16_t rans_cost_q8[RANS_NTABLES][RANS_MAX_SYM];
 extern const int16_t rans_log2_sigma_q8[RANS_N_PAIRS];

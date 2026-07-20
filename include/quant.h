@@ -44,7 +44,7 @@ extern const int32_t quant_pow2_eighth_q30[8];
  * @param loss_bits BFP exponent for `spec_q31`.
  * @param exp_indices Per-band exponent indices.
  * @param gain_code Quantizer gain code.
- * @param interp True to interpolate per-bin exponents; false to use band centers.
+ * @param interp True to interpolate per-bin exponents, false to use band centers.
  * @param quant_out Destination for quantized coefficients.
  * @return 3-bit noise-fill factor in the range 0..7.
  */
@@ -63,7 +63,7 @@ int quant_forward_nf(const int32_t *spec_q31,
  * @param quant_in Quantized coefficients.
  * @param exp_indices Per-band exponent indices.
  * @param gain_code Quantizer gain code.
- * @param interp True to interpolate per-bin exponents; false to use band centers.
+ * @param interp True to interpolate per-bin exponents, false to use band centers.
  * @param spec_q31 Destination for reconstructed Q31 BFP spectrum.
  * @param loss_bits_out Receives the BFP exponent for `spec_q31`.
  */
