@@ -24,7 +24,7 @@ hqlc -d output.hqlc decoded.wav            # decode bitstream to WAV
 ffmpeg -i in.flac -f wav - | hqlc - out.wav  # pipe from ffmpeg
 ```
 
-The public API is in [`include/hqlc.h`](include/hqlc.h) and should be self-explanatory. See [`src/hqlc_cli.c`](src/hqlc_cli.c) for a complete usage example. For ESP-IDF integration, there's a sample component and linker script in `benchmark/esp-bench/components/hqlc`.
+The public API is in [`include/hqlc.h`](include/hqlc.h) and should be self-explanatory. See [`src/hqlc_cli.c`](src/hqlc_cli.c) for a complete usage example. For ESP-IDF integration, there's a sample component and linker script in `misc/esp-benchmark/hqlc`.
 
 ## Python reference
 
