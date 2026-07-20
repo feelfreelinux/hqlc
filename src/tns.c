@@ -6,8 +6,7 @@
 #include "pcm.h"
 
 // TNS parameters
-#define TNS_ATTACK_RATIO 2
-#define TNS_MAX_K_Q30    Q30(0.85)
+#define TNS_MAX_K_Q30    Q30(0.75)
 #define TNS_K_THRESH_Q30 Q30(0.1)
 #define TNS_K_CLAMP_Q30  Q30(0.999)
 
@@ -61,33 +60,62 @@ int tns_quant_k(int32_t k_q30) {
   return sign * q;
 }
 
-bool tns_detect_transient(const uint8_t *prev_pcm,
+bool tns_detect_transient(tns_detect_state *st,
                           const uint8_t *curr_pcm,
                           hqlc_pcm_format fmt,
                           int stride,
                           int ch) {
-  uint64_t e1 = 1; // +1 avoids div-by-zero
-  uint64_t e2 = 0;
+  const int sub = HQLC_FRAME_SAMPLES / TNS_DETECT_SUBBLOCKS;
+  uint64_t e[TNS_DETECT_SUBBLOCKS];
+  int32_t last = st->last_sample;
 
+  // HP (first difference) energy per sub-block. 24-bit input is scaled to
+  // 16-bit range so energies and TNS_DETECT_FLOOR are format-independent.
   if (fmt == HQLC_PCM16) {
-    const int16_t *p1 = (const int16_t *)prev_pcm;
-    const int16_t *p2 = (const int16_t *)curr_pcm;
-    for (int i = 0; i < HQLC_FRAME_SAMPLES; i++) {
-      int32_t s1 = p1[i * stride + ch];
-      int32_t s2 = p2[i * stride + ch];
-      e1 += (uint64_t)(s1 * s1);
-      e2 += (uint64_t)(s2 * s2);
+    const int16_t *p = (const int16_t *)curr_pcm;
+    for (int b = 0; b < TNS_DETECT_SUBBLOCKS; b++) {
+      uint64_t acc = 0;
+      for (int i = b * sub; i < (b + 1) * sub; i++) {
+        int32_t s = p[i * stride + ch];
+        int32_t d = s - last;
+        last = s;
+        acc += (uint64_t)((int64_t)d * d);
+      }
+      e[b] = acc;
     }
   } else {
-    for (int i = 0; i < HQLC_FRAME_SAMPLES; i++) {
-      int32_t s1 = pcm_load_native(prev_pcm, fmt, i * stride + ch);
-      int32_t s2 = pcm_load_native(curr_pcm, fmt, i * stride + ch);
-      e1 += (uint64_t)((int64_t)s1 * s1);
-      e2 += (uint64_t)((int64_t)s2 * s2);
+    for (int b = 0; b < TNS_DETECT_SUBBLOCKS; b++) {
+      uint64_t acc = 0;
+      for (int i = b * sub; i < (b + 1) * sub; i++) {
+        int32_t s = pcm_load_native(curr_pcm, fmt, i * stride + ch) >> 8;
+        int32_t d = s - last;
+        last = s;
+        acc += (uint64_t)((int64_t)d * d);
+      }
+      e[b] = acc;
     }
   }
+  st->last_sample = last;
 
-  return e2 >= (uint64_t)TNS_ATTACK_RATIO * e1;
+  // Each current sub-block vs the mean of the preceding 8 (window slides
+  // from last frame's blocks into this frame's).
+  uint64_t win = 0;
+  for (int b = 0; b < TNS_DETECT_SUBBLOCKS; b++) {
+    win += st->sub_energy[b];
+  }
+
+  bool fire = false;
+  for (int b = 0; b < TNS_DETECT_SUBBLOCKS; b++) {
+    if (e[b] > TNS_DETECT_FLOOR &&
+        e[b] * TNS_DETECT_SUBBLOCKS > (uint64_t)TNS_DETECT_RATIO * win) {
+      fire = true;
+    }
+    // Slide: drop the oldest (last frame's block b), add current block b
+    win += e[b] - st->sub_energy[b];
+  }
+
+  memcpy(st->sub_energy, e, sizeof(e));
+  return fire;
 }
 
 // Autocorrelation of MDCT spectrum, pre-shifted to prevent overflow
@@ -103,7 +131,6 @@ static void tns_autocorrelation(const int32_t *spec, int n, int64_t *r) {
       r[k] += (int64_t)si * spec[i + k];
     }
   }
-  // Tail: guard against out-of-bounds reads
   for (int i = main_end; i < n; i++) {
     int32_t si = spec[i] >> 9;
     for (int k = 0; k <= TNS_MAX_ORDER && i + k < n; k++) {
@@ -151,7 +178,7 @@ static int tns_levinson_durbin(const int64_t *r_raw, int max_order, int32_t *k_o
     }
 
     // ki = -acc / error, in Q30
-    int32_t ki = (int32_t)(-((acc << 30) / error));
+    int32_t ki = (int32_t)(-((int64_t)((uint64_t)acc << 30) / error));
 
     ki = fxp_clamp_i32(ki, -TNS_K_CLAMP_Q30, TNS_K_CLAMP_Q30);
 
@@ -167,16 +194,28 @@ static int tns_levinson_durbin(const int64_t *r_raw, int max_order, int32_t *k_o
       break;
     }
 
-    // Update prediction coefficients
+    // Update prediction coefficients. On strong transients the update can
+    // exceed Q30 headroom. The filter is blowing up, so keep this reflection
+    // coefficient and stop extending the order.
     int32_t a_new[TNS_MAX_ORDER];
+    bool overflowed = false;
     for (int j = 0; j < i; j++) {
-      a_new[j] = a[j] + (int32_t)(((int64_t)ki * a[i - 1 - j]) >> 30);
+      int64_t sum = (int64_t)a[j] + (((int64_t)ki * a[i - 1 - j]) >> 30);
+      if (sum > INT32_MAX || sum < INT32_MIN) {
+        overflowed = true;
+        break;
+      }
+      a_new[j] = (int32_t)sum;
     }
-    a_new[i] = ki;
-    memcpy(a, a_new, (size_t)(i + 1) * sizeof(int32_t));
 
     k_out[order] = ki;
     order++;
+    if (overflowed) {
+      break;
+    }
+
+    a_new[i] = ki;
+    memcpy(a, a_new, (size_t)(i + 1) * sizeof(int32_t));
   }
 
   // Require prediction gain >= 1.5 (i.e. 2*r[0] >= 3*error).
@@ -189,7 +228,6 @@ static int tns_levinson_durbin(const int64_t *r_raw, int max_order, int32_t *k_o
 
 void tns_analyze(const int32_t *spec_q31, tns_info *out) {
   int64_t r[TNS_MAX_ORDER + 1];
-  // Autocorrelation on HF bins only (above TNS_START_BIN)
   tns_autocorrelation(spec_q31 + TNS_START_BIN, HQLC_FRAME_SAMPLES - TNS_START_BIN, r);
 
   int32_t k_raw[TNS_MAX_ORDER];
@@ -198,7 +236,6 @@ void tns_analyze(const int32_t *spec_q31, tns_info *out) {
     return;
   }
 
-  // Clip, quantize, and dequantize
   int8_t q_lar[TNS_MAX_ORDER];
   int32_t k_dq[TNS_MAX_ORDER];
   for (int i = 0; i < order; i++) {
@@ -208,7 +245,6 @@ void tns_analyze(const int32_t *spec_q31, tns_info *out) {
     k_dq[i] = tns_dequant_k(q_lar[i]);
   }
 
-  // Trim trailing zeros
   while (order > 0 && q_lar[order - 1] == 0) {
     order--;
   }

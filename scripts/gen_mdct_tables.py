@@ -76,14 +76,13 @@ def main():
                            ("lut_fft_twiddle_q31", fft)]:
             f.write(fmt_q31(name, data) + "\n\n")
 
-        # Digit-reversal LUT
         lines = [f"const uint8_t lut_digit_rev[{len(digit_rev)}] = {{"]
         for i in range(0, len(digit_rev), 12):
             chunk = digit_rev[i:i+12]
             entries = ", ".join(f"{v:3d}" for v in chunk)
             lines.append(f"    {entries}{',' if i + 12 < len(digit_rev) else ''}")
         lines.append("};")
-        f.write("\n".join(lines) + "\n")
+        f.write("\n".join(lines) + "\n\n")
 
     print(f"Wrote {src}")
 

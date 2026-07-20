@@ -2,9 +2,9 @@ add_library(unity STATIC ${CMAKE_SOURCE_DIR}/external/Unity/src/unity.c)
 target_include_directories(unity PUBLIC ${CMAKE_SOURCE_DIR}/external/Unity/src)
 
 set(HQLC_TESTS
-    test_roundtrip
-    test_mdct
-    test_entropy
+    test_roundtrip   # end-to-end encode/decode integration
+    test_mdct        # MDCT forward/inverse transform identity
+    test_entropy     # bitstream, Rice, zigzag, rANS roundtrip + table invariants
 )
 
 foreach(TEST_NAME ${HQLC_TESTS})

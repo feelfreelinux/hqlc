@@ -1,8 +1,4 @@
-"""Core constants, band definitions, and band weights for HQLC."""
-
-import math
-
-import numpy as np
+"""Core constants and band definitions for HQLC."""
 
 # Frame / block dimensions
 FRAME_LEN = 512
@@ -10,7 +6,8 @@ BLOCK_SIZE = 1024
 N_BINS = 512
 FS = 48000
 
-# 20 non-uniform bands, approximately ERB-spaced
+# 20 non-uniform bands, roughly ERB-spaced (wider in LF, narrower after 2 kHz)
+# Stops at bin 427 (~20 kHz), higher bands are zeroed
 N_BANDS = 20
 BAND_EDGES = [
     0,
@@ -21,44 +18,106 @@ BAND_EDGES = [
     26,
     34,
     43,
-    55,
-    67,
-    82,
-    101,
-    123,
-    149,
-    179,
-    214,
+    52,
+    62,
+    75,
+    89,
+    107,
+    127,
+    152,
+    180,
+    215,
     255,
-    304,
-    362,
-    431,
-    512,
+    303,
+    360,
+    427,
 ]
 
-# Exponent index: log-domain energy descriptor per band
-# step = 2^((idx - BIAS) / 4), giving ~1.5 dB granularity
+# 48 fine bands for exponent computation
+#
+# Single-bin bands below 844 Hz (bins 0-17) to give more resolution there,
+# while higher bands follow ERB spacing
+# Generated with plateau_erb_edges(n_single=18, fs=48000, n_bins=512)
+FINE_BAND_EDGES = [
+    0,
+    1,
+    2,
+    3,
+    4,
+    5,
+    6,
+    7,
+    8,
+    9,
+    10,
+    11,
+    12,
+    13,
+    14,
+    15,
+    16,
+    17,
+    18,
+    20,
+    23,
+    26,
+    29,
+    33,
+    37,
+    42,
+    47,
+    53,
+    59,
+    66,
+    74,
+    83,
+    92,
+    102,
+    114,
+    127,
+    141,
+    157,
+    174,
+    193,
+    214,
+    238,
+    264,
+    293,
+    325,
+    361,
+    400,
+    427,
+    N_BINS,
+]
+
+N_FINE_BANDS = len(FINE_BAND_EDGES) - 1
+N_ACTIVE_FINE = N_FINE_BANDS - 1
+
+# Pre-emphasis tilt (dB) that is baked into the exponent computation, does static perceptual shaping
+FINE_TILT_DB = 35.0
+
+
+# Precomputed fine band to coarse mapping
+_FINE_CENTERS = [
+    (FINE_BAND_EDGES[i] + FINE_BAND_EDGES[i + 1]) / 2.0 for i in range(N_FINE_BANDS)
+]
+FB_COARSE = []
+for _fc in _FINE_CENTERS:
+    for _b in range(N_BANDS):
+        if BAND_EDGES[_b] <= _fc < BAND_EDGES[_b + 1]:
+            FB_COARSE.append(_b)
+            break
+    else:
+        FB_COARSE.append(N_BANDS - 1)
+
+# Exponent value is a log-domain energy descriptor, used to scale the quantizer accordingly
+# step = 2^((idx - BIAS) / 4)
 EXP_INDEX_BIAS = 43
 EXP_INDEX_MAX = 63
 EXP_INDEX_MIN = 0
 
 # Quantizer parameters
 DEAD_ZONE = 0.65  # below this threshold, coefficient quantizes to zero
-CENTROID = 0.15  # MMSE-optimal reconstruction offset for Laplacian source
 
-# Band weights: BW[b] = log2(bin_count[b]) / log2(max_bin_count), clipped [0.10, 1.0]
-# Normalizes quantizer precision across bands of different widths
-_BIN_COUNTS = np.array(
-    [BAND_EDGES[b + 1] - BAND_EDGES[b] for b in range(N_BANDS)], dtype=np.float64
-)
-_LOG2_BINS = np.log2(_BIN_COUNTS)
-BAND_WEIGHTS = np.clip(_LOG2_BINS / np.max(_LOG2_BINS), 0.10, 1.0)
-
-# log2(bin_count) in Q4 per band (for PSD to total energy conversion)
-LOG2_BINS_Q4 = np.array(
-    [
-        int(round(16.0 * math.log2(max(1, BAND_EDGES[b + 1] - BAND_EDGES[b]))))
-        for b in range(N_BANDS)
-    ],
-    dtype=np.int32,
-)
+# Reconstruction offset for the quantizer
+CENTROID = 0.15

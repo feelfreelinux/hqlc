@@ -16,16 +16,26 @@ enum {
   HQLC_BENCH_ENC_RC_TABLE,
   HQLC_BENCH_ENC_RC_QUANT,
   HQLC_BENCH_ENC_RC_COST,
-  HQLC_BENCH_ENC_RC_FINAL,
+  HQLC_BENCH_ENC_SELECT_GAIN,
+  HQLC_BENCH_ENC_QUANT_FWD,
+  HQLC_BENCH_ENC_NF_EST,
   HQLC_BENCH_ENC_ENTROPY,
   HQLC_BENCH_DEC_ENTROPY,
-  HQLC_BENCH_DEC_DEQUANT_NF,
+  HQLC_BENCH_DEC_DEQUANT,
+  HQLC_BENCH_DEC_NF,
   HQLC_BENCH_DEC_TNS,
   HQLC_BENCH_DEC_IMDCT_OLA,
   HQLC_BENCH_MDCT_FOLD,
   HQLC_BENCH_MDCT_PRE_TW,
   HQLC_BENCH_MDCT_FFT,
   HQLC_BENCH_MDCT_POST_TW,
+  HQLC_BENCH_ENC_SIDE_INFO,
+  HQLC_BENCH_ENC_RANS_ENC,
+  HQLC_BENCH_ENC_RANS_TBL,
+  HQLC_BENCH_DEC_RANS_DEC,
+  HQLC_BENCH_ENC_INTERP,
+  HQLC_BENCH_ENC_QLOOP,
+  HQLC_BENCH_ENC_PROBE_BAND,
   HQLC_BENCH_N_STAGES,
 };
 
@@ -59,18 +69,23 @@ typedef struct {
 
 typedef struct {
   hqlc_bench_stage stages[HQLC_BENCH_N_STAGES];
-  uint32_t _mark;
+  // Per-stage start marks so nested BEGIN/END pairs don't clobber each other
+  uint32_t marks[HQLC_BENCH_N_STAGES];
 } hqlc_bench_ctx;
 
-// Global pointer — set by benchmark harness before encode/decode calls.
+// Global pointer, set by benchmark harness before encode/decode calls.
 extern hqlc_bench_ctx *hqlc_bench;
 
 static inline void hqlc_bench_init(hqlc_bench_ctx *ctx) {
   static const char *const names[HQLC_BENCH_N_STAGES] = {
       "enc_mdct",     "enc_tns",      "enc_psy",       "enc_rc_table",
-      "enc_rc_quant", "enc_rc_cost",  "enc_rc_final",  "enc_entropy",
-      "dec_entropy",  "dec_dequant_nf", "dec_tns",     "dec_imdct_ola",
+      "enc_rc_quant", "enc_rc_cost",  "enc_select_gain",
+      "enc_quant_fwd", "enc_nf_est",   "enc_entropy",
+      "dec_entropy",  "dec_dequant",  "dec_nf",       "dec_tns",
+      "dec_imdct_ola",
       "mdct_fold",    "mdct_pre_tw",  "mdct_fft",      "mdct_post_tw",
+      "enc_side_info", "enc_rans_enc", "enc_rans_tbl", "dec_rans_dec",
+      "enc_interp",   "enc_qloop",    "enc_probe_band",
   };
   for (int i = 0; i < HQLC_BENCH_N_STAGES; i++) {
     ctx->stages[i].name = names[i];
@@ -78,8 +93,8 @@ static inline void hqlc_bench_init(hqlc_bench_ctx *ctx) {
     ctx->stages[i].min = UINT32_MAX;
     ctx->stages[i].max = 0;
     ctx->stages[i].sum = 0;
+    ctx->marks[i] = 0;
   }
-  ctx->_mark = 0;
 }
 
 static inline void hqlc_bench_print(const hqlc_bench_ctx *ctx, int cpu_mhz) {
@@ -103,24 +118,24 @@ static inline void hqlc_bench_print(const hqlc_bench_ctx *ctx, int cpu_mhz) {
 }
 
 // Instrumentation macros
-#define HQLC_BENCH_BEGIN()                     \
-  do {                                         \
-    if (hqlc_bench)                            \
-      hqlc_bench->_mark = hqlc_bench_cycles(); \
+#define HQLC_BENCH_BEGIN(stage)                        \
+  do {                                                 \
+    if (hqlc_bench)                                    \
+      hqlc_bench->marks[stage] = hqlc_bench_cycles();  \
   } while (0)
 
-#define HQLC_BENCH_END(stage)                                      \
-  do {                                                             \
-    if (hqlc_bench) {                                              \
-      uint32_t _elapsed = hqlc_bench_cycles() - hqlc_bench->_mark; \
-      hqlc_bench_stage *_s = &hqlc_bench->stages[stage];           \
-      _s->count++;                                                 \
-      _s->sum += _elapsed;                                         \
-      if (_elapsed < _s->min)                                      \
-        _s->min = _elapsed;                                        \
-      if (_elapsed > _s->max)                                      \
-        _s->max = _elapsed;                                        \
-    }                                                              \
+#define HQLC_BENCH_END(stage)                                              \
+  do {                                                                     \
+    if (hqlc_bench) {                                                      \
+      uint32_t _elapsed = hqlc_bench_cycles() - hqlc_bench->marks[stage];  \
+      hqlc_bench_stage *_s = &hqlc_bench->stages[stage];                   \
+      _s->count++;                                                         \
+      _s->sum += _elapsed;                                                 \
+      if (_elapsed < _s->min)                                              \
+        _s->min = _elapsed;                                                \
+      if (_elapsed > _s->max)                                              \
+        _s->max = _elapsed;                                                \
+    }                                                                      \
   } while (0)
 
 #endif // HQLC_BENCH_IMPL_H

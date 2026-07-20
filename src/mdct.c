@@ -7,8 +7,101 @@
 #include "mdct_tables.h"
 #include "pcm.h"
 
-// Lookup a twiddle factor W_256^k from the half-period table.
-// As an optimization, for k >= 128 we use W^k = -W^(k-128) to derive the negative value
+/**
+ * @brief Return one sample from the mirrored 1024-point KBD window
+ */
+static inline int32_t mdct_win_q31(int i) {
+  return kbd_window_half_q31[(i < MDCT_N) ? i : (MDCT_BLOCK_LEN - 1 - i)];
+}
+
+/**
+ * @brief Q31 multiply with one extra guard bit
+ *
+ * Uses >> 32 to give one extra bit of headroom, needed in the add/substract steps that
+ * follow it. Its tracked later in the bfp, so the lost scale is accounted for.
+ */
+static inline int32_t mul_q31_guard(int32_t a, int32_t b) {
+  return (int32_t)((int64_t)a * b >> 32);
+}
+
+/**
+ * @brief Branchless mag for OR-based headroom measurement.
+ *
+ * This is not a saturating abs for full int32, but its good enough for the OR accumulator
+ * to find highest occupied magnitude bit
+ */
+static inline uint32_t mag_or_i32(int32_t v) {
+  return (uint32_t)(v ^ (v >> 31));
+}
+
+/**
+ * @brief Align one BFP sample into a common exponent domain.
+ */
+static inline int32_t align_bfp_sample(int32_t sample, int shift) {
+  return (shift < 31) ? fxp_shr_rnd_i32(sample, shift) : 0;
+}
+
+/**
+ * @brief Apply the final PCM exponent after overlap-add.
+ */
+static inline int32_t apply_pcm_exp(int32_t sample, int exp_shift) {
+  if (exp_shift > 0) {
+    return fxp_shl_sat_i32(sample, exp_shift);
+  }
+  if (exp_shift < 0) {
+    return fxp_shr_rnd_i32(sample, -exp_shift);
+  }
+  return sample;
+}
+
+/**
+ * @brief Convert a Q31 PCM sample to clamped signed 16-bit PCM.
+ */
+static inline int16_t pcm_q31_to_i16(int32_t sample_q31) {
+  int32_t pcm16 = (sample_q31 >> 16) + ((sample_q31 >> 15) & 1);
+  return pcm_clamp_i16(pcm16);
+}
+
+/**
+ * @brief Window, align, and overlap-add one previous/current IMDCT pair.
+ *
+ * The signs are part of the MDCT unfold formula, callers pass +1 or -1 values
+ * for the previous and current terms.
+ */
+static inline int32_t ola_mix_q31(int32_t prev_sample,
+                                  int32_t prev_window,
+                                  int prev_sign,
+                                  int prev_shift,
+                                  int32_t curr_sample,
+                                  int32_t curr_window,
+                                  int curr_sign,
+                                  int curr_shift,
+                                  int pcm_exp) {
+  int32_t prev_windowed = mul_q31_guard(prev_sample, prev_window);
+  int32_t curr_windowed = mul_q31_guard(curr_sample, curr_window);
+
+  if (prev_sign < 0) {
+    prev_windowed = -prev_windowed;
+  }
+  if (curr_sign < 0) {
+    curr_windowed = -curr_windowed;
+  }
+
+  int32_t prev_aligned = align_bfp_sample(prev_windowed, prev_shift);
+  int32_t curr_aligned = align_bfp_sample(curr_windowed, curr_shift);
+  int32_t mixed = fxp_sat_i64_to_i32((int64_t)prev_aligned + curr_aligned);
+  return apply_pcm_exp(mixed, pcm_exp);
+}
+
+/**
+ * @brief Lookup the FFT twiddle W_256^k
+ *
+ * @param k Index into the twiddle lookup table
+ * @param re Pointer to store the real part of the twiddle
+ * @param im Pointer to store the imaginary part of the twiddle
+ *
+ * Done so we only store the first half, second half is the negated first half
+ */
 static inline void tw_lookup(int k, int32_t *re, int32_t *im) {
   k &= 255;
   if (k < 128) {
@@ -20,143 +113,153 @@ static inline void tw_lookup(int k, int32_t *re, int32_t *im) {
   }
 }
 
-// Core FFT with >>2 scaling per stage (>>8 total)
-// N = 256 = 4^4
-// Input is interleaved complex Q31: buf[2*i] = re, buf[2*i+1] = im
-// Calculations are in place
+/**
+ * @brief In-place fixed-size radix-4 FFT used by the DCT-IV.
+ *
+ * The FFT length is 256 = 4^4. Each radix-4 stage scales by >>2, giving >> 8 total
+ * headroom protection. Complex values are interleaved as real/imaginary pairs.
+ */
 static void fft_scaled(int32_t *buf) {
-  const int n = MDCT_FFT_N;
+  const int fft_len = MDCT_FFT_N;
 
-  // Digit-reversal permutation via precomputed swap-pair LUT
-  for (int k = 0; k < MDCT_DIGIT_REV_PAIRS; k++) {
-    int i = lut_digit_rev[2 * k];
-    int j = lut_digit_rev[2 * k + 1];
-    int32_t tr = buf[2 * i], ti = buf[2 * i + 1];
+  for (int swap = 0; swap < MDCT_DIGIT_REV_PAIRS; swap++) {
+    int i = lut_digit_rev[2 * swap];
+    int j = lut_digit_rev[2 * swap + 1];
+    int32_t tmp_re = buf[2 * i];
+    int32_t tmp_im = buf[2 * i + 1];
     buf[2 * i] = buf[2 * j];
     buf[2 * i + 1] = buf[2 * j + 1];
-    buf[2 * j] = tr;
-    buf[2 * j + 1] = ti;
+    buf[2 * j] = tmp_re;
+    buf[2 * j + 1] = tmp_im;
   }
 
-  // Trivial radix-4 butterflies (all twiddles = 1), stage 0
-  for (int base = 0; base < n; base += 4) {
-    int32_t ar = buf[2 * base], ai = buf[2 * base + 1];
-    int32_t br = buf[2 * (base + 1)], bi = buf[2 * (base + 1) + 1];
-    int32_t cr = buf[2 * (base + 2)], ci = buf[2 * (base + 2) + 1];
-    int32_t dr = buf[2 * (base + 3)], di = buf[2 * (base + 3) + 1];
+  for (int base = 0; base < fft_len; base += 4) {
+    int32_t x0_re = buf[2 * base], x0_im = buf[2 * base + 1];
+    int32_t x1_re = buf[2 * (base + 1)], x1_im = buf[2 * (base + 1) + 1];
+    int32_t x2_re = buf[2 * (base + 2)], x2_im = buf[2 * (base + 2) + 1];
+    int32_t x3_re = buf[2 * (base + 3)], x3_im = buf[2 * (base + 3) + 1];
 
-    int32_t u0r = (ar >> 1) + (cr >> 1), u0i = (ai >> 1) + (ci >> 1);
-    int32_t u1r = (ar >> 1) - (cr >> 1), u1i = (ai >> 1) - (ci >> 1);
-    int32_t u2r = (br >> 1) + (dr >> 1), u2i = (bi >> 1) + (di >> 1);
-    int32_t u3r = (br >> 1) - (dr >> 1), u3i = (bi >> 1) - (di >> 1);
+    int32_t even_sum_re = (x0_re >> 1) + (x2_re >> 1);
+    int32_t even_sum_im = (x0_im >> 1) + (x2_im >> 1);
+    int32_t even_diff_re = (x0_re >> 1) - (x2_re >> 1);
+    int32_t even_diff_im = (x0_im >> 1) - (x2_im >> 1);
+    int32_t odd_sum_re = (x1_re >> 1) + (x3_re >> 1);
+    int32_t odd_sum_im = (x1_im >> 1) + (x3_im >> 1);
+    int32_t odd_diff_re = (x1_re >> 1) - (x3_re >> 1);
+    int32_t odd_diff_im = (x1_im >> 1) - (x3_im >> 1);
 
-    buf[2 * base] = (u0r >> 1) + (u2r >> 1);
-    buf[2 * base + 1] = (u0i >> 1) + (u2i >> 1);
-    buf[2 * (base + 1)] = (u1r >> 1) + (u3i >> 1);
-    buf[2 * (base + 1) + 1] = (u1i >> 1) - (u3r >> 1);
-    buf[2 * (base + 2)] = (u0r >> 1) - (u2r >> 1);
-    buf[2 * (base + 2) + 1] = (u0i >> 1) - (u2i >> 1);
-    buf[2 * (base + 3)] = (u1r >> 1) - (u3i >> 1);
-    buf[2 * (base + 3) + 1] = (u1i >> 1) + (u3r >> 1);
+    buf[2 * base] = (even_sum_re >> 1) + (odd_sum_re >> 1);
+    buf[2 * base + 1] = (even_sum_im >> 1) + (odd_sum_im >> 1);
+    buf[2 * (base + 1)] = (even_diff_re >> 1) + (odd_diff_im >> 1);
+    buf[2 * (base + 1) + 1] = (even_diff_im >> 1) - (odd_diff_re >> 1);
+    buf[2 * (base + 2)] = (even_sum_re >> 1) - (odd_sum_re >> 1);
+    buf[2 * (base + 2) + 1] = (even_sum_im >> 1) - (odd_sum_im >> 1);
+    buf[2 * (base + 3)] = (even_diff_re >> 1) - (odd_diff_im >> 1);
+    buf[2 * (base + 3) + 1] = (even_diff_im >> 1) + (odd_diff_re >> 1);
   }
 
-  // Stages 1–3, radix-4 butterflies with twiddle factors
-  for (int s = 1; s <= 3; s++) {
-    int stride = 1 << (2 * s);
-    int block_size = stride << 2;
-    int tw_step = n / block_size;
+  for (int stage = 1; stage <= 3; stage++) {
+    int quarter_stride = 1 << (2 * stage);
+    int butterfly_span = quarter_stride << 2;
+    int groups = fft_len / butterfly_span;
 
-    for (int k = 0; k < stride; k++) {
-      int32_t w1r, w1i, w2r, w2i, w3r, w3i;
-      tw_lookup(k * tw_step, &w1r, &w1i);
-      tw_lookup(2 * k * tw_step, &w2r, &w2i);
-      tw_lookup(3 * k * tw_step, &w3r, &w3i);
+    for (int offset = 0; offset < quarter_stride; offset++) {
+      int32_t w1_re, w1_im, w2_re, w2_im, w3_re, w3_im;
+      tw_lookup(offset * groups, &w1_re, &w1_im);
+      tw_lookup(2 * offset * groups, &w2_re, &w2_im);
+      tw_lookup(3 * offset * groups, &w3_re, &w3_im);
 
-      for (int b = 0; b < tw_step; b++) {
-        int i0 = b * block_size + k;
-        int i1 = i0 + stride;
-        int i2 = i0 + 2 * stride;
-        int i3 = i0 + 3 * stride;
+      for (int group = 0; group < groups; group++) {
+        int i0 = group * butterfly_span + offset;
+        int i1 = i0 + quarter_stride;
+        int i2 = i0 + 2 * quarter_stride;
+        int i3 = i0 + 3 * quarter_stride;
 
-        int32_t ar = buf[2 * i0], ai = buf[2 * i0 + 1];
-        int32_t br = buf[2 * i1], bi = buf[2 * i1 + 1];
-        int32_t cr = buf[2 * i2], ci = buf[2 * i2 + 1];
-        int32_t dr = buf[2 * i3], di = buf[2 * i3 + 1];
+        int32_t x0_re = buf[2 * i0], x0_im = buf[2 * i0 + 1];
+        int32_t raw1_re = buf[2 * i1], raw1_im = buf[2 * i1 + 1];
+        int32_t raw2_re = buf[2 * i2], raw2_im = buf[2 * i2 + 1];
+        int32_t raw3_re = buf[2 * i3], raw3_im = buf[2 * i3 + 1];
 
-        int32_t t1r = fxp_mul_q31(br, w1r) - fxp_mul_q31(bi, w1i);
-        int32_t t1i = fxp_mul_q31(br, w1i) + fxp_mul_q31(bi, w1r);
-        int32_t t2r = fxp_mul_q31(cr, w2r) - fxp_mul_q31(ci, w2i);
-        int32_t t2i = fxp_mul_q31(cr, w2i) + fxp_mul_q31(ci, w2r);
-        int32_t t3r = fxp_mul_q31(dr, w3r) - fxp_mul_q31(di, w3i);
-        int32_t t3i = fxp_mul_q31(dr, w3i) + fxp_mul_q31(di, w3r);
+        int32_t x1_re = fxp_mul_q31(raw1_re, w1_re) - fxp_mul_q31(raw1_im, w1_im);
+        int32_t x1_im = fxp_mul_q31(raw1_re, w1_im) + fxp_mul_q31(raw1_im, w1_re);
+        int32_t x2_re = fxp_mul_q31(raw2_re, w2_re) - fxp_mul_q31(raw2_im, w2_im);
+        int32_t x2_im = fxp_mul_q31(raw2_re, w2_im) + fxp_mul_q31(raw2_im, w2_re);
+        int32_t x3_re = fxp_mul_q31(raw3_re, w3_re) - fxp_mul_q31(raw3_im, w3_im);
+        int32_t x3_im = fxp_mul_q31(raw3_re, w3_im) + fxp_mul_q31(raw3_im, w3_re);
 
-        int32_t u0r = (ar >> 1) + (t2r >> 1), u0i = (ai >> 1) + (t2i >> 1);
-        int32_t u1r = (ar >> 1) - (t2r >> 1), u1i = (ai >> 1) - (t2i >> 1);
-        int32_t u2r = (t1r >> 1) + (t3r >> 1), u2i = (t1i >> 1) + (t3i >> 1);
-        int32_t u3r = (t1r >> 1) - (t3r >> 1), u3i = (t1i >> 1) - (t3i >> 1);
+        int32_t even_sum_re = (x0_re >> 1) + (x2_re >> 1);
+        int32_t even_sum_im = (x0_im >> 1) + (x2_im >> 1);
+        int32_t even_diff_re = (x0_re >> 1) - (x2_re >> 1);
+        int32_t even_diff_im = (x0_im >> 1) - (x2_im >> 1);
+        int32_t odd_sum_re = (x1_re >> 1) + (x3_re >> 1);
+        int32_t odd_sum_im = (x1_im >> 1) + (x3_im >> 1);
+        int32_t odd_diff_re = (x1_re >> 1) - (x3_re >> 1);
+        int32_t odd_diff_im = (x1_im >> 1) - (x3_im >> 1);
 
-        buf[2 * i0] = (u0r >> 1) + (u2r >> 1);
-        buf[2 * i0 + 1] = (u0i >> 1) + (u2i >> 1);
-        buf[2 * i1] = (u1r >> 1) + (u3i >> 1);
-        buf[2 * i1 + 1] = (u1i >> 1) - (u3r >> 1);
-        buf[2 * i2] = (u0r >> 1) - (u2r >> 1);
-        buf[2 * i2 + 1] = (u0i >> 1) - (u2i >> 1);
-        buf[2 * i3] = (u1r >> 1) - (u3i >> 1);
-        buf[2 * i3 + 1] = (u1i >> 1) + (u3r >> 1);
+        buf[2 * i0] = (even_sum_re >> 1) + (odd_sum_re >> 1);
+        buf[2 * i0 + 1] = (even_sum_im >> 1) + (odd_sum_im >> 1);
+        buf[2 * i1] = (even_diff_re >> 1) + (odd_diff_im >> 1);
+        buf[2 * i1 + 1] = (even_diff_im >> 1) - (odd_diff_re >> 1);
+        buf[2 * i2] = (even_sum_re >> 1) - (odd_sum_re >> 1);
+        buf[2 * i2 + 1] = (even_sum_im >> 1) - (odd_sum_im >> 1);
+        buf[2 * i3] = (even_diff_re >> 1) - (odd_diff_im >> 1);
+        buf[2 * i3 + 1] = (even_diff_im >> 1) + (odd_diff_re >> 1);
       }
     }
   }
 }
 
-// In place DCT-IV using a half-length complex FFT
-static void dct_iv(int32_t *restrict data, int32_t *restrict work) {
+/**
+ * @brief In-place DCT-IV implemented with a half-length complex FFT
+ *
+ * @param data Input/output buffer for DCT-IV
+ * @param work Scratch buffer for FFT
+ */
+static void dct_iv(int32_t *data, int32_t *work) {
   const int N = MDCT_N;
   const int N_FFT = MDCT_FFT_N;
 
-  // Pre-twiddle: pack real DCT input into complex FFT input.
-  // Uses >>32 (mulsh-only) instead of >>1 + fxp_mul_q31 — same net precision.
-  HQLC_BENCH_BEGIN();
+  HQLC_BENCH_BEGIN(HQLC_BENCH_MDCT_PRE_TW);
   for (int k = 0; k < N_FFT; k++) {
-    int32_t re = data[2 * k];
-    int32_t im = data[N - 1 - 2 * k];
-    int32_t wr = lut_pre_twiddle_q31[2 * k];
-    int32_t wi = lut_pre_twiddle_q31[2 * k + 1];
-    work[2 * k] = (int32_t)((int64_t)re * wr >> 32) - (int32_t)((int64_t)im * wi >> 32);
+    int32_t even_sample = data[2 * k];
+    int32_t odd_mirror = data[N - 1 - 2 * k];
+    int32_t tw_re = lut_pre_twiddle_q31[2 * k];
+    int32_t tw_im = lut_pre_twiddle_q31[2 * k + 1];
+
+    work[2 * k] = mul_q31_guard(even_sample, tw_re) - mul_q31_guard(odd_mirror, tw_im);
     work[2 * k + 1] =
-        (int32_t)((int64_t)re * wi >> 32) + (int32_t)((int64_t)im * wr >> 32);
+        mul_q31_guard(even_sample, tw_im) + mul_q31_guard(odd_mirror, tw_re);
   }
   HQLC_BENCH_END(HQLC_BENCH_MDCT_PRE_TW);
 
-  HQLC_BENCH_BEGIN();
-  // Do the FFT
+  HQLC_BENCH_BEGIN(HQLC_BENCH_MDCT_FFT);
   fft_scaled(work);
   HQLC_BENCH_END(HQLC_BENCH_MDCT_FFT);
 
-  // Post-twiddle: unpack FFT output to real DCT coefficients.
-  // Uses >>32 (mulsh-only) — same tradeoff as pre-twiddle and inverse unfold.
-  HQLC_BENCH_BEGIN();
+  HQLC_BENCH_BEGIN(HQLC_BENCH_MDCT_POST_TW);
   for (int k = 0; k < N_FFT; k++) {
-    int32_t zr = work[2 * k], zi = work[2 * k + 1];
-    int32_t wr = lut_post_twiddle_q31[2 * k];
-    int32_t wi = lut_post_twiddle_q31[2 * k + 1];
-    data[2 * k] = (int32_t)((int64_t)zr * wr >> 32) - (int32_t)((int64_t)zi * wi >> 32);
-    data[N - 1 - 2 * k] =
-        -((int32_t)((int64_t)zr * wi >> 32) + (int32_t)((int64_t)zi * wr >> 32));
+    int32_t fft_re = work[2 * k];
+    int32_t fft_im = work[2 * k + 1];
+    int32_t tw_re = lut_post_twiddle_q31[2 * k];
+    int32_t tw_im = lut_post_twiddle_q31[2 * k + 1];
+
+    data[2 * k] = mul_q31_guard(fft_re, tw_re) - mul_q31_guard(fft_im, tw_im);
+    data[N - 1 - 2 * k] = -(mul_q31_guard(fft_re, tw_im) + mul_q31_guard(fft_im, tw_re));
   }
   HQLC_BENCH_END(HQLC_BENCH_MDCT_POST_TW);
 }
 
-hqlc_error mdct_forward(const uint8_t *restrict prev_pcm,
-                        const uint8_t *restrict curr_pcm,
+hqlc_error mdct_forward(const uint8_t *prev_pcm,
+                        const uint8_t *curr_pcm,
                         size_t half_pcm_len,
                         hqlc_pcm_format fmt,
                         int stride,
                         int channel_idx,
-                        int32_t *restrict spec_q31,
+                        int32_t *spec_q31,
                         size_t spec_q31_len,
-                        void *restrict scratch,
+                        void *scratch,
                         size_t scratch_len,
-                        int *restrict loss_bits_out) {
+                        int *loss_bits_out) {
   if (!prev_pcm || !curr_pcm || !spec_q31 || !scratch || !loss_bits_out) {
     return HQLC_ERR_INVALID_ARG;
   }
@@ -173,131 +276,224 @@ hqlc_error mdct_forward(const uint8_t *restrict prev_pcm,
     return HQLC_ERR_INVALID_ARG;
   }
 
-  // Check buffer sizes and format
-  size_t bps = (fmt == HQLC_PCM16) ? 2 : 3;
-  size_t needed = (size_t)HQLC_FRAME_SAMPLES * (size_t)stride * bps;
-  if (half_pcm_len < needed) {
+  size_t bytes_per_sample = (fmt == HQLC_PCM16) ? 2 : 3;
+  size_t required_pcm_bytes =
+      (size_t)HQLC_FRAME_SAMPLES * (size_t)stride * bytes_per_sample;
+  if (half_pcm_len < required_pcm_bytes) {
     return HQLC_ERR_BUFFER_TOO_SMALL;
   }
 
   const int N = MDCT_N;
-  const int N2 = N / 2;
-
+  const int half_n = N / 2;
   int32_t *folded = spec_q31;
 
-  // Window + fold into Q30 using >>32 (mulsh-only on Xtensa).
-  // The >>32 combines the Q31 multiply with the >>1 overflow guard into one shift,
-  // costing 1 LSB vs fxp_mul_q31 but saving 3 instructions per multiply.
-  HQLC_BENCH_BEGIN();
-  uint32_t or_acc = 0; // branchless abs via XOR: (v ^ (v >> 31)) avoids INT_MIN branch
+  HQLC_BENCH_BEGIN(HQLC_BENCH_MDCT_FOLD);
+  uint32_t fold_mag = 0;
 
+  // The 1024-sample MDCT window is [A B C D], four 256-sample quarters
+  // Folding turns it into the 512 sample DCT-IV input:
+  //  folded[0..N/2] = -D - reverse(C)
+  //  folded[N/2..N] =  A - reverse(B)
+  // (windowing is applied before folding in the same loop)
   if (fmt == HQLC_PCM16) {
     const int16_t *curr = (const int16_t *)curr_pcm;
     const int16_t *prev = (const int16_t *)prev_pcm;
-    const int32_t *wh = kbd_window_half_q31;
+    const int32_t *win = kbd_window_half_q31;
 
-    for (int n = 0; n < N2; n++) {
-      int32_t s1 = (int32_t)curr[(N2 + n) * stride + channel_idx] << 16;
-      int32_t s2 = (int32_t)curr[(N2 - 1 - n) * stride + channel_idx] << 16;
-      int32_t t1 = (int32_t)((int64_t)s1 * wh[N2 - 1 - n] >> 32);
-      int32_t t2 = (int32_t)((int64_t)s2 * wh[N2 + n] >> 32);
-      int32_t v = -t1 - t2;
-      folded[n] = v;
-      or_acc |= (uint32_t)(v ^ (v >> 31));
+    for (int n = 0; n < half_n; n++) {
+      int32_t curr_late =
+          (int32_t)((uint32_t)curr[(half_n + n) * stride + channel_idx] << 16);
+      int32_t curr_early_rev =
+          (int32_t)((uint32_t)curr[(half_n - 1 - n) * stride + channel_idx] << 16);
+
+      int32_t late_windowed = mul_q31_guard(curr_late, win[half_n - 1 - n]);
+      int32_t early_windowed = mul_q31_guard(curr_early_rev, win[half_n + n]);
+      int32_t folded_sample = -late_windowed - early_windowed;
+
+      folded[n] = folded_sample;
+      fold_mag |= mag_or_i32(folded_sample);
     }
 
-    for (int n = 0; n < N2; n++) {
-      int32_t s1 = (int32_t)prev[n * stride + channel_idx] << 16;
-      int32_t s2 = (int32_t)prev[(N - 1 - n) * stride + channel_idx] << 16;
-      int32_t t1 = (int32_t)((int64_t)s1 * wh[n] >> 32);
-      int32_t t2 = (int32_t)((int64_t)s2 * wh[N - 1 - n] >> 32);
-      int32_t v = t1 - t2;
-      folded[N2 + n] = v;
-      or_acc |= (uint32_t)(v ^ (v >> 31));
+    for (int n = 0; n < half_n; n++) {
+      int32_t prev_early = (int32_t)((uint32_t)prev[n * stride + channel_idx] << 16);
+      int32_t prev_late_rev =
+          (int32_t)((uint32_t)prev[(N - 1 - n) * stride + channel_idx] << 16);
+
+      int32_t early_windowed = mul_q31_guard(prev_early, win[n]);
+      int32_t late_windowed = mul_q31_guard(prev_late_rev, win[N - 1 - n]);
+      int32_t folded_sample = early_windowed - late_windowed;
+
+      folded[half_n + n] = folded_sample;
+      fold_mag |= mag_or_i32(folded_sample);
     }
   } else {
-    for (int n = 0; n < N2; n++) {
-      int32_t s1 = pcm_load_q31(curr_pcm, fmt, (N2 + n) * stride + channel_idx);
-      int32_t s2 = pcm_load_q31(curr_pcm, fmt, (N2 - 1 - n) * stride + channel_idx);
-      int32_t t1 = (int32_t)((int64_t)s1 * kbd_window_q31(3 * N2 + n) >> 32);
-      int32_t t2 = (int32_t)((int64_t)s2 * kbd_window_q31(3 * N2 - 1 - n) >> 32);
-      int32_t v = -t1 - t2;
-      folded[n] = v;
-      or_acc |= (uint32_t)(v ^ (v >> 31));
+    for (int n = 0; n < half_n; n++) {
+      int32_t curr_late =
+          pcm_load_q31(curr_pcm, fmt, (half_n + n) * stride + channel_idx);
+      int32_t curr_early_rev =
+          pcm_load_q31(curr_pcm, fmt, (half_n - 1 - n) * stride + channel_idx);
+
+      int32_t late_windowed = mul_q31_guard(curr_late, mdct_win_q31(3 * half_n + n));
+      int32_t early_windowed =
+          mul_q31_guard(curr_early_rev, mdct_win_q31(3 * half_n - 1 - n));
+      int32_t folded_sample = -late_windowed - early_windowed;
+
+      folded[n] = folded_sample;
+      fold_mag |= mag_or_i32(folded_sample);
     }
-    for (int n = 0; n < N2; n++) {
-      int32_t s1 = pcm_load_q31(prev_pcm, fmt, n * stride + channel_idx);
-      int32_t s2 = pcm_load_q31(prev_pcm, fmt, (N - 1 - n) * stride + channel_idx);
-      int32_t t1 = (int32_t)((int64_t)s1 * kbd_window_q31(n) >> 32);
-      int32_t t2 = (int32_t)((int64_t)s2 * kbd_window_q31(N - 1 - n) >> 32);
-      int32_t v = t1 - t2;
-      folded[N2 + n] = v;
-      or_acc |= (uint32_t)(v ^ (v >> 31));
+
+    for (int n = 0; n < half_n; n++) {
+      int32_t prev_early = pcm_load_q31(prev_pcm, fmt, n * stride + channel_idx);
+      int32_t prev_late_rev =
+          pcm_load_q31(prev_pcm, fmt, (N - 1 - n) * stride + channel_idx);
+
+      int32_t early_windowed = mul_q31_guard(prev_early, mdct_win_q31(n));
+      int32_t late_windowed = mul_q31_guard(prev_late_rev, mdct_win_q31(N - 1 - n));
+      int32_t folded_sample = early_windowed - late_windowed;
+
+      folded[half_n + n] = folded_sample;
+      fold_mag |= mag_or_i32(folded_sample);
     }
   }
 
-  // Headroom normalization (data is Q30 after the >>32 window multiply)
-  int hr = fxp_headroom_u32(or_acc);
+  int headroom = fxp_headroom_u32(fold_mag);
   int fold_gain;
-  if (or_acc == 0) {
+  if (fold_mag == 0) {
     fold_gain = 30;
   } else {
-    if (hr > 0) {
+    if (headroom > 0) {
       for (int i = 0; i < N; i++) {
-        folded[i] <<= hr;
+        folded[i] = (int32_t)((uint32_t)folded[i] << headroom);
       }
     }
-    fold_gain = hr - 1; // -1 accounts for the pre shift
+    fold_gain = headroom - 1;
   }
   HQLC_BENCH_END(HQLC_BENCH_MDCT_FOLD);
 
-  int32_t *work = (int32_t *)scratch;
-  dct_iv(folded, work);
+  int32_t *fft_work = (int32_t *)scratch;
+  dct_iv(folded, fft_work);
 
-  // Account for the DCT gain and the pre-shift normalization
   *loss_bits_out = -fold_gain + MDCT_DCT_BITS;
   return HQLC_OK;
 }
 
-hqlc_error mdct_inverse(const int32_t *restrict spec_q31,
-                        size_t spec_q31_len,
-                        int loss_bits_in,
-                        int32_t *restrict windowed_q31,
-                        size_t windowed_q31_len,
-                        void *restrict scratch,
-                        size_t scratch_len,
-                        int *restrict loss_bits_out) {
-  if (!spec_q31 || !windowed_q31 || !scratch || !loss_bits_out) {
+hqlc_error mdct_inverse_ola(const int32_t *spec_q31,
+                            size_t spec_q31_len,
+                            int loss_bits_in,
+                            mdct_ola_state *ola,
+                            uint8_t *pcm_out,
+                            hqlc_pcm_format fmt,
+                            int stride,
+                            int channel_idx,
+                            void *scratch,
+                            size_t scratch_len) {
+  if (!spec_q31 || !ola || !pcm_out || !scratch) {
     return HQLC_ERR_INVALID_ARG;
   }
   if (spec_q31_len < (size_t)MDCT_N) {
     return HQLC_ERR_BUFFER_TOO_SMALL;
   }
-  if (windowed_q31_len < (size_t)MDCT_BLOCK_LEN) {
-    return HQLC_ERR_BUFFER_TOO_SMALL;
-  }
   if (scratch_len < (size_t)MDCT_SCRATCH_BYTES) {
     return HQLC_ERR_BUFFER_TOO_SMALL;
   }
-
-  const int N = MDCT_N;
-  const int N2 = N / 2;
-
-  int32_t *u = (int32_t *)scratch;
-  int32_t *fft_work = &u[N];
-
-  memcpy(u, spec_q31, (size_t)N * sizeof(int32_t));
-  dct_iv(u, fft_work);
-
-  // Unfold + window (>>32 approximation, costs 1 bit)
-  const int32_t *wh = kbd_window_half_q31;
-  for (int n = 0; n < N2; n++) {
-    windowed_q31[n] = (int32_t)((int64_t)u[N2 + n] * wh[n] >> 32);
-    windowed_q31[N2 + n] = -(int32_t)((int64_t)u[N - 1 - n] * wh[N2 + n] >> 32);
-    windowed_q31[N + n] = -(int32_t)((int64_t)u[N2 - 1 - n] * wh[N - 1 - n] >> 32);
-    windowed_q31[N + N2 + n] = -(int32_t)((int64_t)u[n] * wh[N2 - 1 - n] >> 32);
+  if (fmt != HQLC_PCM16 && fmt != HQLC_PCM24) {
+    return HQLC_ERR_INVALID_ARG;
+  }
+  if (stride < 1 || channel_idx < 0 || channel_idx >= stride) {
+    return HQLC_ERR_INVALID_ARG;
   }
 
-  *loss_bits_out = loss_bits_in + MDCT_DCT_BITS - MDCT_MATH_GAIN_BITS + 1;
+  const int N = MDCT_N;
+  const int half_n = N / 2;
+
+  int32_t *time = (int32_t *)scratch;
+  int32_t *fft_work = &time[N];
+  memcpy(time, spec_q31, (size_t)N * sizeof(int32_t));
+
+  dct_iv(time, fft_work);
+
+  int curr_exp = loss_bits_in + MDCT_DCT_BITS - MDCT_MATH_GAIN_BITS;
+  if (!ola->has_overlap) {
+    ola->loss_bits = curr_exp;
+    ola->has_overlap = true;
+  }
+
+  int prev_exp = ola->loss_bits;
+  int common_exp = (prev_exp > curr_exp) ? prev_exp : curr_exp;
+  int prev_shift = (common_exp - prev_exp) + 1;
+  int curr_shift = (common_exp - curr_exp) + 1;
+  int pcm_exp = common_exp + 2;
+
+  const int32_t *win = kbd_window_half_q31;
+  const int32_t *prev_time = ola->overlap;
+
+  if (fmt == HQLC_PCM16) {
+    int16_t *out = (int16_t *)pcm_out;
+    for (int n = 0; n < half_n; n++) {
+      int32_t first_pcm = ola_mix_q31(prev_time[half_n - 1 - n],
+                                      win[N - 1 - n],
+                                      -1,
+                                      prev_shift,
+                                      time[half_n + n],
+                                      win[n],
+                                      1,
+                                      curr_shift,
+                                      pcm_exp);
+      out[n * stride + channel_idx] = pcm_q31_to_i16(first_pcm);
+
+      int32_t second_pcm = ola_mix_q31(prev_time[n],
+                                       win[half_n - 1 - n],
+                                       -1,
+                                       prev_shift,
+                                       time[N - 1 - n],
+                                       win[half_n + n],
+                                       -1,
+                                       curr_shift,
+                                       pcm_exp);
+      out[(half_n + n) * stride + channel_idx] = pcm_q31_to_i16(second_pcm);
+    }
+  } else {
+    for (int n = 0; n < half_n; n++) {
+      int32_t first_pcm = ola_mix_q31(prev_time[half_n - 1 - n],
+                                      win[N - 1 - n],
+                                      -1,
+                                      prev_shift,
+                                      time[half_n + n],
+                                      win[n],
+                                      1,
+                                      curr_shift,
+                                      pcm_exp);
+      pcm_store_q31(pcm_out, fmt, n * stride + channel_idx, first_pcm);
+
+      int32_t second_pcm = ola_mix_q31(prev_time[n],
+                                       win[half_n - 1 - n],
+                                       -1,
+                                       prev_shift,
+                                       time[N - 1 - n],
+                                       win[half_n + n],
+                                       -1,
+                                       curr_shift,
+                                       pcm_exp);
+      pcm_store_q31(pcm_out, fmt, (half_n + n) * stride + channel_idx, second_pcm);
+    }
+  }
+
+  uint32_t overlap_mag = 0;
+  for (int i = 0; i < half_n; i++) {
+    overlap_mag |= mag_or_i32(time[i]);
+  }
+
+  int overlap_headroom = fxp_headroom_u32(overlap_mag);
+  if (overlap_headroom > 0) {
+    for (int i = 0; i < half_n; i++) {
+      ola->overlap[i] = (int32_t)((uint32_t)time[i] << overlap_headroom);
+    }
+  } else {
+    for (int i = 0; i < half_n; i++) {
+      ola->overlap[i] = time[i];
+    }
+  }
+  ola->loss_bits = curr_exp - overlap_headroom;
+
   return HQLC_OK;
 }

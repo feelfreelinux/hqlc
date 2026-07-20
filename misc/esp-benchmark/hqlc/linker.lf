@@ -13,4 +13,13 @@ entries:
     # kbd_window_half_q31: stays in flash (one linear pass per frame)
     # Entropy tables in DRAM (rANS inner loop)
     entropy_tables (noflash_data)
-    # hqlc, quant, psy, tns: default flash placement
+    # Quantizer hot paths (dequant, NF fill, fwd quant) in IRAM
+    # noflash also covers its rodata (quant_pow2_eighth_q30)
+    quant (noflash)
+    # TNS filter in IRAM (FIR/IIR inner loops)
+    tns (noflash)
+    # PSY tables in DRAM (per-frame band and envelope loops)
+    psy:psy_band_edges (noflash_data)
+    psy:psy_fine_band_edges (noflash_data)
+    psy:psy_hat_w (noflash_data)
+    psy:psy_hat_ws (noflash_data)

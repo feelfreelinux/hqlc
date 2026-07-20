@@ -20,7 +20,7 @@ from pathlib import Path
 
 REPO = Path(__file__).resolve().parent.parent
 SCRIPTS = Path(__file__).resolve().parent
-HQLC_ENC = REPO / "build" / "hqlc_enc"
+HQLC_ENC = REPO / "build" / "hqlc"
 DOCKER_IMAGE = "visqol-local"
 DOCKERFILE = SCRIPTS / "Dockerfile.visqol"
 MAX_DURATION = 30
@@ -29,8 +29,7 @@ LC3_ENC = None
 LC3_DEC = None
 
 
-# ── Audio helpers ──
-
+# Audio helpers
 def to_48k_wav(src, dst):
     subprocess.run(
         ["ffmpeg", "-y", "-loglevel", "error", "-i", str(src),
@@ -54,8 +53,7 @@ def extract_musdb_mix(src, dst):
         capture_output=True, check=True)
 
 
-# ── ViSQOL via docker ──
-
+# ViSQOL via docker
 def visqol_mono(ref, deg, tmpdir):
     r = subprocess.run(
         ["docker", "run", "--rm", "-v", f"{tmpdir}:/work", DOCKER_IMAGE,
@@ -82,8 +80,77 @@ def visqol_stereo(ref, deg, tmpdir):
     return (mos_l + mos_r) / 2.0
 
 
-# ── Codec encode/decode ──
+# Zimtohrli via pyohrli
+# The prebuilt _pyohrli.so is a CPython extension linked against one specific
+# Python (3.14 on this machine); it must run under that interpreter. The metric
+# is lazily initialised once per worker process.
 
+_ZIM = None
+
+
+def _zim_metric():
+    global _ZIM
+    if _ZIM is not None:
+        return _ZIM
+    sys.path.insert(0, str(REPO / "mos"))
+    from quality_metrics import QualityConfig, get_quality_metric
+    _ZIM = get_quality_metric(QualityConfig(backend="zimtohrli"))
+    return _ZIM
+
+
+def zim_stereo(ref_path, deg_path):
+    import numpy as np
+    from scipy.io import wavfile
+    sr_r, ref = wavfile.read(str(ref_path))
+    sr_d, deg = wavfile.read(str(deg_path))
+    if sr_r != 48000 or sr_d != 48000:
+        return 0.0
+    if ref.dtype.kind == "i":
+        ref = ref.astype(np.float32) / np.iinfo(ref.dtype).max
+    if deg.dtype.kind == "i":
+        deg = deg.astype(np.float32) / np.iinfo(deg.dtype).max
+    if ref.ndim == 1:
+        ref = np.stack([ref, ref], axis=1)
+    if deg.ndim == 1:
+        deg = np.stack([deg, deg], axis=1)
+    n = min(len(ref), len(deg))
+    ref, deg = ref[:n], deg[:n]
+    metric = _zim_metric()
+    return float(metric.mos_stereo_lr_avg(
+        np.ascontiguousarray(ref[:, 0]),
+        np.ascontiguousarray(ref[:, 1]),
+        np.ascontiguousarray(deg[:, 0]),
+        np.ascontiguousarray(deg[:, 1]),
+    ))
+
+
+def _check_zim_python():
+    """Fail early if --zim runs under the wrong interpreter.
+
+    _pyohrli.so import-succeeds under any Python but segfaults on first call
+    (surfacing only as an opaque BrokenProcessPool), so check up front.
+    """
+    so = REPO / "mos" / "zimtohrli" / "build" / "_pyohrli.so"
+    if not so.exists():
+        sys.exit(f"--zim: {so} not found - build pyohrli (cmake in mos/zimtohrli) first.")
+    want = None
+    try:  # best-effort: read the linked Python framework version via otool (macOS)
+        out = subprocess.run(["otool", "-L", str(so)], capture_output=True, text=True).stdout
+        m = re.search(r"Python\.framework/Versions/(\d+\.\d+)/Python", out)
+        if m:
+            want = m.group(1)
+    except Exception:
+        return
+    have = f"{sys.version_info.major}.{sys.version_info.minor}"
+    if want and want != have:
+        sys.exit(
+            f"--zim needs Python {want} ({so.name} is linked against it), "
+            f"but this is Python {have}.\n"
+            f"Re-run with that interpreter, e.g.:\n"
+            f"    /opt/homebrew/bin/python{want} {' '.join(sys.argv)}")
+
+
+# Codec encode/decode
 def encode_hqlc(ref, deg, bitrate, tmp):
     subprocess.run([str(HQLC_ENC), str(ref), str(deg), "-b", str(bitrate)],
                    capture_output=True, check=True)
@@ -104,8 +171,15 @@ def encode_opus(ref, deg, bitrate, tmp):
                    ["-c:a", "libopus", "-b:a", str(bitrate), "-vbr", "off"], ".ogg")
 
 
+# Apple AudioToolbox AAC-LC (macOS): reference-grade and hits the target bitrate
+# exactly. ffmpeg's native "aac" both undershoots (~82k for a 96k request) and
+# is lower quality; libfdk_aac isn't in this build. Override with AAC_ENCODER=aac.
+AAC_ENCODER = os.environ.get("AAC_ENCODER", "aac_at")
+
+
 def encode_aac(ref, deg, bitrate, tmp):
-    _ffmpeg_encode(ref, deg, bitrate, ["-c:a", "aac", "-b:a", str(bitrate)], ".m4a")
+    _ffmpeg_encode(ref, deg, bitrate,
+                   ["-c:a", AAC_ENCODER, "-b:a", str(bitrate)], ".m4a")
 
 
 def encode_mp3(ref, deg, bitrate, tmp):
@@ -143,10 +217,10 @@ CODECS = {"hqlc": encode_hqlc, "opus": encode_opus, "aac": encode_aac,
           "mp3": encode_mp3, "lc3": encode_lc3}
 
 
-# ── Track processing ──
+# Track processing
 # prep_mode: "wav" = to_48k_wav, "musdb" = extract_musdb_mix
 
-def process_track(name, src_path, prep_mode, codec, bitrate):
+def process_track(name, src_path, prep_mode, codec, bitrate, do_zim=False):
     with tempfile.TemporaryDirectory() as tmpdir:
         tmp = Path(tmpdir)
         ref_wav = tmp / "ref.wav"
@@ -157,28 +231,34 @@ def process_track(name, src_path, prep_mode, codec, bitrate):
             else:
                 to_48k_wav(src_path, ref_wav)
         except Exception as e:
-            return name, codec, 0.0, f"prep: {str(e)[:60]}"
+            return name, codec, 0.0, 0.0, f"prep: {str(e)[:60]}"
 
         deg_wav = tmp / "deg.wav"
         try:
             CODECS[codec](ref_wav, deg_wav, bitrate, tmp)
         except subprocess.CalledProcessError as e:
             err = e.stderr.decode(errors="replace") if isinstance(e.stderr, bytes) else str(e)
-            return name, codec, 0.0, f"encode: {err[:60]}"
+            return name, codec, 0.0, 0.0, f"encode: {err[:60]}"
 
         if not deg_wav.exists():
-            return name, codec, 0.0, "no output"
+            return name, codec, 0.0, 0.0, "no output"
 
         try:
             mos = visqol_stereo(ref_wav, deg_wav, tmpdir)
         except Exception as e:
-            return name, codec, 0.0, f"visqol: {str(e)[:60]}"
+            return name, codec, 0.0, 0.0, f"visqol: {str(e)[:60]}"
 
-        return name, codec, mos, "ok"
+        zim = 0.0
+        if do_zim:
+            try:
+                zim = zim_stereo(ref_wav, deg_wav)
+            except Exception as e:
+                print(f"  zim error on {name}: {str(e)[:80]}", file=sys.stderr)
+
+        return name, codec, mos, zim, "ok"
 
 
-# ── Dataset loaders (each returns [(name, src_path, prep_mode), ...]) ──
-
+# Dataset loaders (each returns [(name, src_path, prep_mode), ...])
 def load_sqam():
     sqam_dir = REPO / "datasets" / "SQAM_FLAC_00s9l4"
     if not sqam_dir.exists():
@@ -223,8 +303,7 @@ def _init_pool_worker(lc3_enc, lc3_dec):
     LC3_ENC, LC3_DEC = lc3_enc, lc3_dec
 
 
-# ── Main ──
-
+# Main
 def main():
     parser = argparse.ArgumentParser(description="ViSQOL benchmark for HQLC")
     sub = parser.add_subparsers(dest="cmd")
@@ -234,6 +313,8 @@ def main():
         p.add_argument("-j", "--jobs", type=int, default=4)
         p.add_argument("-c", "--codecs", type=str, default="hqlc")
         p.add_argument("-o", "--output", type=str, default=None)
+        p.add_argument("--zim", action="store_true",
+                       help="also compute Zimtohrli MOS (needs python3.14 + mos/ backend)")
         p.add_argument("--lc3-enc", type=str, default=None)
         p.add_argument("--lc3-dec", type=str, default=None)
 
@@ -257,6 +338,9 @@ def main():
     global LC3_ENC, LC3_DEC
     LC3_ENC = args.lc3_enc
     LC3_DEC = args.lc3_dec
+    do_zim = args.zim
+    if do_zim:
+        _check_zim_python()
 
     codec_list = [c.strip() for c in args.codecs.split(",")]
     for c in codec_list:
@@ -274,10 +358,13 @@ def main():
         if not os.path.isfile(args.wav):
             sys.exit(f"Error: {args.wav} not found")
         for codec in codec_list:
-            _, _, mos, status = process_track(
-                Path(args.wav).stem, args.wav, "wav", codec, args.bitrate)
-            print(f"{Path(args.wav).stem}: {mos:.3f} ({codec})" if status == "ok"
-                  else f"{Path(args.wav).stem}: {status} ({codec})")
+            _, _, mos, zim, status = process_track(
+                Path(args.wav).stem, args.wav, "wav", codec, args.bitrate, do_zim)
+            if status == "ok":
+                extra = f"  Z={zim:.3f}" if do_zim else ""
+                print(f"{Path(args.wav).stem}: {mos:.3f}{extra} ({codec})")
+            else:
+                print(f"{Path(args.wav).stem}: {status} ({codec})")
         return
 
     # Load dataset
@@ -297,28 +384,43 @@ def main():
         futures = {}
         for name, src, prep_mode in tracks:
             for codec in codec_list:
-                f = pool.submit(process_track, name, src, prep_mode, codec, args.bitrate)
+                f = pool.submit(process_track, name, src, prep_mode, codec,
+                                args.bitrate, do_zim)
                 futures[f] = (name, codec)
 
         for future in as_completed(futures):
-            name, codec, mos, status = future.result()
+            name, codec, mos, zim, status = future.result()
             if status == "ok":
-                print(f"  {codec:>5s}  {mos:.3f}  {name}", flush=True)
+                extra = f"  Z={zim:.3f}" if do_zim else ""
+                print(f"  {codec:>5s}  {mos:.3f}{extra}  {name}", flush=True)
             else:
                 print(f"  {codec:>5s}  {status}  {name}", flush=True)
-            results.append((name, codec, mos, status))
+            results.append((name, codec, mos, zim, status))
 
     # Summary
-    print(f"\n{'Codec':>8s}  {'Mean':>6s}  {'Min':>6s}  {'Max':>6s}  {'N':>3s}")
-    print("─" * 40)
+    hdr = f"\n{'Codec':>8s}  {'ViSQOL':>6s}  {'Min':>6s}  {'Max':>6s}"
+    if do_zim:
+        hdr += f"  {'Zim':>6s}  {'Min':>6s}  {'Max':>6s}"
+    hdr += f"  {'N':>3s}"
+    print(hdr)
+    print("-" * (len(hdr) - 1))
     for codec in codec_list:
-        scores = [m for _, c, m, s in results if c == codec and s == "ok" and m > 0]
-        if scores:
-            print(f"{codec:>8s}  {sum(scores)/len(scores):6.3f}  {min(scores):6.3f}  "
-                  f"{max(scores):6.3f}  {len(scores):3d}")
+        rows = [(m, z) for _, c, m, z, s in results if c == codec and s == "ok" and m > 0]
+        if not rows:
+            continue
+        vs = [m for m, _ in rows]
+        line = f"{codec:>8s}  {sum(vs)/len(vs):6.3f}  {min(vs):6.3f}  {max(vs):6.3f}"
+        if do_zim:
+            zs = [z for _, z in rows if z > 0]
+            if zs:
+                line += f"  {sum(zs)/len(zs):6.3f}  {min(zs):6.3f}  {max(zs):6.3f}"
+            else:
+                line += f"  {'-':>6s}  {'-':>6s}  {'-':>6s}"
+        line += f"  {len(rows):3d}"
+        print(line)
 
     for codec in codec_list:
-        ok = sorted([(n, m) for n, c, m, s in results if c == codec and s == "ok" and m > 0],
+        ok = sorted([(n, m) for n, c, m, z, s in results if c == codec and s == "ok" and m > 0],
                     key=lambda x: x[1])
         if ok:
             print(f"\n  {codec} bottom 3:")
@@ -329,9 +431,9 @@ def main():
     if args.output:
         with open(args.output, "w", newline="") as f:
             w = csv.writer(f)
-            w.writerow(["track", "bitrate", "codec", "mos_lqo", "status"])
-            for name, codec, mos, status in sorted(results):
-                w.writerow([name, args.bitrate, codec, f"{mos:.4f}", status])
+            w.writerow(["track", "bitrate", "codec", "mos_lqo", "zim", "status"])
+            for name, codec, mos, zim, status in sorted(results):
+                w.writerow([name, args.bitrate, codec, f"{mos:.4f}", f"{zim:.4f}", status])
         print(f"\nResults written to {args.output}")
 
 

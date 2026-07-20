@@ -1,21 +1,9 @@
-"""Temporal Noise Shaping (TNS).
+"""Temporal Noise Shaping (TNS)
 
 TNS applies linear prediction in the frequency domain to shape quantization
-noise in the time domain. This concentrates noise where the signal is loud,
-reducing audible pre-echo artifacts on transient signals.
+noise in the time domain, hiding it behind transients instead of smearing / pre-echo
 
-TNS operates only on high-frequency bins (above TNS_START_BIN, ~2 kHz).
-This prevents the filter from distorting low-frequency tonal content
-(e.g., bass instruments) while still providing full pre-echo suppression
-in the perceptually sensitive high-frequency range.
-
-Algorithm:
-  1. Detect transients via energy ratio test (threshold 2x) on the time-domain block.
-  2. Compute autocorrelation of the HF portion of the MDCT spectrum.
-  3. Solve for reflection coefficients via Levinson-Durbin.
-  4. Quantize reflection coefficients through the LAR (Log Area Ratio) domain.
-  5. Apply a lattice FIR filter to the HF spectrum (encoder).
-  6. Apply the inverse lattice IIR filter at the decoder.
+Only bins >= TNS_START_BIN (~940 Hz) are analysed and filtered.
 """
 
 import numpy as np
@@ -23,12 +11,56 @@ import numpy as np
 from .constants import FRAME_LEN
 
 TNS_MAX_ORDER = 4
-TNS_MAX_K = 0.85
+TNS_MAX_K = 0.75
 TNS_PRED_GAIN_THR = 1.5
-TNS_ATTACK_RATIO = 2.0
 TNS_K_BITS = 4
 TNS_LAR_MAX = 3.5
-TNS_START_BIN = 43  # ~2 kHz: analyse and filter only above this bin
+TNS_START_BIN = 20  # ~940 Hz
+
+
+# Adapted from the C impl, hence the shifts
+TNS_DETECT_FLOOR = (1 << 20) / float(1 << 30)
+
+TNS_DETECT_SUBBLOCKS = 8
+TNS_DETECT_RATIO = 8
+
+
+class TransientDetector:
+    """Simple time-domain attack detector:
+    high-passed signal is split into 8 sub blocks, each compared against the mean of the preceding 8 sub-blocks.
+
+    Stateful so we work across the frame boundary"""
+
+    def __init__(self):
+        self.sub_energy = [0.0] * TNS_DETECT_SUBBLOCKS
+        self.last = 0.0
+
+    def detect(self, frame):
+        sub = FRAME_LEN // TNS_DETECT_SUBBLOCKS
+        e = []
+        last = self.last
+        for b in range(TNS_DETECT_SUBBLOCKS):
+            blk = frame[b * sub : (b + 1) * sub]
+
+            # First-difference preemphasis: y[n] = x[n] - x[n-1]
+            # Done so we don't let the LF energy dominate the TNS detection,
+            # TODO: Check if this is the right filter setup, maybe we should have a proper cutoff frequency filter here
+            d = np.diff(np.concatenate(([last], blk)))
+            e.append(float(np.dot(d, d)))
+            last = float(blk[-1])
+        self.last = last
+
+        win = sum(self.sub_energy)
+        fire = False
+        for b in range(TNS_DETECT_SUBBLOCKS):
+            if (
+                e[b] > TNS_DETECT_FLOOR
+                and e[b] * TNS_DETECT_SUBBLOCKS > TNS_DETECT_RATIO * win
+            ):
+                fire = True
+            win += e[b] - self.sub_energy[b]
+        self.sub_energy = e
+        return fire
 
 
 def _autocorrelation(x, max_order):
@@ -41,7 +73,7 @@ def _autocorrelation(x, max_order):
 
 
 def _levinson_durbin(r, max_order, k_threshold=0.1):
-    """Levinson-Durbin recursion -> (reflection_coeffs, order, prediction_gain)."""
+    """Does the levinson-durbin recursion to compute (reflection_coeffs, order, prediction_gain)"""
     if r[0] < 1e-30:
         return np.zeros(0, dtype=np.float64), 0, 1.0
     error = r[0]
@@ -88,6 +120,7 @@ def lattice_fir(x, k):
         return x.copy()
     N = len(x)
     y = x.copy()
+    # f = forward / whitened path, b_state = one backward delay per stage
     b_state = np.zeros(M, dtype=np.float64)
     for n in range(TNS_START_BIN, N):
         f = x[n]
@@ -113,6 +146,7 @@ def lattice_iir(y, k):
         return y.copy()
     N = len(y)
     x = y.copy()
+    # Undo the FIR: recover f stage by stage, then refill the backward delays
     b_state = np.zeros(M, dtype=np.float64)
     for n in range(TNS_START_BIN, N):
         f = y[n]
@@ -127,23 +161,13 @@ def lattice_iir(y, k):
     return x
 
 
-def analyze(X, block):
-    """TNS analysis with transient gating.
+def analyze(X):
+    """TNS analysis on the HF spectrum (bins >= TNS_START_BIN).
 
-    Analyses only the HF portion of the spectrum (bins >= TNS_START_BIN).
+    Needs to be transient-gated at the caller (detector + hangover)
+
     Returns (order, k_dequantized, q_indices, side_bits).
     """
-    N = FRAME_LEN
-
-    # Transient detection: compare energy of first and second halves
-    if TNS_ATTACK_RATIO > 0:
-        h1, h2 = block[:N], block[N:]
-        e1 = float(np.dot(h1, h1)) + 1e-30
-        e2 = float(np.dot(h2, h2))
-        if (e2 / e1) < TNS_ATTACK_RATIO:
-            return 0, np.zeros(0), np.zeros(0, dtype=np.int32), 1
-
-    # Autocorrelation on HF bins only
     r = _autocorrelation(X[TNS_START_BIN:], TNS_MAX_ORDER)
     k_raw, order, pred_gain = _levinson_durbin(r, TNS_MAX_ORDER)
 

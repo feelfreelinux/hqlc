@@ -10,21 +10,44 @@ extern "C" {
 #endif
 
 // M=1024 (10-bit), provides enough precision without blowing up the LUTs
-#define RANS_M         1024
-#define RANS_M_BITS    10
-#define RANS_L         (1u << 16)
-#define RANS_MAX_SYM   16 // 0-14 magnitudes + 15 ESC
-#define RANS_LUT_NBINS 32
-#define RANS_N_PAIRS   10
+#define RANS_M       1024
+#define RANS_M_BITS  10
+#define RANS_L       (1u << 16)
+#define RANS_MAX_SYM 16 // 0-14 magnitudes + 15 ESC
+#define RANS_N_PAIRS 10
 
-// Zigzag encoding, mapping signed integers to unsigned for variable-length coding
+// rANS probability tables: 12 alpha x 4 activity = 48 tables
+#define RANS_ALPHA_NBINS    12
+#define RANS_ACT_NBINS      4
+#define RANS_NTABLES        48
+#define RANS_ALPHA_LO_Q8    (-1271)
+#define RANS_ALPHA_RANGE_Q8 2647
+
+// 48 rANS probability tables in cumulative form, freq[s] = cf[s + 1] - cf[s]
+extern const uint16_t rans_cf[RANS_NTABLES][RANS_MAX_SYM + 1];
+extern const uint32_t rans_rcp[RANS_NTABLES][RANS_MAX_SYM];
+extern const int16_t rans_cost_q8[RANS_NTABLES][RANS_MAX_SYM];
+extern const int16_t rans_log2_sigma_q8[RANS_N_PAIRS];
+
+/**
+ * @brief Convert a signed value to zigzag form.
+ *
+ * Negative values map to odd integers and non-negative values map to even
+ * integers.
+ *
+ * @param v Signed value to encode.
+ * @return Zigzag-encoded unsigned value.
+ */
 static inline uint32_t zigzag_enc(int32_t v) {
-  // negative numbers are mapped to odd values, positive numbers to even values
   return (v < 0) ? (uint32_t)((-v << 1) - 1) : (uint32_t)(v << 1);
 }
 
-// inverse of zigzag encoding, mapping unsigned integers back to signed for
-// variable-length coding
+/**
+ * @brief Convert a zigzag value back to signed form.
+ *
+ * @param u Zigzag-encoded unsigned value.
+ * @return Decoded signed value.
+ */
 static inline int32_t zigzag_dec(uint32_t u) {
   return (u & 1) ? -(int32_t)((u + 1) >> 1) : (int32_t)(u >> 1);
 }
@@ -37,6 +60,13 @@ typedef struct {
   int free;     /**< Free bits in buf[pos]: 8 = empty, 0 = full */
 } hqlc_bitwriter;
 
+/**
+ * @brief Initialize an MSB-first bit writer.
+ *
+ * @param w Bit writer state to initialize.
+ * @param buf Output buffer.
+ * @param cap Output buffer capacity in bytes.
+ */
 static inline void bw_init(hqlc_bitwriter *w, uint8_t *buf, size_t cap) {
   w->buf = buf;
   w->cap = cap;
@@ -48,11 +78,13 @@ static inline void bw_init(hqlc_bitwriter *w, uint8_t *buf, size_t cap) {
 }
 
 /**
- * @brief Write n bits from the lower n bits of val.
+ * @brief Write bits to an MSB-first bitstream.
  *
- * @param w   Bit writer state
- * @param val Value whose lower n bits are written
- * @param n   Number of bits to write
+ * Writes the low `n` bits of `val`, most-significant bit first.
+ *
+ * @param w Bit writer state.
+ * @param val Value containing the bits to write.
+ * @param n Number of low bits to write.
  */
 static inline void bw_write(hqlc_bitwriter *w, uint32_t val, int n) {
   while (n > 0) {
@@ -71,21 +103,29 @@ static inline void bw_write(hqlc_bitwriter *w, uint32_t val, int n) {
 }
 
 /**
- * @brief Write a value using Rice coding, unary(q) + k-bit remainder
+ * @brief Write a Rice-coded unsigned value.
  *
- * @param w   Bit writer state
- * @param val Value to encode
- * @param k   Rice parameter
+ * Encodes `val` as `unary(val >> k)` followed by the `k`-bit remainder.
+ *
+ * @param w Bit writer state.
+ * @param val Value to encode.
+ * @param k Rice parameter.
  */
 void bw_write_rice(hqlc_bitwriter *w, uint32_t val, int k);
 
-// Finds an optimal rice K for a set of values
+/**
+ * @brief Find the Rice parameter that minimizes coded size.
+ *
+ * @param values Signed values to analyze.
+ * @param n Number of values.
+ * @return Best Rice parameter in the range 0..6.
+ */
 int find_best_rice_k(const int32_t *values, int n);
 
 /**
- * @brief Pad current byte with zeros and advance to the next byte boundary
+ * @brief Pad with zero bits to the next byte boundary.
  *
- * @param w Bit writer state
+ * @param w Bit writer state.
  */
 static inline void bw_flush(hqlc_bitwriter *w) {
   if (w->free < 8) {
@@ -98,20 +138,12 @@ static inline void bw_flush(hqlc_bitwriter *w) {
 }
 
 /**
- * @brief Return total bits written, including any partial current byte
+ * @brief Return the number of completed bytes written.
  *
- * @param w Bit writer state
- * @return Number of bits written
- */
-static inline size_t bw_bits(const hqlc_bitwriter *w) {
-  return w->pos * 8 + (8 - w->free);
-}
-
-/**
- * @brief Return completed bytes written. Call after bw_flush()
+ * Call this after bw_flush() if a partial byte may be pending.
  *
- * @param w Bit writer state
- * @return Number of complete bytes written
+ * @param w Bit writer state.
+ * @return Number of completed bytes in the output buffer.
  */
 static inline size_t bw_bytes(const hqlc_bitwriter *w) {
   return w->pos;
@@ -125,6 +157,13 @@ typedef struct {
   int rem;            /**< remaining bits in buf[pos]: 8 = full byte */
 } hqlc_bitreader;
 
+/**
+ * @brief Initialize an MSB-first bit reader.
+ *
+ * @param r Bit reader state to initialize.
+ * @param buf Input buffer.
+ * @param len Input buffer length in bytes.
+ */
 static inline void br_init(hqlc_bitreader *r, const uint8_t *buf, size_t len) {
   r->buf = buf;
   r->len = len;
@@ -133,13 +172,14 @@ static inline void br_init(hqlc_bitreader *r, const uint8_t *buf, size_t len) {
 }
 
 /**
- * @brief Read n bits (1..25), returned right-aligned
+ * @brief Read bits from an MSB-first bitstream.
  *
- * Returns zero bits if the reader runs past the end of the buffer.
+ * Reads `n` bits and returns them right-aligned. Reads past the end of the
+ * buffer are padded with zero bits.
  *
- * @param r Bit reader state
- * @param n Number of bits to read
- * @return Read bits in the lower n bits of the return value
+ * @param r Bit reader state.
+ * @param n Number of bits to read, from 1 to 25.
+ * @return Right-aligned bits read from the stream.
  */
 static inline uint32_t br_read(hqlc_bitreader *r, int n) {
   uint32_t val = 0;
@@ -160,27 +200,27 @@ static inline uint32_t br_read(hqlc_bitreader *r, int n) {
 }
 
 /**
- * @brief Read a Rice-coded value: unary(q) + k-bit remainder
+ * @brief Read a Rice-coded unsigned value.
  *
- * @param r Bit reader state
- * @param k Rice parameter
- * @return Decoded value
+ * Decodes `unary(q)` followed by a `k`-bit remainder.
+ *
+ * @param r Bit reader state.
+ * @param k Rice parameter.
+ * @return Decoded value.
  */
 uint32_t br_read_rice(hqlc_bitreader *r, int k);
 
 /**
- * @brief Return total bits consumed
+ * @brief Return the number of bits consumed.
  *
- * @param r Bit reader state
- * @return Number of bits consumed
+ * @param r Bit reader state.
+ * @return Total bits read from the stream.
  */
 static inline size_t br_bits(const hqlc_bitreader *r) {
   return r->pos * 8 + (8 - r->rem);
 }
 
-// rANS encoder state
-// Note: This writes backward from the end of the buffer, inverse of the decoder due to
-// the nature of rANS encoding
+// rANS encoder state. Writes backward from the buffer end (reversed in decoder)
 typedef struct {
   uint32_t state; /**< 4 byte state of the encoder */
   uint8_t *buf;   /**< Output buffer */
@@ -193,124 +233,155 @@ typedef struct {
   uint32_t state;
   const uint8_t *buf;
   size_t len;
-  size_t pos; // read cursor
+  size_t pos;   // read cursor
+  bool overrun; // set if a read ran past the end (corrupt/truncated input)
 } hqlc_rans_dec;
 
-// rANS band precomputed tables definition
-typedef struct {
-  uint16_t freq[RANS_MAX_SYM];   /**< Symbol frequencies */
-  uint16_t cf[RANS_MAX_SYM + 1]; /**< Cumulative frequencies */
-  int16_t cost_q8[RANS_MAX_SYM]; /**< Cost per symbol */
-  uint32_t rcp[RANS_MAX_SYM];    /**< Reciprocals for division-free encode, fixed point
-                                    optimization */
-} hqlc_rans_band_tables;
-
 /**
- * @brief Initialize an rANS encoder
+ * @brief Initialize an rANS encoder.
  *
- * @param enc Encoder state to initialize
- * @param buf Output buffer
- * @param cap Buffer capacity in bytes
+ * @param enc Encoder state to initialize.
+ * @param buf Output buffer.
+ * @param cap Output buffer capacity in bytes.
  */
 void rans_enc_init(hqlc_rans_enc *enc, uint8_t *buf, size_t cap);
 
 /**
- * @brief Encode one symbol into the rANS stream. Essentially unused, as the codec uses
- * specialized versions - but kept for API.
+ * @brief Flush an rANS encoder.
  *
- * @param enc  Encoder state
- * @param sym  Symbol to encode
- * @param freq Symbol frequency table
- * @param cf   Cumulative frequency table
- * @param rcp  Reciprocal table for division free encoding
- */
-void rans_enc_put(hqlc_rans_enc *enc,
-                  uint8_t sym,
-                  const uint16_t *freq,
-                  const uint16_t *cf,
-                  const uint32_t *rcp);
-
-/**
- * @brief Flush the rANS encoder and return the encoded byte count
- *
- * @param enc Encoder state
- * @return Number of bytes written
+ * @param enc Encoder state to flush.
+ * @return Number of encoded bytes written.
  */
 size_t rans_enc_flush(hqlc_rans_enc *enc);
 
 /**
- * @brief Initialize a rANS decoder
+ * @brief Initialize an rANS decoder.
  *
- * @param dec Decoder state to initialize
- * @param buf Input buffer
- * @param len Buffer length in bytes
+ * @param dec Decoder state to initialize.
+ * @param buf Encoded input buffer.
+ * @param len Encoded input length in bytes.
  */
 void rans_dec_init(hqlc_rans_dec *dec, const uint8_t *buf, size_t len);
 
 /**
- * @brief Decode one symbol from the rANS stream
+ * @brief Map a Q8 log2(alpha) value to an rANS alpha bin.
  *
- * @param dec  Decoder state
- * @param freq Symbol frequency table
- * @param cf   Cumulative frequency table
- * @param nsym Number of symbols
- * @return Decoded symbol
+ * The linear mapping is clamped to the valid 0..11 bin range.
+ *
+ * @param log2_alpha_q8 log2(alpha) in Q8 format.
+ * @return Alpha bin in the range 0..11.
  */
-uint8_t
-rans_dec_get(hqlc_rans_dec *dec, const uint16_t *freq, const uint16_t *cf, int nsym);
+static inline int rans_alpha_bin_from_la(int32_t log2_alpha_q8) {
+  int32_t bin =
+      (log2_alpha_q8 - RANS_ALPHA_LO_Q8) * RANS_ALPHA_NBINS / RANS_ALPHA_RANGE_Q8;
+  if (bin < 0) {
+    bin = 0;
+  }
+  if (bin >= RANS_ALPHA_NBINS) {
+    bin = RANS_ALPHA_NBINS - 1;
+  }
+  return (int)bin;
+}
 
 /**
- * @brief Build per-band rANS frequency tables for a given gain code
+ * @brief Map a band's nonzero fraction to an activity bin.
  *
- * @param gain_code Global gain code
- * @param tables    Output array of RANS_N_PAIRS band tables
+ * Thresholds on `nz / w` are: less than 0.1, less than 0.3, less than 0.6,
+ * and 0.6 or greater.
+ *
+ * @param nz Number of nonzero values.
+ * @param w Band width.
+ * @return Activity bin in the range 0..3.
  */
-void rans_build_band_tables(int gain_code, hqlc_rans_band_tables tables[RANS_N_PAIRS]);
+static inline int rans_activity_from(int nz, int w) {
+  int nz10 = nz * 10;
+  if (nz10 < w) {
+    return 0;
+  }
+  if (nz10 < 3 * w) {
+    return 1;
+  }
+  if (nz10 < 6 * w) {
+    return 2;
+  }
+  return 3;
+}
 
 /**
- * @brief Estimate the rANS coding cost of a quantized coefficient in Q8 bits
+ * @brief Build a probability table index from alpha and activity bins.
  *
- * @param tbl   Band table for this coefficient's band
- * @param value Quantized coefficient
- * @return Estimated cost in Q8 fractional bits
+ * @param alpha_bin Alpha bin.
+ * @param activity Activity bin.
+ * @return Clamped rANS table index.
  */
-int32_t rans_coeff_cost_q8(const hqlc_rans_band_tables *tbl, int16_t value);
+static inline int rans_table_idx(int alpha_bin, int activity) {
+  int tidx = alpha_bin * RANS_ACT_NBINS + activity;
+  if (tidx < 0) {
+    tidx = 0;
+  }
+  if (tidx >= RANS_NTABLES) {
+    tidx = RANS_NTABLES - 1;
+  }
+  return tidx;
+}
 
 /**
- * @brief Encode quantized spectral coefficients to a byte buffer
+ * @brief Count the bits needed for an EG(0) escape body.
  *
- * @param quant   Quantized coeffs
- * @param nf_mask Noise-fill mask per band
- * @param n_ch    Number of channels
- * @param tables  Per-band rANS tables
- * @param out     Output byte buffer
- * @param out_cap Output buffer capacity in bytes
- * @return Number of bytes written
+ * @param overflow Overflow value to encode.
+ * @return Number of EG(0) body bits.
  */
-size_t rans_encode_coeffs(const int16_t *quant,
-                          const uint8_t *nf_mask,
-                          int n_ch,
-                          const hqlc_rans_band_tables *tables,
-                          uint8_t *out,
-                          size_t out_cap);
+static inline int rans_eg0_nbits(int overflow) {
+  int nbits = 0;
+  for (int tmp = overflow + 1; tmp > 1; tmp >>= 1) {
+    nbits++;
+  }
+  return nbits;
+}
 
 /**
- * @brief Decode quantized spectral coefficients from a byte buffer
+ * @brief Compute the alpha bin for one band.
  *
- * @param data     Input byte buffer
- * @param len      Input buffer length in bytes
- * @param quant_out Output quantized coefficients
- * @param nf_mask  Noise-fill mask per band
- * @param n_ch     Number of channels
- * @param tables   Per-band rANS tables
- * @return true on success, false on error
+ * @param band Band index.
+ * @param gain_code Quantizer gain code.
+ * @return Alpha bin in the range 0..11.
  */
-bool rans_decode_coeffs(const uint8_t *data,
-                        size_t len,
-                        int16_t *quant_out,
-                        const uint8_t *nf_mask,
-                        int n_ch,
-                        const hqlc_rans_band_tables *tables);
+int rans_alpha_bin(int band, int gain_code);
+
+/**
+ * @brief Compute the activity bin from the previous band's nonzero fraction.
+ *
+ * @param quant Quantized coefficients.
+ * @param band Band index.
+ * @return Activity bin in the range 0..3.
+ */
+int rans_activity_bin(const int16_t *quant, int band);
+
+/**
+ * @brief Encode quantized coefficients with rANS.
+ *
+ * @param quant Quantized coefficients to encode.
+ * @param n_ch Number of channels.
+ * @param gain_code Quantizer gain code.
+ * @param out Output buffer.
+ * @param out_cap Output buffer capacity in bytes.
+ * @return Number of encoded bytes written.
+ */
+size_t rans_encode_coeffs(
+    const int16_t *quant, int n_ch, int gain_code, uint8_t *out, size_t out_cap);
+
+/**
+ * @brief Decode quantized coefficients from an rANS byte stream.
+ *
+ * @param data Encoded byte stream.
+ * @param len Encoded byte stream length in bytes.
+ * @param quant_out Destination for decoded coefficients.
+ * @param n_ch Number of channels.
+ * @param gain_code Quantizer gain code.
+ * @return True on success, or false if the stream is corrupt or truncated.
+ */
+bool rans_decode_coeffs(
+    const uint8_t *data, size_t len, int16_t *quant_out, int n_ch, int gain_code);
 
 #ifdef __cplusplus
 }

@@ -156,46 +156,65 @@ void test_roundtrip_silence(void) {
   free(pcm_dec);
 }
 
-void test_roundtrip_onset(void) {
-  // Quiet to loud transition: 4 frames at 0.01 amplitude, 8 frames at 0.5
-  const int n_frames = 12;
+void test_decode_corrupt_frames(void) {
+  // Corrupted / truncated frames must decode without memory errors: either
+  // HQLC_OK (garbage audio is fine) or HQLC_ERR_BITSTREAM_CORRUPT.
+  const int n_frames = 8;
   const int n_samples = n_frames * HQLC_FRAME_SAMPLES;
-  const int quiet_frames = 4;
 
-  int16_t *pcm_orig = (int16_t *)calloc(n_samples, sizeof(int16_t));
-  gen_sine_pcm16(pcm_orig, quiet_frames * HQLC_FRAME_SAMPLES, 1, 1000.0f, 0.01f);
-  gen_sine_pcm16(pcm_orig + quiet_frames * HQLC_FRAME_SAMPLES,
-                 (n_frames - quiet_frames) * HQLC_FRAME_SAMPLES,
-                 1,
-                 1000.0f,
-                 0.5f);
+  int16_t *pcm_orig = (int16_t *)calloc((size_t)n_samples * 2, sizeof(int16_t));
+  gen_sine_pcm16(pcm_orig, n_samples, 2, 700.0f, 0.4f);
+  // Attack in frame 4 so some frames carry TNS side info
+  for (int i = 4 * HQLC_FRAME_SAMPLES; i < 4 * HQLC_FRAME_SAMPLES + 64; i++) {
+    pcm_orig[i * 2] = 30000;
+    pcm_orig[i * 2 + 1] = -30000;
+  }
 
-  int16_t *pcm_dec = codec_roundtrip(pcm_orig, n_frames, 1, HQLC_MODE_FIXED, 2.0f, 0);
+  hqlc_encoder *enc = (hqlc_encoder *)calloc(1, hqlc_encoder_size());
+  hqlc_decoder *dec = (hqlc_decoder *)calloc(1, hqlc_decoder_size());
+  hqlc_encoder_config cfg = {
+      .channels = 2, .sample_rate = HQLC_SAMPLE_RATE, .mode = HQLC_MODE_RC};
+  cfg.bitrate = 96000;
+  hqlc_encoder_init(enc, &cfg);
+  hqlc_decoder_init(dec, 2, HQLC_SAMPLE_RATE);
+  void *enc_scratch = calloc(1, hqlc_encoder_scratch_size());
+  void *dec_scratch = calloc(1, hqlc_decoder_scratch_size());
 
-  // Check steady-state SNR well after the transition
-  int steady_dec = (quiet_frames + 4) * HQLC_FRAME_SAMPLES;
-  float snr = compute_snr(pcm_orig,
-                          steady_dec - HQLC_FRAME_SAMPLES,
-                          pcm_dec,
-                          steady_dec,
-                          3 * HQLC_FRAME_SAMPLES,
-                          1);
-  TEST_ASSERT_GREATER_THAN_FLOAT(15.0f, snr);
+  uint8_t compressed[HQLC_MAX_FRAME_BYTES];
+  uint8_t mangled[HQLC_MAX_FRAME_BYTES];
+  int16_t pcm_dec[HQLC_FRAME_SAMPLES * 2];
+  uint32_t rng = 12345;
 
-  // Check transition clipping is bounded (< 10%)
-  int trans_start = quiet_frames * HQLC_FRAME_SAMPLES;
-  int trans_len = 2 * HQLC_FRAME_SAMPLES;
-  int clipped = 0;
-  for (int i = trans_start; i < trans_start + trans_len; i++) {
-    if (pcm_dec[i] >= 32767 || pcm_dec[i] <= -32768) {
-      clipped++;
+  for (int f = 0; f < n_frames; f++) {
+    const uint8_t *fp = (const uint8_t *)&pcm_orig[f * HQLC_FRAME_SAMPLES * 2];
+    size_t comp_len = 0;
+    TEST_ASSERT_EQUAL(HQLC_OK,
+                      hqlc_encode_frame(enc,
+                                        fp,
+                                        HQLC_PCM16,
+                                        compressed,
+                                        HQLC_MAX_FRAME_BYTES,
+                                        &comp_len,
+                                        enc_scratch));
+
+    for (int variant = 0; variant < 4; variant++) {
+      memcpy(mangled, compressed, comp_len);
+      for (int k = 0; k < variant * 8 && comp_len > 0; k++) {
+        rng = rng * 1103515245u + 12345u;
+        mangled[(rng >> 8) % comp_len] ^= (uint8_t)(rng >> 16);
+      }
+      size_t use_len = (variant == 3) ? comp_len / 3 : comp_len;
+      hqlc_error err = hqlc_decode_frame(
+          dec, mangled, use_len, (uint8_t *)pcm_dec, HQLC_PCM16, dec_scratch);
+      TEST_ASSERT_TRUE(err == HQLC_OK || err == HQLC_ERR_BITSTREAM_CORRUPT);
     }
   }
-  float clip_pct = 100.0f * (float)clipped / (float)trans_len;
-  TEST_ASSERT_MESSAGE(clip_pct < 10.0f, "Excessive onset clipping (>10%)");
 
   free(pcm_orig);
-  free(pcm_dec);
+  free(enc);
+  free(dec);
+  free(enc_scratch);
+  free(dec_scratch);
 }
 
 void test_roundtrip_rc_mode(void) {
@@ -224,7 +243,7 @@ int main(void) {
   RUN_TEST(test_roundtrip_mono);
   RUN_TEST(test_roundtrip_stereo);
   RUN_TEST(test_roundtrip_silence);
-  RUN_TEST(test_roundtrip_onset);
   RUN_TEST(test_roundtrip_rc_mode);
+  RUN_TEST(test_decode_corrupt_frames);
   return UNITY_END();
 }

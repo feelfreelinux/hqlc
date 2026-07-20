@@ -18,9 +18,13 @@
 #include "esp_audio_dec_default.h"
 
 #include "bench.h"
+#include "hqlc_bench_impl.h"
 #include "test_pcm.h"
 
-/* ── Shared buffers ── */
+// Set to 1 for HQLC-only per-stage profiling, 0 for multi-codec comparison
+#define HQLC_STAGE_PROFILE 1
+
+/* Shared buffers */
 
 // Max PCM frame across codecs: AAC 1024 * 2ch * 2 = 4096
 #define MAX_PCM_FRAME_BYTES 4096
@@ -33,7 +37,7 @@ static uint8_t frame_buf[MAX_PCM_FRAME_BYTES] __attribute__((aligned(4)));
 static uint8_t enc_out[MAX_ENC_OUT_BYTES] __attribute__((aligned(4)));
 static uint8_t dec_out[MAX_PCM_FRAME_BYTES] __attribute__((aligned(4)));
 
-// Encoded bitstream store — malloc'd from PSRAM at runtime (too large for static DRAM)
+// Encoded bitstream store
 static uint8_t *enc_store;
 static uint16_t enc_sizes[MAX_FRAMES];
 
@@ -196,7 +200,7 @@ static void bench_codec(const codec_entry_t *codec, int cpu_mhz,
         esp_audio_dec_close(dec_hd);
     }
 
-    /* ── Results ── */
+    /* Results */
     {
         float actual_kbps = (float)total_encoded * 8.0f * 48000.0f /
                             (n_frames * (float)frame_samples) / 1000.0f;
@@ -332,11 +336,223 @@ static codec_entry_t codecs[N_CODECS];
 static codec_result_t results[N_CODECS];
 static int n_codecs;
 
+#if HQLC_STAGE_PROFILE
+static void bench_hqlc_stages(int cpu_mhz) {
+    printf("\n=== HQLC Per-Stage Profile ===\n");
+
+    hqlc_bench_ctx hb_ctx;
+    hqlc_bench_init(&hb_ctx);
+    hqlc_bench = &hb_ctx;
+
+    const uint8_t *pcm = (const uint8_t *)test_pcm;
+    int in_size = 0, out_size = 0;
+    int n_frames = 0;
+    uint32_t total_encoded = 0;
+    uint32_t store_offset = 0;
+    esp_audio_err_t err;
+
+    // Encode
+    {
+        esp_audio_enc_config_t enc_config = {
+            .type = codecs[0].type,
+            .cfg = &hqlc_enc_cfg,
+            .cfg_sz = sizeof(hqlc_enc_cfg),
+        };
+
+        esp_audio_enc_handle_t enc_hd = NULL;
+        err = esp_audio_enc_open(&enc_config, &enc_hd);
+        if (err != ESP_AUDIO_ERR_OK) {
+            printf("  ERROR: encoder open failed (%d)\n", err);
+            hqlc_bench = NULL;
+            return;
+        }
+
+        esp_audio_enc_get_frame_size(enc_hd, &in_size, &out_size);
+        int total_pcm_bytes =
+            TEST_PCM_FRAMES * HQLC_FRAME_SAMPLES * TEST_PCM_CHANNELS * 2;
+        n_frames = total_pcm_bytes / in_size;
+        if (n_frames > MAX_FRAMES) n_frames = MAX_FRAMES;
+
+        int frame_samples = in_size / (TEST_PCM_CHANNELS * 2);
+        float frame_ms = (float)frame_samples / 48.0f;
+        printf("  %d frames, %d samples/frame (%.2f ms)\n",
+               n_frames, frame_samples, frame_ms);
+
+        bench_ctx top;
+        bench_init(&top);
+        int s_enc = bench_add_stage(&top, "encode_total");
+
+        for (int f = 0; f < n_frames; f++) {
+            memcpy(frame_buf, pcm + f * in_size, in_size);
+            esp_audio_enc_in_frame_t in_frame = {
+                .buffer = frame_buf, .len = in_size,
+            };
+            esp_audio_enc_out_frame_t out_frame = {
+                .buffer = enc_out, .len = MAX_ENC_OUT_BYTES,
+            };
+
+            bench_begin(&top);
+            err = esp_audio_enc_process(enc_hd, &in_frame, &out_frame);
+            bench_end(&top, s_enc);
+
+            if (err != ESP_AUDIO_ERR_OK) {
+                printf("  ERROR: encode frame %d failed (%d)\n", f, err);
+                break;
+            }
+            memcpy(enc_store + store_offset, enc_out, out_frame.encoded_bytes);
+            enc_sizes[f] = (uint16_t)out_frame.encoded_bytes;
+            store_offset += out_frame.encoded_bytes;
+            total_encoded += out_frame.encoded_bytes;
+        }
+        esp_audio_enc_close(enc_hd);
+
+        uint64_t enc_total_cy = top.stages[s_enc].sum;
+        float actual_kbps = (float)total_encoded * 8.0f * 48000.0f /
+                            ((float)n_frames * ((float)in_size / (TEST_PCM_CHANNELS * 2))) / 1000.0f;
+        printf("  Bitrate: %.1f kbps\n\n", actual_kbps);
+
+        // Print encoder stages
+        printf("  -- Encoder stages --\n");
+        printf("  %-20s %10s %10s %10s %7s %7s\n",
+               "Stage", "Avg cy", "Min cy", "Max cy", "Avg us", "% enc");
+        printf("  %-20s %10s %10s %10s %7s %7s\n",
+               "--------------------", "----------", "----------",
+               "----------", "-------", "-------");
+        for (int i = 0; i <= HQLC_BENCH_ENC_ENTROPY; i++) {
+            const hqlc_bench_stage *s = &hb_ctx.stages[i];
+            if (s->count == 0) continue;
+            uint32_t avg = (uint32_t)(s->sum / s->count);
+            uint32_t avg_us = avg / (uint32_t)cpu_mhz;
+            float pct = 100.0f * (float)s->sum / (float)enc_total_cy;
+            printf("  %-20s %10lu %10lu %10lu %7lu %6.1f%%\n",
+                   s->name, (unsigned long)avg, (unsigned long)s->min,
+                   (unsigned long)s->max, (unsigned long)avg_us, pct);
+        }
+        // MDCT sub-stages + entropy sub-stages
+        printf("  -- MDCT breakdown --\n");
+        for (int i = HQLC_BENCH_MDCT_FOLD; i < HQLC_BENCH_N_STAGES; i++) {
+            const hqlc_bench_stage *s = &hb_ctx.stages[i];
+            if (s->count == 0) continue;
+            uint32_t avg = (uint32_t)(s->sum / s->count);
+            uint32_t avg_us = avg / (uint32_t)cpu_mhz;
+            float pct = 100.0f * (float)s->sum / (float)enc_total_cy;
+            printf("  %-20s %10lu %10lu %10lu %7lu %6.1f%%\n",
+                   s->name, (unsigned long)avg, (unsigned long)s->min,
+                   (unsigned long)s->max, (unsigned long)avg_us, pct);
+        }
+
+        uint32_t enc_avg_cy = (uint32_t)(enc_total_cy / n_frames);
+        uint32_t enc_avg_us = enc_avg_cy / (uint32_t)cpu_mhz;
+        float frame_budget_us = frame_ms * 1000.0f;
+        printf("\n  Encode total: %lu avg cy, %lu avg us (%.1f%% RT)\n",
+               (unsigned long)enc_avg_cy, (unsigned long)enc_avg_us,
+               100.0f * enc_avg_us / frame_budget_us);
+    }
+
+    // Reset stage counters for decode
+    for (int i = 0; i < HQLC_BENCH_N_STAGES; i++) {
+        hb_ctx.stages[i].count = 0;
+        hb_ctx.stages[i].min = UINT32_MAX;
+        hb_ctx.stages[i].max = 0;
+        hb_ctx.stages[i].sum = 0;
+    }
+
+    // Decode
+    {
+        esp_audio_dec_cfg_t dec_config = {
+            .type = codecs[0].type,
+            .cfg = &hqlc_dec_cfg,
+            .cfg_sz = sizeof(hqlc_dec_cfg),
+        };
+        esp_audio_dec_handle_t dec_hd = NULL;
+        err = esp_audio_dec_open(&dec_config, &dec_hd);
+        if (err != ESP_AUDIO_ERR_OK) {
+            printf("  ERROR: decoder open failed (%d)\n", err);
+            hqlc_bench = NULL;
+            return;
+        }
+
+        bench_ctx top;
+        bench_init(&top);
+        int s_dec = bench_add_stage(&top, "decode_total");
+
+        uint32_t rd_offset = 0;
+        for (int f = 0; f < n_frames; f++) {
+            memcpy(enc_out, enc_store + rd_offset, enc_sizes[f]);
+            esp_audio_dec_in_raw_t raw = {
+                .buffer = enc_out, .len = enc_sizes[f],
+                .frame_recover = ESP_AUDIO_DEC_RECOVERY_NONE,
+            };
+            esp_audio_dec_out_frame_t dec_frame = {
+                .buffer = dec_out, .len = MAX_PCM_FRAME_BYTES,
+            };
+
+            bench_begin(&top);
+            err = esp_audio_dec_process(dec_hd, &raw, &dec_frame);
+            bench_end(&top, s_dec);
+
+            if (err != ESP_AUDIO_ERR_OK) {
+                printf("  ERROR: decode frame %d failed (%d)\n", f, err);
+                break;
+            }
+            rd_offset += enc_sizes[f];
+        }
+        esp_audio_dec_close(dec_hd);
+
+        uint64_t dec_total_cy = top.stages[s_dec].sum;
+        int frame_samples = in_size / (TEST_PCM_CHANNELS * 2);
+        float frame_ms = (float)frame_samples / 48.0f;
+
+        printf("\n  -- Decoder stages --\n");
+        printf("  %-20s %10s %10s %10s %7s %7s\n",
+               "Stage", "Avg cy", "Min cy", "Max cy", "Avg us", "% dec");
+        printf("  %-20s %10s %10s %10s %7s %7s\n",
+               "--------------------", "----------", "----------",
+               "----------", "-------", "-------");
+        for (int i = HQLC_BENCH_DEC_ENTROPY; i <= HQLC_BENCH_DEC_IMDCT_OLA; i++) {
+            const hqlc_bench_stage *s = &hb_ctx.stages[i];
+            if (s->count == 0) continue;
+            uint32_t avg = (uint32_t)(s->sum / s->count);
+            uint32_t avg_us = avg / (uint32_t)cpu_mhz;
+            float pct = 100.0f * (float)s->sum / (float)dec_total_cy;
+            printf("  %-20s %10lu %10lu %10lu %7lu %6.1f%%\n",
+                   s->name, (unsigned long)avg, (unsigned long)s->min,
+                   (unsigned long)s->max, (unsigned long)avg_us, pct);
+        }
+        // IMDCT + other sub-stages
+        printf("  -- Sub-stage breakdown --\n");
+        for (int i = HQLC_BENCH_MDCT_FOLD; i < HQLC_BENCH_N_STAGES; i++) {
+            const hqlc_bench_stage *s = &hb_ctx.stages[i];
+            if (s->count == 0) continue;
+            uint32_t avg = (uint32_t)(s->sum / s->count);
+            uint32_t avg_us = avg / (uint32_t)cpu_mhz;
+            float pct = 100.0f * (float)s->sum / (float)dec_total_cy;
+            printf("  %-20s %10lu %10lu %10lu %7lu %6.1f%%\n",
+                   s->name, (unsigned long)avg, (unsigned long)s->min,
+                   (unsigned long)s->max, (unsigned long)avg_us, pct);
+        }
+
+        uint32_t dec_avg_cy = (uint32_t)(dec_total_cy / n_frames);
+        uint32_t dec_avg_us = dec_avg_cy / (uint32_t)cpu_mhz;
+        float frame_budget_us = frame_ms * 1000.0f;
+        printf("\n  Decode total: %lu avg cy, %lu avg us (%.1f%% RT)\n",
+               (unsigned long)dec_avg_cy, (unsigned long)dec_avg_us,
+               100.0f * dec_avg_us / frame_budget_us);
+    }
+
+    hqlc_bench = NULL;
+    printf("\nDone. Halting.\n");
+}
+#endif // HQLC_STAGE_PROFILE
+
 #define BENCH_TASK_STACK (48 * 1024)
 
 static void bench_task(void *arg) {
     int cpu_mhz = (int)(intptr_t)arg;
 
+#if HQLC_STAGE_PROFILE
+    bench_hqlc_stages(cpu_mhz);
+#else
     for (int i = 0; i < n_codecs; i++) {
         bench_codec(&codecs[i], cpu_mhz, &results[i]);
     }
@@ -368,6 +584,7 @@ static void bench_task(void *arg) {
 
     printf("\nNote: MP3 omitted (no encoder in esp_audio_codec)\n");
     printf("Note: AAC min stereo bitrate at 48kHz is 118kbps (using 128kbps)\n");
+#endif
 
     printf("\nDone. Halting.\n");
     vTaskDelete(NULL);
@@ -406,7 +623,7 @@ void app_main(void) {
         return;
     }
 
-    /* ── Build codec table ── */
+    /* Build codec table */
 
     codecs[0] = (codec_entry_t){
         .name = "HQLC",        .type = hqlc_type,

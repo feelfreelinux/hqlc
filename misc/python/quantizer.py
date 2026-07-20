@@ -1,35 +1,27 @@
-"""Scalar quantization with deadzone and band-weighted step sizes.
+"""Scalar quantization: gain code, per-band step size, deadzone quantizer.
 
-The quantizer maps MDCT coefficients to integer symbols:
-  q = sign(x) * floor(|x|/step - dz + 1)   if |x|/step > dz
-  q = 0                                      otherwise
+Each MDCT coefficient becomes an integer symbol via a deadzone rule
+  q = sign(x) * floor(|x|/step - DEAD_ZONE + 1)   if |x|/step > DEAD_ZONE, else 0
+and is reconstructed with an MMSE-optimal centroid offset
+  x_hat = sign(q) * (|q| + CENTROID) * step
 
-Dequantization uses an MMSE-optimal centroid offset:
-  x_hat = sign(q) * (|q| + centroid) * step
-
-The step size is: step = 2^((exp_idx - 43) / 4) * BW[b] / gain
-  - exp_idx: per-band energy (6-bit log scale)
-  - BW[b]:   band weight = log2(width) / log2(max_width), normalizes precision
-  - gain:    global gain code (7-bit, 8 codes per octave)
+step = 2^((exp_idx - 43) / 4) / gain folds the per-band log-energy exponent
+(6-bit, from psy.py) with the global gain (7-bit code, 8 steps per octave).
+Equivalent to the C reference step = 2^((2*exp - gain_code - 59) / 8).
 """
 
 import math
 
 import numpy as np
 
-from .constants import (
-    BAND_WEIGHTS,
-    CENTROID,
-    DEAD_ZONE,
-    EXP_INDEX_BIAS,
-)
+from .constants import CENTROID, DEAD_ZONE, EXP_INDEX_BIAS
 
 # Gain quantization: 7-bit code, log2 Q3 (8 codes per octave)
 GAIN_BITS = 7
 GAIN_Q = 8
-GAIN_BIAS = 48  # code for gain = 1.0
+GAIN_BIAS = 27  # code 59 / gain 16 / 128 kbps-ish with rANS
 GAIN_MAX_CODE = (1 << GAIN_BITS) - 1  # 127
-GAIN_RC_MAX = GAIN_BIAS + GAIN_Q * 3  # cap: gain = 8 (3 octaves above unity)
+GAIN_RC_MAX = GAIN_BIAS + GAIN_Q * 5  # cap: gain = 32 (5 octaves above unity)
 
 
 def quantize_gain(gain):
@@ -43,25 +35,34 @@ def dequantize_gain(code):
     return 2.0 ** ((code - GAIN_BIAS) / float(GAIN_Q))
 
 
-def quantize_band(coeffs, exp_idx, inv_gain, band_idx):
-    """Deadzone-quantize one band of MDCT coefficients."""
-    qquarter = exp_idx - EXP_INDEX_BIAS
-    step = (2.0 ** (qquarter / 4.0)) * BAND_WEIGHTS[band_idx] * inv_gain
-    scaled = coeffs / step
-    abs_sc = np.abs(scaled)
-    q = np.zeros(len(coeffs), dtype=np.int32)
-    mask = abs_sc > DEAD_ZONE
-    q[mask] = (np.sign(scaled[mask]) * np.floor(abs_sc[mask] - DEAD_ZONE + 1.0)).astype(
-        np.int32
-    )
-    return q
+def exp_to_step_factor(exp_val):
+    """Exponent index -> step scale factor 2^((exp - 43)/4) (scalar or array)."""
+    return 2.0 ** ((exp_val - EXP_INDEX_BIAS) / 4.0)
 
 
-def dequantize_band(q, exp_idx, inv_gain, band_idx):
-    """Inverse quantize one band with centroid reconstruction."""
-    qquarter = exp_idx - EXP_INDEX_BIAS
-    step = (2.0 ** (qquarter / 4.0)) * BAND_WEIGHTS[band_idx] * inv_gain
-    y = np.zeros(len(q), dtype=np.float64)
+def quantize(X, step):
+    """Deadzone-quantize coefficients at a per-bin step size.
+
+    Returns (q, abs_scaled): the integer symbols and the pre-deadzone
+    magnitudes |X / step|, which the noise-fill estimator reuses. step
+    fixes the length; X is sliced to match (the inaudible HF tail is dropped).
+    """
+    n = len(step)
+    scaled = np.zeros(n)
+    valid = step > 1e-20  # guard against divide-by-zero on empty bands
+    scaled[valid] = X[:n][valid] / step[valid]
+    abs_scaled = np.abs(scaled)
+
+    q = np.zeros(n, dtype=np.int32)
+    mask = abs_scaled > DEAD_ZONE
+    q[mask] = (np.sign(scaled[mask])
+               * np.floor(abs_scaled[mask] - DEAD_ZONE + 1.0)).astype(np.int32)
+    return q, abs_scaled
+
+
+def dequantize(q, step):
+    """Centroid reconstruction: x_hat = sign(q) * (|q| + CENTROID) * step."""
+    x = np.zeros(len(step))
     nz = q != 0
-    y[nz] = np.sign(q[nz]) * (np.abs(q[nz]) + CENTROID) * step
-    return y
+    x[nz] = np.sign(q[nz]) * (np.abs(q[nz]) + CENTROID) * step[nz]
+    return x
