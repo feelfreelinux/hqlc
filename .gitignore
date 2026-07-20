@@ -5,3 +5,5 @@ __pycache__
 .DS_Store
 managed_components/
 test_pcm.h
+.zig-cache/
+zig-out/
