@@ -7,6 +7,9 @@ import { Transport, buildBuffer } from "./transport.js";
 import { showResults } from "./results.js";
 import { initSubmit, prepareSubmit } from "./submit.js";
 
+// Whether to show the running score during the test
+let showLiveScore = false;
+
 initCodecs().catch((err) => showError(err.message));
 initSubmit();
 setPhase("setup");
@@ -139,6 +142,7 @@ $("#btn-start").addEventListener("click", async () => {
 
   Transport.ensureCtx();
   Transport.resumeAtPos = $("#chk-resume").checked;
+  showLiveScore = $("#chk-livescore").checked;
   $("#processing").hidden = true;
   $("#btn-start").disabled = false;
   startAbx();
@@ -155,6 +159,7 @@ function startAbx() {
     dot.className = "dot pending";
     history.appendChild(dot);
   }
+  $("#score-live").hidden = !showLiveScore;
   setPhase("abx");
   loadTrial();
 }
@@ -179,6 +184,7 @@ function loadTrial() {
 }
 
 function updateLiveScore() {
+  if (!showLiveScore) return;
   const answered = state.trials.slice(0, state.currentTrial);
   const correct = answered.filter((t) => t.correct).length;
   $("#score-live").textContent = `${correct} / ${answered.length} correct`;
@@ -192,7 +198,9 @@ function answer(ans) {
   t.correct = (ans === "a" && t.xIsA) || (ans === "b" && !t.xIsA);
 
   const dots = $$("#history .dot");
-  dots[state.currentTrial].className = "dot " + (t.correct ? "correct" : "wrong");
+  dots[state.currentTrial].className = showLiveScore
+    ? "dot " + (t.correct ? "correct" : "wrong")
+    : "dot answered";
 
   state.currentTrial++;
   Transport.pause();
