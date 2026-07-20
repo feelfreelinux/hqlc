@@ -1,17 +1,5 @@
-"""Psychoacoustic analysis: band energy, spreading envelope, noise fill decisions.
-
-Band energy is computed as a log-scale exponent index per band:
-  exp_idx = clip(round(2 * log2(mean_sq)) + BIAS, 0, 63)
-This gives ~1.5 dB granularity and controls the quantizer step size.
-
-The spreading envelope models cross-band masking using the ERB-rate scale
-(Glasberg & Moore 1990). Upward masking decays at -10 dB/ERB, downward
-at -15 dB/ERB. The signal-to-mask ratio (SMR) drives tier-2 noise fill.
-
-Noise fill replaces very quiet or deeply masked bands with shaped pseudorandom
-noise, avoiding wasteful coding of near-zero coefficients.
-  - Tier 1: low energy (exp_idx <= 7) + non-tonal (crest factor < 20 dB)
-  - Tier 2: deeply masked (exp_idx <= 24, SMR below threshold)
+"""
+Psychoacoustic analysis, calculates the per-band exponent indices
 """
 
 import math
@@ -19,131 +7,120 @@ import math
 import numpy as np
 
 from .constants import (
-    BAND_EDGES, BLOCK_SIZE, EXP_INDEX_BIAS, EXP_INDEX_MAX, EXP_INDEX_MIN,
-    FS, LOG2_BINS_Q4, N_BANDS,
+    BAND_EDGES,
+    EXP_INDEX_BIAS,
+    EXP_INDEX_MAX,
+    EXP_INDEX_MIN,
+    FB_COARSE,
+    FINE_BAND_EDGES,
+    FINE_TILT_DB,
+    N_ACTIVE_FINE,
+    N_BANDS,
 )
 
-# Noise fill parameters
-NF_EXP_MAX = 7
-NF_MUL = 0.7
-NF_CREST_DB = 20.0
-NF_EXP_MAX_TIER2 = 24
-NF_SMR_THRESHOLD_Q4 = 8  # Q4(0.5)
 
-_NF_CREST_RATIO = 10.0 ** (NF_CREST_DB / 10.0)  # 100.0
+def tilt_for_bitrate(bitrate):
+    """Pre-emphasis tilt in dB for a bitrate (C psy_tilt_for_bitrate).
 
-# Noise fill LCG constants (Numerical Recipes)
-NF_LCG_A = 1664525
-NF_LCG_C = 1013904223
-NF_SEED_BIAS = 0x9E3779B9
+    35 dB at >=128 kbps, ramps down 5 dB per 32 kbps, floor at 15 dB.
+    """
+    if bitrate >= 128000:
+        return 35
+    tilt = 35 - (128000 - bitrate) * 5 // 32000
+    return max(15, tilt)
 
 
-# ── Spreading envelope ──
-
-def _erb_rate(hz):
-    """ERB-rate scale (Glasberg & Moore 1990)."""
-    return 21.4 * math.log10(1 + 0.00437 * hz)
+def tilt_step_q7(tilt_db):
+    """Per-fine-band tilt increment in EXP_Q7 (128 per exponent index unit)"""
+    return (int(tilt_db) * 118612 + 32768) >> 16
 
 
-_HZ_PER_BIN = FS / BLOCK_SIZE
-_ERB_CENTERS = np.array([
-    _erb_rate((BAND_EDGES[b] + BAND_EDGES[b + 1]) * _HZ_PER_BIN / 2.0)
-    for b in range(N_BANDS)
-])
+def compute_exponents(X, tilt_db=FINE_TILT_DB, transient=False):
+    """Compute 20 coarse-band exponent indices from the MDCT spectrum.
 
-_SPREAD_UP_DB_PER_ERB = -10.0
-_SPREAD_DOWN_DB_PER_ERB = -15.0
-_DB_TO_Q4 = 16.0 / 3.0103  # dB -> Q4 log2 (power domain)
-_Q4_NEG_INF = -10000
+    For non-transient / steady frames, we use apply the 1-2-1 PSD smoothing, and do the "hat-basis" aggregation
+    (so the fine bands are used to better model the signal, this is the same idea behind interpolation in the quantizer)
 
-_SPREAD_DECAY_UP_Q4 = np.zeros(N_BANDS, dtype=np.int32)
-_SPREAD_DECAY_DOWN_Q4 = np.zeros(N_BANDS, dtype=np.int32)
-for _b in range(1, N_BANDS):
-    _erb_c2c = _ERB_CENTERS[_b] - _ERB_CENTERS[_b - 1]
-    _SPREAD_DECAY_UP_Q4[_b] = int(round(_SPREAD_UP_DB_PER_ERB * _erb_c2c * _DB_TO_Q4))
-    _SPREAD_DECAY_DOWN_Q4[_b - 1] = int(
-        round(_SPREAD_DOWN_DB_PER_ERB * _erb_c2c * _DB_TO_Q4)
-    )
+    Transient frames use a plain geometric mean for the coarse bands. This is due to the fact that transients are sharp by definition, we do not want to model it's finer structure, or smooth its attack.
+    """
+    edges = FINE_BAND_EDGES
 
+    # Per-fine-band mean energy (PSD)
+    psd = [0.0] * N_ACTIVE_FINE
+    for fb in range(N_ACTIVE_FINE):
+        s, e = edges[fb], edges[fb + 1]
+        psd[fb] = float((X[s:e] ** 2).sum()) / float(e - s)
 
-def compute_spreading_envelope(exp_indices):
-    """Cross-band masking envelope. Returns (energy_q4, mask_q4)."""
-    energy_q4 = np.array(
-        [(int(exp_indices[b]) - EXP_INDEX_BIAS) * 8 for b in range(N_BANDS)],
-        dtype=np.int32,
-    )
-    total_q4 = energy_q4 + LOG2_BINS_Q4
+    if not transient:
+        # 1-2-1 low-pass across fine-band PSDs (linear domain, edges replicated)
+        prev = psd[0]
+        for fb in range(N_ACTIVE_FINE):
+            nxt = psd[fb + 1] if fb + 1 < N_ACTIVE_FINE else psd[fb]
+            sm = (prev + 2.0 * psd[fb] + nxt) / 4.0
+            prev = psd[fb]
+            psd[fb] = sm
 
-    # Forward sweep (upward masking)
-    mask_left = np.full(N_BANDS, _Q4_NEG_INF, dtype=np.int32)
-    for b in range(1, N_BANDS):
-        mask_left[b] = max(total_q4[b - 1], mask_left[b - 1]) + _SPREAD_DECAY_UP_Q4[b]
+    # Tilt increment per fine band, in exponent-index units
+    tilt_per_fb = tilt_step_q7(tilt_db) / 128.0
 
-    # Backward sweep (downward masking)
-    mask_right = np.full(N_BANDS, _Q4_NEG_INF, dtype=np.int32)
-    for b in range(N_BANDS - 2, -1, -1):
-        mask_right[b] = max(total_q4[b + 1], mask_right[b + 1]) + _SPREAD_DECAY_DOWN_Q4[b]
+    if not transient:
+        # Hat-basis: each fine band's tilted log-PSD is split between its two
+        # nearest coarse centers, weighted by distance. wl/ws accumulate the
+        # weighted log-sum and total weight per coarse band. exp = wl/ws.
+        centers = [(BAND_EDGES[b] + BAND_EDGES[b + 1] + 2) >> 1 for b in range(N_BANDS)]
+        wl = [0.0] * N_BANDS
+        ws = [0.0] * N_BANDS
+        tilt_acc = 0.0
+        k = 0
+        exp = np.zeros(N_BANDS, dtype=np.int32)
+        for fb in range(N_ACTIVE_FINE):
+            lg = (2.0 * math.log2(psd[fb]) if psd[fb] > 0.0 else 0.0) + tilt_acc
+            tilt_acc += tilt_per_fb
+            x = (edges[fb] + edges[fb + 1]) >> 1  # fine-band center bin
+            if x <= centers[0]:
+                wl[0] += lg
+                ws[0] += 1.0
+            elif x >= centers[-1]:
+                wl[-1] += lg
+                ws[-1] += 1.0
+            else:
+                while x >= centers[k + 1]:
+                    k += 1
+                t = (x - centers[k]) / float(centers[k + 1] - centers[k])
+                wl[k] += (1.0 - t) * lg
+                ws[k] += 1.0 - t
+                wl[k + 1] += t * lg
+                ws[k + 1] += t
+        for b in range(N_BANDS):
+            v = wl[b] / ws[b] if ws[b] > 0.0 else 0.0
+            exp[b] = int(
+                np.clip(
+                    math.floor(v + EXP_INDEX_BIAS + 0.5),
+                    EXP_INDEX_MIN,
+                    EXP_INDEX_MAX,
+                )
+            )
+        return exp
 
-    mask_q4 = np.maximum(mask_left, mask_right) - LOG2_BINS_Q4
-    return energy_q4, mask_q4
+    # Transient path - simple geometric mean per coarse band
+    log_sum = [0.0] * N_BANDS
+    cnt = [0] * N_BANDS
+    tilt_acc = 0.0
+    for fb in range(N_ACTIVE_FINE):
+        b = FB_COARSE[fb]
+        log_idx = 2.0 * math.log2(psd[fb]) if psd[fb] > 0.0 else 0.0
+        log_sum[b] += log_idx + tilt_acc
+        cnt[b] += 1
+        tilt_acc += tilt_per_fb
 
-
-def compute_exponents(X):
-    """Compute band exponent indices from MDCT coefficients (one channel)."""
     exp = np.zeros(N_BANDS, dtype=np.int32)
     for b in range(N_BANDS):
-        s, e = BAND_EDGES[b], BAND_EDGES[b + 1]
-        w = e - s
-        mean_sq = np.sum(X[s:e] ** 2) / float(w) if w > 0 else 0.0
-        if mean_sq > 1e-18:
-            exp[b] = int(np.clip(
-                round(2.0 * math.log2(mean_sq)) + EXP_INDEX_BIAS,
-                EXP_INDEX_MIN, EXP_INDEX_MAX,
-            ))
+        if cnt[b] > 0:
+            exp[b] = int(
+                np.clip(
+                    math.floor(log_sum[b] / cnt[b] + EXP_INDEX_BIAS + 0.5),
+                    EXP_INDEX_MIN,
+                    EXP_INDEX_MAX,
+                )
+            )
     return exp
-
-
-def nf_crest_below(band):
-    """Test if crest factor is below NF_CREST_DB (non-tonal)."""
-    w = len(band)
-    if w == 0:
-        return True
-    peak = float(np.max(np.abs(band)))
-    sum_sq = float(np.sum(band * band))
-    if sum_sq < 1e-30:
-        return True
-    return peak * peak * w < _NF_CREST_RATIO * sum_sq
-
-
-def nf_decide(exp_indices_ch, Xs_ch, smr_q4_ch=None):
-    """Two-tier noise fill decision per band."""
-    nf = np.zeros(N_BANDS, dtype=bool)
-    for b in range(N_BANDS):
-        idx = int(exp_indices_ch[b])
-        s, e = BAND_EDGES[b], BAND_EDGES[b + 1]
-        if idx <= NF_EXP_MAX and nf_crest_below(Xs_ch[s:e]):
-            nf[b] = True
-        elif smr_q4_ch is not None and idx <= NF_EXP_MAX_TIER2:
-            if smr_q4_ch[b] <= NF_SMR_THRESHOLD_Q4:
-                nf[b] = True
-    return nf
-
-
-def nf_synthesize(seed, n, amp):
-    """LCG noise with L1 normalization at gain-invariant amplitude."""
-    noise = np.zeros(n, dtype=np.float64)
-    x = int(seed)
-    mean = 0.0
-    for i in range(n):
-        x = (NF_LCG_A * x + NF_LCG_C) & 0xFFFFFFFF
-        u = float((x >> 8) & 0xFFFFFF) * (1.0 / 16777216.0)
-        v = 2.0 * u - 1.0
-        noise[i] = v
-        mean += v
-    if n > 0:
-        noise -= mean / n
-        mean_abs = float(np.mean(np.abs(noise)))
-        if mean_abs > 1e-12 and amp != 0.0:
-            noise *= amp / (1.1547005383792517 * mean_abs)  # 2/sqrt(3)
-            return noise
-    return noise * amp

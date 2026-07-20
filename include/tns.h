@@ -10,36 +10,23 @@
 extern "C" {
 #endif
 
-// TNS_MAX_ORDER and TNS_START_BIN are overridable via -D for experiments
-// (scripts/tns_sweep.py). Order is coded as 3 bits (order-1), so <= 8.
-#ifndef TNS_MAX_ORDER
+// Max order for the TNS filter
 #define TNS_MAX_ORDER 4
-#endif
+
 #define TNS_K_BITS   4
 #define TNS_LAR_HALF 7
-#ifndef TNS_START_BIN
-// ~940 Hz: TNS analyses and filters only above this bin. Lowered from 43
-// (~2 kHz): including the 1-2 kHz region in the autocorrelation lets the
-// filter capture the broadband transient structure — castanets pre-echo
-// -11 dB at 96k with no measurable cost on tonal clips (see
-// scripts/tns_sweep.py).
-#define TNS_START_BIN 20
-#endif
 
-// Sub-block transient detector: the frame is split into 8 sub-blocks of 64
-// samples; each sub-block's high-pass energy is compared against the mean of
-// the preceding 8 sub-blocks (sliding across the frame boundary via state).
-// TNS_DETECT_RATIO is the energy ratio that counts as an attack; overridable
-// via -D for experiments (scripts/transient_sweep.py).
+// Start TNS analysis and filter at ~940 Hz
+#define TNS_START_BIN 20
+
+// Transient detector runs 8 sub-blocks of 64 samples
 #define TNS_DETECT_SUBBLOCKS 8
-#ifndef TNS_DETECT_RATIO
+
+// Ratio for transient detection (higher = less sensitive)
 #define TNS_DETECT_RATIO 8
-#endif
-// Absolute HP-energy floor per sub-block (16-bit sample scale): don't call
-// noise-floor wiggle in silence an attack.
-#ifndef TNS_DETECT_FLOOR
+
+// Absolute HP-energy floor per sub-block (16-bit sample scale)
 #define TNS_DETECT_FLOOR (1u << 20)
-#endif
 
 // Per-channel detector state (zero-init = preceding silence)
 typedef struct {
@@ -56,28 +43,36 @@ typedef struct {
 
 extern const int32_t tns_k_dq_q30[15];
 
-// Dequantize LAR index to reflection coefficient in Q30
+/**
+ * @brief Dequantize a LAR index to a reflection coefficient.
+ *
+ * @param q Quantized LAR index in the range -7..7.
+ * @return Reflection coefficient in Q30 format.
+ */
 static inline int32_t tns_dequant_k(int q) {
   return tns_k_dq_q30[q + 7];
 }
 
-// Quantize reflection coefficient (Q30) to LAR index (-7, 7)
+/**
+ * @brief Quantize a reflection coefficient to a LAR index.
+ *
+ * @param k_q30 Reflection coefficient in Q30 format.
+ * @return Quantized LAR index in the range -7..7.
+ */
 int tns_quant_k(int32_t k_q30);
 
 /**
- * @brief Detect an attack transient inside the current frame.
+ * @brief Detect an attack transient in the current frame.
  *
- * High-passes the frame (first difference), accumulates energy per 64-sample
- * sub-block, and fires when any sub-block exceeds TNS_DETECT_RATIO x the
- * mean of the preceding 8 sub-blocks. Catches mid-frame attacks and repeated
- * hits that a whole-frame energy ratio misses.
+ * A transient is detected when any 64-sample high-pass sub-block has enough
+ * energy compared with the mean of the preceding sub-blocks.
  *
- * @param st       Per-channel detector state (updated)
- * @param curr_pcm Current frame PCM
- * @param fmt      PCM sample format
- * @param stride   Channel interleave stride / channel count
- * @param ch       Channel index
- * @return true if an attack was detected in this frame
+ * @param st Per-channel detector state, updated in place.
+ * @param curr_pcm Current frame PCM samples.
+ * @param fmt PCM sample format.
+ * @param stride Channel interleave stride, usually the total channel count.
+ * @param ch Channel index to analyze.
+ * @return True if an attack transient is detected.
  */
 bool tns_detect_transient(tns_detect_state *st,
                           const uint8_t *curr_pcm,
@@ -86,51 +81,60 @@ bool tns_detect_transient(tns_detect_state *st,
                           int ch);
 
 /**
- * @brief Analyse spectrum and produce TNS filter parameters
+ * @brief Analyze a spectrum and produce TNS filter parameters.
  *
- * @param spec_q31 MDCT spectrum (HQLC_FRAME_SAMPLES, not modified)
- * @param out Output TNS results
+ * @param spec_q31 MDCT spectrum, HQLC_FRAME_SAMPLES elements. Not modified.
+ * @param out Destination for TNS analysis results.
  */
 void tns_analyze(const int32_t *spec_q31, tns_info *out);
 
-
 /**
- * @brief Lattice FIR (encoder analysis filter, in-place)
+ * @brief Apply the encoder TNS lattice FIR filter in place.
  *
- * @param spec_q31     Spectrum to filter (HQLC_FRAME_SAMPLES, modified in-place)
- * @param k_q30        Reflection coefficients in Q30
- * @param order        Filter order
- * @param input_rshift Right-shift applied to each input sample (0 = none)
- * @param out_hr       If non-NULL, receives output block headroom
+ * @param spec_q31 Spectrum to filter, HQLC_FRAME_SAMPLES elements.
+ * @param k_q30 Reflection coefficients in Q30 format.
+ * @param order Filter order.
+ * @param input_rshift Right shift applied to each input sample, or 0 for none.
+ * @param out_hr If non-NULL, receives output block headroom.
  */
 void tns_lattice_fir(
     int32_t *spec_q31, const int32_t *k_q30, int order, int input_rshift, int *out_hr);
 
 /**
- * @brief Lattice IIR (decoder synthesis filter, in-place)
+ * @brief Apply the decoder TNS lattice IIR filter in place.
  *
- * @param spec_q31     Spectrum to filter (HQLC_FRAME_SAMPLES, modified in-place)
- * @param k_q30        Reflection coefficients in Q30
- * @param order        Filter order
- * @param input_rshift Right-shift applied to each input sample (0 = none)
- * @param out_hr       If non-NULL, receives output block headroom
+ * @param spec_q31 Spectrum to filter, HQLC_FRAME_SAMPLES elements.
+ * @param k_q30 Reflection coefficients in Q30 format.
+ * @param order Filter order.
+ * @param input_rshift Right shift applied to each input sample, or 0 for none.
+ * @param out_hr If non-NULL, receives output block headroom.
  */
 void tns_lattice_iir(
     int32_t *spec_q31, const int32_t *k_q30, int order, int input_rshift, int *out_hr);
 
 /**
- * @brief Safe FIR with automatic headroom management.
+ * @brief Apply the FIR filter with automatic headroom management.
  *
- * Pre-shifts spectrum, runs lattice FIR, re-normalizes.
- * @return Net loss_bits adjustment (caller adds to loss_bits)
+ * Pre-shifts the spectrum, runs the lattice FIR filter, then renormalizes the
+ * result.
+ *
+ * @param spec_q31 Spectrum to filter in place.
+ * @param k_q30 Reflection coefficients in Q30 format.
+ * @param order Filter order.
+ * @return Net `loss_bits` adjustment for the caller to add.
  */
 int tns_fir_safe(int32_t *spec_q31, const int32_t *k_q30, int order);
 
 /**
- * @brief Safe IIR with automatic headroom management.
+ * @brief Apply the IIR filter with automatic headroom management.
  *
- * Pre-shifts spectrum, runs lattice IIR, re-normalizes
- * @return Net loss_bits adjustment (caller adds to loss_bits)
+ * Pre-shifts the spectrum, runs the lattice IIR filter, then renormalizes the
+ * result.
+ *
+ * @param spec_q31 Spectrum to filter in place.
+ * @param k_q30 Reflection coefficients in Q30 format.
+ * @param order Filter order.
+ * @return Net `loss_bits` adjustment for the caller to add.
  */
 int tns_iir_safe(int32_t *spec_q31, const int32_t *k_q30, int order);
 

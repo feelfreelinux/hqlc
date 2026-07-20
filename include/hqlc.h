@@ -34,12 +34,11 @@ typedef enum {
 } hqlc_pcm_format;
 
 /**
- * @brief Returns the number of bytes per interleaved frame for the given PCM
- * format
+ * @brief Return the PCM byte count for one interleaved codec frame.
  *
- * @param channels Number of channels
- * @param fmt PCM format
- * @return Number of bytes per frame, or 0 if format is invalid
+ * @param channels Number of channels.
+ * @param fmt PCM format.
+ * @return Number of bytes per frame, or 0 for an invalid format.
  */
 static inline size_t hqlc_frame_pcm_bytes(uint8_t channels, hqlc_pcm_format fmt) {
   switch (fmt) {
@@ -55,7 +54,7 @@ static inline size_t hqlc_frame_pcm_bytes(uint8_t channels, hqlc_pcm_format fmt)
 // Encoder mode enumeration
 typedef enum {
   HQLC_MODE_RC = 0, /**< rate-controlled (target bitrate) */
-  HQLC_MODE_FIXED,  /**< fixed gain                       */
+  HQLC_MODE_FIXED,  /**< fixed gain */
 } hqlc_mode;
 
 // Encoder configuration
@@ -64,8 +63,8 @@ typedef struct {
   uint32_t sample_rate; /**< sample rate in Hz (only 48000 supported) */
   hqlc_mode mode;       /**< encoder mode */
   union {
-    uint32_t bitrate; /* HQLC_MODE_RC: target bits per second  */
-    float gain;       /* HQLC_MODE_FIXED: quantizer gain value       */
+    uint32_t bitrate; /**< HQLC_MODE_RC: target bits per second */
+    float gain;       /**< HQLC_MODE_FIXED: quantizer gain value */
   };
 } hqlc_encoder_config;
 
@@ -73,40 +72,54 @@ typedef struct {
 typedef struct hqlc_encoder hqlc_encoder;
 typedef struct hqlc_decoder hqlc_decoder;
 
-// Returns size of hqlc_encoder struct in bytes
+/**
+ * @brief Return the required size of an encoder instance.
+ *
+ * @return Size of `hqlc_encoder` in bytes.
+ */
 size_t hqlc_encoder_size(void);
 
-// Returns size of hqlc_encoder scratch buffer in bytes
+/**
+ * @brief Return the required size of the encoder scratch buffer.
+ *
+ * @return Encoder scratch buffer size in bytes.
+ */
 size_t hqlc_encoder_scratch_size(void);
 
-// Returns size of hqlc_decoder struct in bytes
+/**
+ * @brief Return the required size of a decoder instance.
+ *
+ * @return Size of `hqlc_decoder` in bytes.
+ */
 size_t hqlc_decoder_size(void);
 
-// Returns size of hqlc_decoder scratch buffer in bytes
+/**
+ * @brief Return the required size of the decoder scratch buffer.
+ *
+ * @return Decoder scratch buffer size in bytes.
+ */
 size_t hqlc_decoder_scratch_size(void);
 
 /**
- * @brief Initialize an hqlc_encoder instance.
+ * @brief Initialize an encoder instance.
  *
- * @param enc Pointer to the hqlc_encoder struct to initialize, should be
- *            allocated by the caller with hqlc_encoder_size() bytes.
- * @param cfg Pointer to the encoder configuration.
- * @return hqlc_error HQLC_OK on success, or an error code on failure.
+ * @param enc Encoder storage allocated by the caller with hqlc_encoder_size() bytes.
+ * @param cfg Encoder configuration.
+ * @return HQLC_OK on success, or an error code on failure.
  */
 hqlc_error hqlc_encoder_init(hqlc_encoder *enc, const hqlc_encoder_config *cfg);
 
 /**
- * @brief Encode a single frame of PCM data
+ * @brief Encode one frame of PCM data.
  *
- * @param enc Pointer to the hqlc_encoder struct.
- * @param pcm Pointer to the mono / interleaved PCM samples to encode
- * @param fmt The PCM format of the input samples.
+ * @param enc Initialized encoder instance.
+ * @param pcm Mono or interleaved PCM samples to encode.
+ * @param fmt PCM format of the input samples.
  * @param out Destination buffer for the compressed frame.
- * @param out_cap Capacity of the `out` buffer in bytes.
- * @param out_len Receives the actual compressed frame size in bytes.
- * @param scratch Temporary workspace buffer (hqlc_encoder_scratch_size()
- * bytes).
- * @return hqlc_error HQLC_OK on success, or an error code on failure.
+ * @param out_cap Capacity of `out` in bytes.
+ * @param out_len Receives the compressed frame size in bytes.
+ * @param scratch Temporary workspace with hqlc_encoder_scratch_size() bytes.
+ * @return HQLC_OK on success, or an error code on failure.
  */
 hqlc_error hqlc_encode_frame(hqlc_encoder *enc,
                              const uint8_t *pcm,
@@ -117,34 +130,34 @@ hqlc_error hqlc_encode_frame(hqlc_encoder *enc,
                              void *scratch);
 
 /**
- * @brief Initialize an hqlc_decoder instance.
+ * @brief Initialize a decoder instance.
  *
- * @param dec Pointer to the hqlc_decoder struct to initialize, should be
- *            allocated by the caller with hqlc_decoder_size() bytes.
+ * @param dec Decoder storage allocated by the caller with hqlc_decoder_size() bytes.
  * @param channels Number of channels to decode.
- * @param sample_rate Sample rate of the output PCM.
- * @return hqlc_error HQLC_OK on success, or an error code on failure.
+ * @param sample_rate Output sample rate in Hz.
+ * @return HQLC_OK on success, or an error code on failure.
  */
 hqlc_error hqlc_decoder_init(hqlc_decoder *dec, uint8_t channels, uint32_t sample_rate);
 
-/*
+/**
  * @brief Reset decoder state after a gap in reception.
  *
- * Clears the MDCT overlap buffer so the next frame starts clean.
+ * Clears the MDCT overlap buffer so the next frame starts cleanly.
+ *
+ * @param dec Initialized decoder instance.
  */
 void hqlc_decoder_reset(hqlc_decoder *dec);
 
 /**
- * @brief Decode a single compressed frame to interleaved PCM.
+ * @brief Decode one compressed frame to interleaved PCM.
  *
- * @param dec Pointer to the hqlc_decoder struct.
- * @param payload Pointer to the compressed frame bytes.
- * @param payload_len Size of the payload in bytes.
- * @param pcm_out Destination for decoded PCM (hqlc_frame_pcm_bytes() bytes).
+ * @param dec Initialized decoder instance.
+ * @param payload Compressed frame bytes.
+ * @param payload_len Payload size in bytes.
+ * @param pcm_out Destination for decoded PCM with hqlc_frame_pcm_bytes() bytes.
  * @param fmt Desired output PCM format.
- * @param scratch Temporary workspace buffer (hqlc_decoder_scratch_size()
- * bytes).
- * @return hqlc_error HQLC_OK on success, or an error code on failure.
+ * @param scratch Temporary workspace with hqlc_decoder_scratch_size() bytes.
+ * @return HQLC_OK on success, or an error code on failure.
  */
 hqlc_error hqlc_decode_frame(hqlc_decoder *dec,
                              const uint8_t *payload,

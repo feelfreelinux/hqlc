@@ -14,7 +14,7 @@ import tempfile
 
 REPO = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 SCRIPTS = os.path.dirname(os.path.abspath(__file__))
-HQLC_ENC = os.path.join(REPO, "build", "hqlc_enc")
+HQLC_ENC = os.path.join(REPO, "build", "hqlc")
 DOCKER_IMAGE = "visqol-local"
 DOCKERFILE = os.path.join(SCRIPTS, "Dockerfile.visqol")
 BITRATE = 96000

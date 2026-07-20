@@ -2,26 +2,27 @@
 
 ## Why do I need another audio codec?
 
-TLDR; I needed an audio codec that can provide me with good / transparent audio quality at 96-128kbps range, while being truly low complexity / easy to encode and decode on embedded microprocessors such as Espressif ESP32. I've evaluated a few audio codecs, but none really matched my needs.
+TLDR; I needed an audio codec that can provide good / transparent audio quality in the 96-128 kbps range, while being truly low complexity / easy to encode and decode on embedded microprocessors such as Espressif ESP32. I've evaluated a few audio codecs, but none really matched my needs.
+
 - **Opus** - Excellent compression and efficiency, completely open and royalty free. Unfortunately, it's a bit complex for embedded targets. Both the encoder and decoder have large stack and flash footprints, and the encoding side in particular is quite CPU-heavy. Not a great fit for embedded targets like an ESP32.
 - **LC3** - Marketed as low complexity and used in Bluetooth LE Audio. The spec itself is still fairly involved though - mixed-radix FFT, arithmetic coding, spectral shaping, and the publicly available implementations lack good fixed-point encoder/decoder paths, so on an ESP32 it ends up not being as fast as you'd expect. It also typically requires a license for use outside of Bluetooth, which limits where you can deploy it.
 - **AAC-LC** - The core patents have technically expired, but the codec itself is showing its age. At comparable bitrates it provides lower quality than Opus or LC3, and the encoder/decoder still uses quite a bit of memory.
 - **SBC** - Very low complexity and small footprint, but the compression efficiency is noticeably worse than any of the transform-based codecs above. Fine for Bluetooth Classic at higher bitrates, but not competitive at 96-128 kbps.
 
-A note on the target bitrate: HQLC deliberately does not try to compete below 96 kbps. At lower bitrates, codecs like Opus switch to SILK, a voice optimized linear prediction that is fundamentally different from MDCT-based coding. Thats a completely different problem / domain, and HQLC is not made for usage there. Hence all the benchmarks & my measurements are at 96kbps+.
+A note on the target bitrate: HQLC deliberately does not try to compete below 96 kbps. At lower bitrates, codecs like Opus switch to SILK, a voice-optimized linear prediction mode that is fundamentally different from MDCT-based coding. That's a completely different problem / domain, and HQLC is not made for usage there. Hence all the benchmarks & my measurements are at 96 kbps+.
 
-So, all the MDCT transform based codecs are quite heavy and complex. Subband codecs like SBC fill the gap for low complexity & low memory footprint compression, but they are a lot less efficient than transform based codecs. Hence why I decided to try to design one :) I'll try to describe how HQLC (and overall how transform codecs) work stage by stage, and the reasons why I chose a specific design over another one. Although, keep in mind that I'm not an audio engineer, and my understanding of the concepts might be flawed.
+So, the MDCT transform-based codecs are quite heavy and complex. Subband codecs like SBC fill the gap for low complexity & low memory footprint compression, but they are a lot less efficient than transform-based codecs. Hence why I decided to try to design one :) I'll try to describe how HQLC (and overall how transform codecs) work stage by stage, and the reasons why I chose a specific design over another one. Although, keep in mind that I'm not an audio engineer, and my understanding of the concepts might be flawed.
 
 ### Encoder pipeline overview
 
 ```mermaid
 flowchart LR
-    PCM["PCM\n48 kHz"] --> MDCT["MDCT"] --> BAND["Band\nAnalysis"] --> TNS["TNS"] --> NF["Noise\nFill"] --> QUANT["Quantize"] --> RANS["rANS"] --> BIT["Bitstream"]
+    PCM["PCM\n48 kHz"] --> MDCT["MDCT"] --> TNS["TNS"] --> ENV["Envelope\nanalysis"] --> RC["Rate\ncontrol"] --> QUANT["Quantize\n+ NF estimate"] --> RANS["rANS"] --> BIT["Bitstream"]
 ```
 
 ## MDCT, splitting PCM into frequency bins
 
-The heart of all transform codecs. It takes raw PCM data, and converts it into values in frequency domain. Instead of coding individual samples, we describe the signal as frequency content. This is much more compressible and maps to how we actually hear audio.
+The Modified Discrete Cosine Transform (MDCT) is the heart of most transform codecs. Raw PCM audio data is just a representation of the audio amplitude over time, which makes it hard to efficiently compress directly. MDCT takes a short chunk of that data, and splits it directly into values that represent the frequency content of the signal. This makes for a lot more structure than just raw PCM samples, and maps a lot more closely to how we actually hear audio.
 
 MDCT processes overlapping blocks where each block shares half its samples with the previous and next one. This 50% overlap plus a window function gives you perfect reconstruction (transform then inverse-transform = exact original). You can implement the MDCT directly as a sum of cosines, but that's quite expensive. Therefore, the standard trick is to decompose it into a window, a time-domain fold, and a DCT-IV, which can then be computed via FFT in O(N log N). The window+fold produces 512 values from the 1024-sample block, and the DCT-IV turns those into 512 spectral coefficients.
 
@@ -35,82 +36,106 @@ The 512 fixed sample frame is chosen on purpose. It's low enough for low latency
 
 See `misc/python/mdct.py` for code. The C version is fixed-point and mixes in a bunch of optimizations & careful block floating point management - might be a bit hard to read.
 
+## Transient detection
+
+This isn't a full-blown codec phase, but some of the later stages depend on whether the current frame is a 'transient' or not. A transient frame is one that contains a sudden change in the audio signal, such as a drum hit, castanet click, sudden sharp vocal.
+
+Like Opus/CELT, HQLC detects attacks from the time-domain signal / PCM before the MDCT. A single audio frame is high passed with a simple first difference, split into 8 blocks of 64 samples each, and then each block's energy is measured against the average energy of the previous 8 blocks. If the difference is high enough, the frame is marked as transient.
+
+This is quite similar to how Opus does it, just a bit simpler.
+
 ## Band structure and spectral analysis
 
-After the MDCT, audio is nicely split into 512 evenly split coefficients. These coefficients are split into 20 groups / bands, with uneven widths to make the later coding and analysis easier. The defined widths roughly follow ERB, as the ear is more sensitive to lower frequencies (first few bands cover like 3-8 bins) and the higher bands cover up to 81 bins. This is based on 1990 Glasberg & Moore - some codecs use Bark scale, but ERB is generally newer and more accurate.
+After the MDCT, audio is nicely split into 512 evenly split coefficients. These coefficients are split into 20 groups / bands, with uneven widths to make the later coding and analysis easier. The defined widths roughly follow ERB, as the ear is more sensitive to lower frequencies (first few bands cover like 3-8 bins) and the highest band covers 67 bins. This is based on 1990 Glasberg & Moore - some codecs use Bark scale, but ERB is generally newer and more accurate. Only the first 427 bins (~20kHz) are coded, with the remaining bins being zero'ed.
 
-For each of those bands / groups, we calculate an exponent index. It's a 6-bit value that describes the energy in a given band on a log scale, around ~1.5 dB per step. The exponent drives the coarseness of the per-band quantization, making it so louder bands get compressed more than quieter ones, as they can tolerate it. The formula is roughly `round(2 * log2(mean_squared_energy)) + 43`, 43 being a bias, calculated empirically so the range covers the actual range used in typical audio, without clipping. The choice of 6-bit values comes from the balance between a fine step for the quantizer and the actual cost of coding those exponents. For the actual coding, the exponents are coded with a simple DPCM code - aka, each exponent is written as the delta from the previous exponent. Exponents for channels 1+ are coded as a difference from channel 0 - that's a stereo optimization, as the stereo channels are often correlated, saving on side info there.
+For each of those bands / groups, we calculate an exponent index. It's a 6-bit value that describes the energy in a given band on a log scale, around ~1.5 dB per step. The exponent directly drives the coarseness of the quantization, making it so louder bands get compressed more than quieter ones, as they can tolerate it.
 
-This is a similar concept to scale factors in AAC or MP3, but a bit simpler. In AAC, scale factors control a separate per-band gain that's applied before a uniform quantizer. In HQLC, the exponent directly sets the quantizer step size per band, so there's no separate scaling pass. Because the step scales with signal energy, quantization noise ends up roughly proportional to the signal level in each band. That's already a basic form of perceptual noise shaping on its own, without needing an explicit masking model.
+The exponents are calculated a bit differently depending on whether a frame is a transient frame or not. For transient frames, the exponent calculation is simply a geometric estimate of the energy in the band, using the mean squared energy and a logarithmic scale.
+
+For non-transient frames, the encoder uses a finer analysis path. Instead of measuring only the 20 transmitted bands directly, it first measures energy on 47 fine bands. That fine estimate is lightly smoothed and then reduced back to the 20 transmitted exponents. The reduction is matched to the way the decoder later interpolates between exponent band centers, so the encoder is fitting the envelope shape that the quantizer will actually use.
+
+The smoothing itself is pretty close to what LC3 does, and seems to improve the visqol / zim scores a bit - the coarse exponents can be a bit noisy across frames, so it helps stabilize the quantizer.
+
+The exponents are adjusted with a bitrate-dependent static tilt. The tilt boosts the exponents of the higher bands, which makes their quantization coarser and effectively shifts bits down toward the perceptually more important lower/mid bands. It is strongest at 128 kbps and above (35 dB) and eases down to a 15 dB floor at lower bitrates. The stronger tilt at higher rates is deliberate: with more bits available, the high bands would otherwise attract more than they perceptually deserve, so the tilt reins them in harder. At lower rates the coarse global gain already starves the top end, so less explicit tilt is needed.
+
+This is a similar concept to scale factors in AAC or MP3, but a bit simpler. HQLC does not apply any per-band scaling before the quantizer, so the exponents directly control the quantizer step size per band and the quantization noise roughly scales with the signal level in given bands, which gives a form of perceptual noise shaping without any explicit modeling.
 
 ## TNS (Temporal Noise Shaping)
 
-When the MDCT quantizes a frame containing a sharp transient (like a loud drum hit, a castanet click, etc), the quantization noise spreads across the entire frame. It's audible as a "smear" or echo just before the attack, called pre-echo. This is an inherent artifact of transform codecs, and is usually mitigated in a few different ways.
+When the MDCT quantizes a frame containing a sharp transient, like a loud drum hit or a castanet click, quantization noise can spread across the whole transform window. The most annoying form of this is noise that happens before the transient itself, called pre-echo. As it often happens in quiet sections before the signal, it can often be quite noticeable. It's a natural artifact of all MDCT-based codecs, and can be mitigated in a few different ways.
 
-One of the ways to fight it is called block switching. The idea is straightforward: when a transient is detected, the codec switches to a shorter MDCT window. A shorter window covers less time, which naturally limits how far the pre-echo artifact can spread. This is what MP3 and other codecs do.
+One way to fight this is block switching. When a transient is detected, the codec switches to a shorter frame. A shorter frame covers less time, which limits where the noise can spread. MP3, AAC, Opus/CELT, and many other transform codecs use this idea.
 
-The downside is complexity. You need a state machine for switching between long and short windows, including the transition windows in between. The band layout also has to change, since the 20-band exponent structure only really works for 512-sample frames. All of this roughly doubles the amount of windowing and analysis code you have to carry around.
+The downside is complexity. You need a state machine for switching between long and short windows, often including the transition windows in between. The band layout also has to change, since the 20-band exponent structure only really works for 512-sample frames. This can double the amount of windowing and analysis code quite a bit, so I've decided against using it.
 
-To keep things simple, HQLC uses something called TNS (temporal noise shaping). When a transient happens, the MDCT coefficients end up with a specific pattern to them. TNS finds a short filter that flattens this pattern before quantization. The encoder sends the filter parameters as side info (cheap, just a few bits), and the decoder applies the inverse filter to restore the original shape. The trick is that the quantization noise, which was spread evenly across the flattened spectrum, now follows the restored shape and ends up concentrated where the signal is loud. The noise hides behind the transient instead of smearing before it.
+To keep things simple, HQLC uses TNS instead. When a transient happens, the MDCT coefficients line up to a specific pattern. TNS's autocorrelation finds a short filter that flattens this pattern before quantization, "whitening" the noise. The encoder sends the filter parameters as side info, and the decoder applies the inverse filter to restore the original shape. This has a neat side effect of also shaping the quantization noise too, hiding it where the signal is loud.
 
-**Without TNS:**
-```mermaid
-flowchart LR
-    A["Spectrum (transient)"] --> B["Quantize"] --> C["Noise spreads across full frame"] --> D["Pre-echo"]
-```
+The filter itself is intentionally tiny, order 0 to 4. The encoder computes autocorrelation on the spectrum, runs Levinson-Durbin to get reflection coefficients, clips them to a safe range, and quantizes them into 4 bits. The actual filtering is a lattice FIR in the encoder and the matching lattice IIR in the decoder.
 
-**With TNS:**
-```mermaid
-flowchart LR
-    E["Spectrum (transient)"] --> F["LPC filter (flatten)"] --> G["Quantize"] --> H["Inverse LPC filter"] --> I["Noise masked by transient"]
-```
+TNS is only attempted on frames selected by the transient detector described above, with an extra 1 hangover frame. The hangover is done due to the overlap MDCT carries - the frame after an attack can still contain the attack in the left half of its window, even if it would not trigger the transient detector itself.
 
-The filter itself is small (up to order 4), and the coefficients are found by looking at how neighboring spectral bins correlate with each other. This is a standard implementation - autocorrelation of the spectrum, Levinson-Durbin to get reflection coefficients, and a lattice FIR/IIR filter pair for the encoder/decoder respectively. The coefficients are quantized to 4 bits each via LAR (Log Area Ratio) mapping, which is coarse but enough for this purpose. Total side info when TNS is active: 1 flag bit + 3 order bits + up to 16 coeffs bits.
+Only bins from 20+ are filtered, so around 940 Hz at 48 kHz. Filtering the low-frequency bins tends to distort bass and pitched content without helping pre-echo much, so HQLC leaves them alone.
 
-TNS only processes the high-frequency part of the spectrum (above ~2 kHz). Low-frequency content like bass notes also has correlated spectral bins, but for a different reason (tonal harmonics, not transients). Filtering those just adds distortion without helping pre-echo.
-
-The filter's activation is gated with a simple energy ratio test, comparing the energy of the current frame to the previous one. If the current frame isn't at least 2x louder, there's likely no transient and TNS is skipped. This avoids running the filter on sustained signals where it would do more harm than good.
-
-TNS was originally developed by Herre at Fraunhofer in the mid-90s for MPEG-2 AAC. The main patent (Herre, US 5,781,888, filed 1996) expired in 2016. The underlying building blocks (Levinson-Durbin, lattice filters, LAR quantization) are all standard DSP techniques in public domain.
-
-## Noise fill
-
-Some bands end up with very little energy, near silence, and bits can be saved up by simply skipping it. At the decoder, the flagged bands are filled with pseudorandom noise at an appropriate amplitude, as simply filling it with silence is worse perceptually.
-
-Two separate checks / tiers can trigger a band to be noise filled.
-
-**Tier 1** catches bands that are both quiet and non-tonal. A band qualifies if its exponent index is very low (7 or below) and its crest factor is below 20 dB. The crest factor check (peak energy vs mean energy) prevents noise-filling bands that contain a quiet but distinct tone, like a soft harmonic, which would sound wrong if replaced with noise.
-
-**Tier 2** is a bit more complex. It exploits the fact that a human ear cannot hear quieter frequencies, if they are next to a louder neighbour - aka perceptual masking. This extends to even bands with moderate energies, when a band next to it is way louder, so usually that band would not be noise filled by the tier 1 check. To find which band is masked, a two pass sweep is done. One forward (lower bands mask higher ones) and one backward (downwards masking). If a band's energy is under this calculated envelope, it can be qualified for noise fill at a higher exponent cap than tier 1.
-
-The noise itself is generated with a simple LCG (linear congruential generator) seeded from the frame index and band index, so it's deterministic. The amplitude of that noise is derived from the step size on the decoder, making it possible to recreate it without explicitly transmitting it.
-
-### Quick note about psychoacoustics
-
-Tier 2 noise fill is the only place where HQLC utilizes the spectral masking envelope. Other codecs usually use it for more complex psychoacoustic modelling. I tried driving the quantizer step itself with different masking models, allocating less bits to more deeply masked bands, refining the more prominent ones - but with negligible success at 96kbps+. As mentioned earlier, the exponents themselves provide "self-masking" (aka, the quantization is coarser for bands that are loud), so part of this model is already naturally accounted for. I also wanted to avoid making too many decisions about the quantization based on the mask, as all of this breaks once the listener decides to apply an equalizer over the received signal - that's when the mechanics of cross-band masking break.
-
-There's also a temporal masking phenomenon (a loud sound will render the ear less sensitive for a short amount of time) that I tried to plug into the bit reservoir mechanism, but ultimately decided against it. All in all, at the target bitrates of HQLC, we are quite comfortable with the bit budget.
+TNS was originally developed by Herre at Fraunhofer in the mid-90s for MPEG-2 AAC. The main patent, Herre US 5,781,888, filed in 1996, expired in 2016. The underlying pieces used here - autocorrelation, Levinson-Durbin, reflection coefficients, LAR quantization, and lattice filters - are standard DSP tools.
 
 ## Quantization
 
-The quantizer turns each spectral coefficient into an integer symbol that can be later efficiently coded. This is where* the codec essentially becomes lossy. The quantizer is driven with one knob, called step size - it says how coarse should the rounding be.
+The quantizer turns each spectral coefficient into an integer symbol that can be efficiently entropy coded later. This is where* the codec essentially becomes lossy. The quantizer is driven by a step size: a larger step means coarser rounding, fewer nonzero symbols, and fewer bits.
 
-_*ok, technically the MDCT in the fixed-point impl naturally drops some precision from the audio signal, so the 'perfect' reconstruction is a bit misleading, but you get the idea._
+_\*ok, technically the MDCT in the fixed-point impl naturally drops some precision from the audio signal, so the 'perfect' reconstruction is a bit misleading, but you get the idea._
 
-The step size formula for a given band is: `step = 2^((exponent - 43) / 4) * BW[b] / gain`. Three things go into it:
+The step for a bin is derived from the transmitted exponent envelope and the global gain:
 
-- The **exponent** (per-band, from the analysis stage) sets the base step. Louder bands get bigger steps. The **43** magic value is related to the previously mentioned bias / offset, it needs to be reapplied so we work with actual signal energy derived values.
-- The **band weight** `BW[b]` is a normalization for the number of bins in a given band. As mentioned earlier, the actual band layout is not even - higher bands have more bins, lower have less. With strictly uniform quantization, the lower bands would get heavily penalized, while HF bands would get plenty of bits. The weight is `log2(bin_count) / log2(max_bin_count)`. Log2 also carries a bit of a perceptual curve to itself (higher frequencies matter less).
-- The **global gain** is a single 7-bit code per frame (8 codes per octave). This is the only knob the rate controller turns to hit the target bitrate. Higher gain, finer steps, more bits.
-  - Note: Some codecs like AAC use per-band gain values, that is used to shape the quantization noise around the spectrum. HQLC uses a single global gain, kind of like LC3 does to keep things simple + other mechanisms already account for the noise distribution.
+```text
+step = 2^((2*exp - gain_code - 59) / 8)
+```
 
-The quantizer in itself is a deadzone quantizer, meaning that the coefficients that fall below a certain threshold (0.65 * step) get rounded down to zero. A standard threshold would be a 0.5, but after tuning it a bit empirically, the 0.65 value is a good trade-off of a bit more distortion on small coefficients, which are not significant either way.
+The exponent is the local scale-factor-like value described earlier, while the global gain is a single 7-bit code per frame at 8 codes per octave. The gain is the only knob the rate controller turns: higher gain means finer steps and more bits, lower gain means coarser steps and fewer bits.
 
-At the decoder, nonzero symbols are dequantized with a centroid offset of 0.15: `sign(q) * (|q| + 0.15) * step`. This offset controls where within the quantization bin we place the reconstructed value. A 0 would put it at the bin edge - too low. A 0.5 at the center - too high. The optimal value of 0.15 depends on the distribution of the source signal. MDCT coefficients tend to follow a Laplacian distribution (aka most values are small, with exponentially decaying tails), which is common for transform coded audio. For a Laplacian source, the MMSE-optimal (minimum mean squared error, aka the value that minimizes the average reconstruction error) centroid works out to around 0.15. This is a standard result in quantization theory and shows up in other codecs too.
+### Per-bin envelope interpolation
 
-I experimented with doing something a bit smarter there. There's a paper by Gary Sullivan (1996) that explores optimal quantizer design for Laplacian sources. I tried to utilize it for per-band centroid optimization, estimating the distribution per band and computing a more accurate offset. The improvement was negligible, the fixed 0.15 works well enough.
+If the decoder used the 20 transmitted exponents directly, the quantization noise floor would jump at every band edge. That is especially noticeable on smooth tonal content. So on non-transient frames, both encoder and decoder linearly interpolate the exponent values between band centers to get a per-bin step size. This costs no side information, because the decoder can reconstruct the same interpolated envelope from the same 20 exponent values.
 
-Some codecs use full RDO (rate-distortion optimization) in the quantizer. This means the encoder tries multiple quantizer configurations per band, measures the actual bit cost and distortion for each, and picks the combination that gives the best quality at a given rate. AAC encoders seem to do this, iterating over scale factors until they find a good allocation. RDO can squeeze out extra quality but it's expensive, as the quantizer needs to be run a few times. I decided against it after experimenting a bit with it, as the improvements were also negligible at my target bitrates.
+On TNS / transient frames, the steps stay flat per band. Attacks have genuinely sharp envelopes, so the exponent analysis path for those frames is the simple coarse-band estimate, no smoothing, no interpolation.
+
+### Deadzone quantizer
+
+HQLC makes use of a simple deadzone quantizer - coefficients below `0.65 * step` are rounded down to zero, and coefficients above that threshold become signed integer symbols:
+
+```text
+q = sign(x) * floor(|x| / step - 0.65 + 1)
+```
+
+At the decoder, nonzero symbols are reconstructed with a centroid offset of `0.15`:
+
+```text
+x_hat = sign(q) * (|q| + 0.15) * step
+```
+
+This offset controls where within the quantization bin we place the reconstructed value. A 0 would put it at the bin lower edge. 0.5 might seem like an obvious guess, but that assumes that the values are spread uniformly inside the bin. MDCT coefficients are not like that - most of them are small, and larger values get exponentially less likely as the magnitude grows. So within a quantization bin, the centroid offset should be closer to the bin lower edge. A value of around 0.15 works well for MDCT coefficients, and is a good fixed approximation of the optimal Laplacian-like distribution that MDCT follows.
+
+
+### Noise fill
+
+The deadzone quantizer intentionally turns small coefficients into zero. That's a good decision for our rate, but decoding long zero runs as literal digital silence tends to sound wrong. Our ears don't really like holes in the spectrum, between the tonal peaks. A standard approach is to fill the holes with noise, shaped to the right amplitude.
+
+The mechanism is pretty simple. During decoding, HQLC looks for runs of more than four consecutive zeros. Once such a run is found, it is filled with synthetic noise. There is no masking model or tonality detector here, as the quantizer already made the perceptual decision by rounding those coefficients to zero. Noise fill only repairs the texture of these holes.
+
+The fill level is transmitted as a 3-bit noise factor per channel, similar to LC3. During quantization, the encoder reuses the pre-deadzone magnitudes `|X| / step` and averages them over exactly the bins the decoder would fill. That estimates how full the deadzone was before the coefficients rounded to zero. This is used to scale the noise amplitude.
+
+The noise itself is deterministic pseudorandom sign noise from a tiny LCG. The seed depends on the frame index and channel, so we don't get a static metallic hiss across frames.
+
+Note: even on non-transient frames where coded coefficients use the interpolated exponent envelope, noise fill uses the flat per-band step. The interpolated version did not seem to buy anything perceptually, and the flat version keeps the fill rule simple and tied directly to the transmitted exponents.
+
+### Quick note about psychoacoustics
+
+HQLC currently does not use an explicit spectral masking model. The perceptual shaping comes from a few simpler mechanisms. Exponents scale the quantizer step with local signal energy, the spectral tilt moves bits toward the more important lower/mid bands, TNS handles the temporal masking failure case around attacks, and noise fill repairs the texture of quantized-away noise floors.
+
+Other codecs usually use stuff like spectral masking for more complex psychoacoustic modelling. I tried driving the quantizer step itself with different masking models, allocating less bits to more deeply masked bands, refining the more prominent ones - but with negligible success at 96kbps+. As mentioned earlier, the exponents themselves provide "self-masking" (aka, the quantization is coarser for bands that are loud), so part of this model is already naturally accounted for. I also wanted to avoid making too many decisions about the quantization based on the mask, as all of this breaks once the listener decides to apply an equalizer over the received signal - that's when the mechanics of cross-band masking break.
+
+There's also a temporal masking phenomenon (a loud sound will render the ear less sensitive for a short amount of time) that I tried to plug into the bit reservoir mechanism, but ultimately decided against it. All in all, at the target bitrates of HQLC, we are quite comfortable with the bit budget.
+
+Some codecs use full RDO (rate-distortion optimization) in the quantizer. This means the encoder tries multiple quantizer configurations per band, measures the actual bit cost and distortion for each, and picks the combination that gives the best quality at a given rate. AAC encoders seem to do this, iterating over scale factors until they find a good allocation. HQLC keeps the quantizer cheaper: the rate controller adjusts one global gain code, and the fixed exponent envelope handles the spectral shape.
 
 ## Entropy coding
 
@@ -118,17 +143,17 @@ After quantization, we have integer symbols that need to be packed into bits as 
 
 ### Rice coding
 
-My first approach was Rice coding, which is also what HQLC still uses for side information (exponents, etc). Rice codes are worth explaining because they're a good intro to entropy coding overall.
+In HQLC, Rice coding is only used for side information, but its worth explaining first because it is a good intro to entropy coding overall.
 
 Rice coding in itself is quite simple. To encode a non-negative value, you split it into two parts using a parameter k. The upper bits are coded in unary (that many 1s followed by a 0), and the lower k bits are written directly, as a value. For example, for k=2, the value 7 becomes: upper = 7 >> 2 = 1, coded as "10", lower = 7 & 3 = 3, coded as "11", giving "1011" (4 bits). The value 0 would be just "000". Small values get short codes, large values get longer ones. The k is picked based on the expected distribution, higher k for data with larger values on average, lower k for lower values.
 
-There are many variations on this idea (Golomb-Rice, Exp-Golomb, etc) that tweak the unary/binary split in different ways, but the core concept is the same. It's used in many places (like FLAC for example), and in HQLC it works well for the exponent deltas and other side info where the distribution is simple and predictable. But for the quantized MDCT coefficients, the distribution varies significantly between bands and across different gain settings. Rice only has one knob (k), so it can't adapt well to these varying shapes. Tricks like sending the per-band K value made the side info significantly larger too.
+There are many variations on this idea (Golomb-Rice, Exp-Golomb, etc) that tweak the unary/binary split in different ways, but the core concept is the same. It's used in many places (like FLAC for example), and in HQLC it works well for the exponent deltas and other side info where the distribution is simple and predictable. But for the quantized MDCT coefficients, the distribution varies significantly between bands and across different gain settings. Rice only has one knob (k), so it can't adapt well to these varying shapes. Adding enough per-band adaptation would also cost side information, which works against Rice's simplicity.
 
 It's quite fast though and does not require any large lookup tables / symbol codes like Huffman does.
 
-### Moving to rANS
+### using rANS for entropy coding
 
-Theoretically, the next logical coding to try would be Huffman coding, as this is what MP3 and AAC use. Huffman works by assigning shorter bit patterns to more probable values and longer ones to rare values, built from a binary tree of symbol frequencies. It can model arbitrary distributions, which is a big step up from Rice. However, it has some downsides, like the fact that the codebooks need to be quite large, in particular when trying to tie them to multiple distributions. Its probability tables also force you to round the probabilities to a full integer, wasting up to one bit.
+A classic solution is Huffman coding, which is what MP3 and AAC use. Huffman works by assigning shorter bit patterns to more probable values and longer ones to rare values, built from a binary tree of symbol frequencies. It can model arbitrary distributions, which is a big step up from Rice. However, it has some downsides, like the fact that the codebooks need to be quite large, in particular when trying to tie them to multiple distributions. Its probability tables also force you to round the probabilities to a full integer, wasting up to one bit.
 
 Some codecs (like LC3 does) for example, use Arithmetic Coding, but those are usually heavily patented, and more complex depending on the actual implementation.
 
@@ -150,19 +175,18 @@ The implementation is just integer multiply, divide, and modulo per symbol.
 
 ### How rANS works in HQLC
 
-Each quantized coefficient is coded as up to three parts: a magnitude symbol (0-14 literal, or 15 as an escape for larger values), an optional overflow for magnitudes >= 15 coded with Exp-Golomb, and a sign bit for nonzero values.
+Each quantized coefficient is coded as a magnitude, an optional overflow, and an optional sign. Magnitudes `0..14` are direct rANS symbols. Magnitude `15` is an escape code - values above that code the remaining overflow with Exp-Golomb bits. The overflow bits and signs use a fixed 50/50 bit coder, which costs exactly one bit per bit and does not need a trained table.
 
-But to code it, we need probability tables. A very large distribution table trained on all bands and all coefficients would be unreasonably large, and overly generalized. After all, the distribution varies both between the bands, and between the different gain values. HQLC uses 32 pre-trained frequency tables, indexed with a formula of `alpha = K * BW[b] / gain`. This captures how lively / how active a given band is. The lower the alpha, the more likely zeros are. The tables were trained on a larger audio corpus, and each is a probability distribution of the 15 magnitude symbols at a given alpha range.
+The magnitude symbol uses one of 48 pre-trained rANS frequency tables. The table is selected from two context values that the decoder can reproduce without any extra side information:
 
-Bands next to each other are paired (so band 0 + band 1, 2+3, etc) and share the same tables. This is a workaround for the more narrow bands, and is a bit of an optimization. Band 0 is very narrow (3 bins) so it's hard to reliably model its distribution, hence why it's mixed with band 1.
+- **Alpha** estimates the expected coefficient scale for the current band. It is derived from the global gain and a trained per-band-pair sigma value. Fine steps and naturally hot bands select tables with heavier tails, coarse steps and quiet bands select tables where zero is much more likely.
+- **Activity** measures the fraction of nonzero coefficients in the previous band, quantized into four bins. Usually a dense previous band is a useful hint that the next band may also be dense.
 
-The sign bit uses a fixed 50/50 split, since positive and negative coefficients are equally likely. Because the split is exactly half of the probability mass, the rANS encode/decode for signs reduces to shift and mask operations with no table lookup.
+Bands are paired for the alpha statistics (`0+1`, `2+3`, etc.) because the narrow low-frequency bands do not contain enough coefficients to model reliably on their own.
 
-The side information (exponents, TNS parameters, noise fill masks) is coded separately using Rice codes and fixed-width fields, packed into a bitstream header. The rANS payload follows after byte alignment. This split keeps things simple to parse, as the decoder reads the header with a bitreader, then switches to rANS for the bulk coefficient data.
+The side information (gain, TNS parameters, exponent deltas, and 3-bit noise factors) is coded separately with Rice codes and fixed-width fields in the frame header. The rANS payload follows after byte alignment. This split keeps parsing simple, the decoder just reads the header with a bitreader, then switches to rANS for the coefficient payload.
 
-The most expensive (from esp32 perspective) theoretical part of rANS is the required division in the encoder (coming from the `state = (state / freq[s]) * M + (state % freq[s]) + cf[s]` formula). This is worked around by using a reciprocal table, turning the division into multiplication.
-
-The total static table footprint for the entropy coder is about 3.3 KB: 1 KB for the 32x16 frequency tables, 2 KB for the precomputed reciprocals, and the rest for alpha bin edges and a log2 LUT used for cost estimation. Not bad for a near-optimal entropy coder.
+The most expensive part of rANS on a small CPU is the encoder-side division in the state update. HQLC avoids doing real division per symbol by using precomputed reciprocal tables, turning that step into multiplication and shifts.
 
 ## Rate control
 
@@ -172,7 +196,7 @@ The target bit budget per frame is simply `bitrate * 512 / 48000`. At 96 kbps, t
 
 ### Searching for the right gain code
 
-While it does not have to be _exact_, the rate controller should accurately be able to estimate the gain code at which the quantizer will be driven, before running the quantizer. If we had plenty of spare CPU cycles, we could just run the entire encoding logic, see the resulting bits, then reiterate doing a binary search. But we can't afford that. There are some rough tricks to estimate it. For example, back when the codec was still using rice codes, I've used a fast feed-forward model to roughly learn the rates on the go, but thanks to rANS it's possible to very cheaply calculate the exact bitcount.
+While it does not have to be _exact_, the rate controller should accurately be able to estimate the gain code at which the quantizer will be driven, before running the quantizer. If we had plenty of spare CPU cycles, we could just run the entire encoding logic, see the resulting bits, then reiterate doing a binary search. But we can't afford that. There are some rough tricks to estimate it. For example, back when the codec was still using rice codes, I've used a fast feed-forward model to roughly learn the rates on the go, but thanks to rANS it's possible to very cheaply calculate a more-or-less right bitcount without running the full encoding logic.
 
 To find the right gain, HQLC does two probes:
 
@@ -184,7 +208,7 @@ This is deliberately simple. AAC encoders might do 10+ iterations per frame to o
 
 ### Bit reservoir
 
-Not every frame needs to hit the target exactly. Some frames (silence, sustained tones) are cheap to encode, while others (transients, complex passages) are expensive. Hitting the target on every frame would waste bits on places where we don't really need them, while starving the harder frames. This is what the bit reservoir is for. It allows the more expensive frames to borrow bits from the simpler ones, temporarily breaking the budget. Over multiple samples, it smooths out into the target bitrate.
+Not every frame needs to hit the target exactly. Some frames (silence, sustained tones) are cheap to encode, while others (transients, complex passages) are expensive. Hitting the target on every frame would waste bits on places where we don't really need them, while starving the harder frames. This is what the bit reservoir is for. It allows the more expensive frames to borrow bits from the simpler ones, temporarily breaking the budget. Over multiple frames, it smooths out into the target bitrate.
 
 HQLC's reservoir is simple. It tracks the running surplus/deficit (`res_bits += target - actual` per frame), clamped to +/- 2x the per-frame budget. When computing the effective target for the next frame, half the reservoir balance is added. So if we saved 200 bits over the last few frames, the next frame gets a target that's 100 bits higher, allowing finer quantization.
 

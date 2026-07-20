@@ -178,7 +178,7 @@ static int tns_levinson_durbin(const int64_t *r_raw, int max_order, int32_t *k_o
     }
 
     // ki = -acc / error, in Q30
-    int32_t ki = (int32_t)(-((acc << 30) / error));
+    int32_t ki = (int32_t)(-((int64_t)((uint64_t)acc << 30) / error));
 
     ki = fxp_clamp_i32(ki, -TNS_K_CLAMP_Q30, TNS_K_CLAMP_Q30);
 
@@ -194,16 +194,28 @@ static int tns_levinson_durbin(const int64_t *r_raw, int max_order, int32_t *k_o
       break;
     }
 
-    // Update prediction coefficients
+    // Update prediction coefficients. On strong transients the update can
+    // exceed Q30 headroom; the filter is blowing up, so keep this reflection
+    // coefficient and stop extending the order.
     int32_t a_new[TNS_MAX_ORDER];
+    bool overflowed = false;
     for (int j = 0; j < i; j++) {
-      a_new[j] = a[j] + (int32_t)(((int64_t)ki * a[i - 1 - j]) >> 30);
+      int64_t sum = (int64_t)a[j] + (((int64_t)ki * a[i - 1 - j]) >> 30);
+      if (sum > INT32_MAX || sum < INT32_MIN) {
+        overflowed = true;
+        break;
+      }
+      a_new[j] = (int32_t)sum;
     }
-    a_new[i] = ki;
-    memcpy(a, a_new, (size_t)(i + 1) * sizeof(int32_t));
 
     k_out[order] = ki;
     order++;
+    if (overflowed) {
+      break;
+    }
+
+    a_new[i] = ki;
+    memcpy(a, a_new, (size_t)(i + 1) * sizeof(int32_t));
   }
 
   // Require prediction gain >= 1.5 (i.e. 2*r[0] >= 3*error).

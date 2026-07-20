@@ -37,37 +37,26 @@ int psy_tilt_for_bitrate(uint32_t bitrate) {
   return (tilt < 15) ? 15 : tilt;
 }
 
-/*
- * EXP_Q7: the working format for exponent computation.
- *
- * 128 units per exponent index, matching fxp_log2_q8 output naturally:
- *   fxp_log2_q8(x) = log2(x) * 256 = 2*log2(x) * 128
- *
- * Since exp = round(2*log2(psd) + bias), and 2*log2 * 128 = log2 * 256,
- * the Q8 log output IS already in EXP_Q7.
- */
+// EXP_Q7: working format for exponent math, 128 units per exponent index.
+// Since exp = round(2*log2(psd) + bias) and 2*log2(x)*128 = log2(x)*256,
+// the Q8 output of fxp_log2_q8_u64 is already in EXP_Q7.
 #define EXP_Q7_FRAC_BITS 7
 #define EXP_Q7(x)        ((int32_t)((x) * 128.0 + 0.5))
 
 int psy_tilt_step_q7(int tilt_db) {
-  // Convert dB tilt to integer EXP_Q7 step per fine band.
-  // Tilt is defined in powers of 2: tilt[fb] = 2^(fb * step / 128).
-  // Total tilt = step * 46 / 128 exponent units ≈ step * 0.54 dB.
-  // Approximate: step ≈ tilt_db * 1.809, rounded to integer.
+  // dB tilt to per-fine-band step in EXP_Q7, spread over the 47 active
+  // fine bands at ~1.505 dB per exponent unit: step ~= tilt_db * 1.81
   return (tilt_db * 118612 + 32768) >> 16;
 }
 
-// Fine bands per coarse band (for division in step 5)
+// Fine bands per coarse band, divisor for the transient path
 static const uint8_t fb_per_coarse[PSY_N_BANDS] = {
     3, 5, 5, 5, 3, 2, 2, 2, 1, 2, 2, 1, 2, 2, 1, 2, 2, 1, 2, 2,
 };
 
-// Compute 20 coarse-band exponent indices from 47 fine-band PSDs. Analysis
-// is encoder-only; the decoder sees only the transmitted exponents. Two
-// refinements over a plain geometric per-band mean, both bypassed on
-// transient frames (synthesis uses flat steps there and attacks need a sharp
-// envelope): a 1-2-1 low-pass across fine-band PSDs, and hat-basis
-// aggregation (below). `transient` selects the geometric fallback path.
+// 20 coarse-band exponents from 47 fine-band PSDs. Non-transient frames get
+// 1-2-1 PSD smoothing + hat-basis aggregation; transient frames use a plain
+// geometric mean (flat synthesis steps, attacks need a sharp envelope).
 void psy_fine_band_exponents(const int32_t *spec_q31,
                              int loss_bits,
                              int tilt_step,
@@ -100,11 +89,9 @@ void psy_fine_band_exponents(const int32_t *spec_q31,
     }
   }
 
-  // Hat-basis aggregation: each fine band's log-PSD (tilt included) is
-  // scattered onto the two coarse band centers that straddle it, using the
-  // same linear weights quant_interp_bin_exp applies at synthesis — i.e.
-  // the analysis is the (mass-lumped) least-squares fit to the basis the
-  // quantizer reconstructs with.
+  // Hat-basis aggregation: split each fine band's log-PSD between the two
+  // nearest coarse band centers, mirroring the quantizer's per-bin
+  // interpolation weights.
   if (!transient) {
     int32_t centers[PSY_N_BANDS];
     for (int b = 0; b < PSY_N_BANDS; b++) {
@@ -115,8 +102,7 @@ void psy_fine_band_exponents(const int32_t *spec_q31,
     int32_t tilt_acc = 0;
     int k = 0;
     for (int fb = 0; fb < PSY_N_ACTIVE_FINE; fb++) {
-      int32_t lg =
-          ((psd[fb] == 0) ? 0 : fxp_log2_q8_u64(psd[fb])) + tilt_acc;
+      int32_t lg = ((psd[fb] == 0) ? 0 : fxp_log2_q8_u64(psd[fb])) + tilt_acc;
       tilt_acc += tilt_step;
       int x = (psy_fine_band_edges[fb] + psy_fine_band_edges[fb + 1]) >> 1;
       if (x <= centers[0]) {
@@ -145,7 +131,7 @@ void psy_fine_band_exponents(const int32_t *spec_q31,
     }
     return;
   }
-  // Transient frames fall through to the geometric path below.
+  // Transient path: plain geometric mean per coarse band
   int32_t log_sum[PSY_N_BANDS] = {0};
   int32_t tilt_acc = 0;
 

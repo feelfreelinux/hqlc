@@ -1,87 +1,40 @@
-"""Entropy coding: rANS with trained CDFs, Rice coding, bitstream I/O.
+"""
+Implements an rANS streaming encoder and some rice coding utilities.
 
-rANS (range variant of Asymmetric Numeral Systems) with M=1024 provides
-near-optimal compression with a simple streaming implementation. Each
-MDCT coefficient is coded as:
+An MDCT coefficient is coded as:
   - magnitude symbol: 0..14 literal, 15 = escape
   - optional Exp-Golomb(0) overflow for magnitudes >= 15
-  - optional sign bit (equi-probable)
+  - optional sign bit (equivalent probability)
 
-32 pre-trained frequency tables are indexed by alpha = K * BW[b] / gain,
-giving the encoder's CDF estimate. Adjacent bands are paired (10 pairs
-from 20 bands) to stabilize statistics.
+Table selection is alpha x activity, in order to capture per-band and per-gain variation
+  - 12 alpha bins x 4 activity bins = 48 tables
+  - Alpha: log2(gain * sigma_pair), covers gain and band-pair variation
+  - Activity: quantized non-zero fraction of the previous band (0-3)
+  - Both are available to the decoder for free, no cross-frame state
 
-Side information (exponents, TNS, NF masks) uses Rice coding with an
-optimal k parameter selected per block.
+Side information (exponents, TNS, noise factor) uses Rice or fixed-width fields
 """
 
-import bisect
 import math
 
 import numpy as np
 
-from .constants import BAND_EDGES, BAND_WEIGHTS, N_BANDS
+from .constants import BAND_EDGES
 
 # rANS constants
 RANS_M = 1024
 RANS_MAX_SYM = 16  # 0..14 magnitudes + 15 ESC
 RANS_L = 1 << 16
-_RANS_K = 1.65
 
+# Sign bit has equivalent probability
 _SIGN_FREQ = [512, 512]
 _SIGN_CF = [0, 512, 1024]
 
-# 32-bin alpha-indexed LUT
-_RANS_LUT_NBINS = 32
 
-_RANS_LUT_ALPHA_EDGES = [
-    0.120000, 0.137334, 0.157171, 0.179874, 0.205856, 0.235591, 0.269622,
-    0.308568, 0.353140, 0.404150, 0.462528, 0.529339, 0.605800, 0.693306,
-    0.793452, 0.908063, 1.039230, 1.189344, 1.361141, 1.557754, 1.782767,
-    2.040282, 2.334995, 2.672277, 3.058280, 3.500039, 4.005609, 4.584207,
-    5.246381, 6.004205, 6.871494, 7.864060, 9.000000,
-]
-
-_RANS_LUT_FREQ = [
-    [82, 113, 100, 88, 77, 68, 60, 53, 46, 41, 36, 31, 28, 24, 21, 156],
-    [93, 127, 110, 95, 82, 71, 61, 53, 45, 39, 34, 29, 25, 22, 19, 119],
-    [95, 119, 93, 77, 66, 59, 52, 47, 43, 40, 37, 35, 34, 33, 32, 162],
-    [120, 159, 130, 108, 89, 73, 60, 50, 41, 34, 28, 23, 19, 16, 13, 61],
-    [127, 150, 110, 89, 75, 64, 56, 50, 45, 41, 39, 36, 34, 31, 26, 51],
-    [151, 171, 126, 101, 83, 70, 60, 52, 46, 41, 35, 30, 22, 12, 7, 17],
-    [173, 199, 146, 115, 92, 73, 58, 46, 36, 28, 21, 16, 10, 6, 3, 2],
-    [182, 202, 147, 114, 90, 71, 57, 46, 38, 30, 18, 8, 5, 4, 3, 9],
-    [207, 227, 164, 122, 91, 68, 50, 36, 25, 14, 8, 5, 3, 1, 1, 2],
-    [225, 253, 183, 129, 89, 59, 38, 22, 11, 6, 3, 2, 1, 1, 1, 1],
-    [242, 273, 195, 130, 81, 47, 26, 13, 7, 3, 2, 1, 1, 1, 1, 1],
-    [274, 285, 194, 122, 71, 39, 19, 8, 4, 2, 1, 1, 1, 1, 1, 1],
-    [310, 311, 191, 107, 56, 26, 10, 4, 2, 1, 1, 1, 1, 1, 1, 1],
-    [334, 332, 189, 97, 43, 14, 5, 2, 1, 1, 1, 1, 1, 1, 1, 1],
-    [374, 351, 178, 75, 26, 8, 3, 1, 1, 1, 1, 1, 1, 1, 1, 1],
-    [421, 359, 158, 57, 15, 4, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1],
-    [460, 369, 137, 38, 8, 2, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1],
-    [517, 366, 108, 19, 3, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1],
-    [558, 362, 80, 11, 2, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1],
-    [615, 337, 54, 6, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1],
-    [674, 302, 33, 3, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1],
-    [736, 259, 16, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1],
-    [779, 223, 9, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1],
-    [834, 173, 4, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1],
-    [882, 127, 2, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1],
-    [925, 85, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1],
-    [953, 57, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1],
-    [981, 29, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1],
-    [990, 20, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1],
-    [1002, 8, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1],
-    [1006, 4, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1],
-    [1008, 2, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1],
-]
-
-
-# ── Bitstream I/O ──
-
+# Bit stream I/O
 class BitWriter:
     """Pack bits into bytes, MSB first."""
+
     __slots__ = ("_buf", "_byte", "_n")
 
     def __init__(self):
@@ -123,6 +76,7 @@ class BitWriter:
 
 class BitReader:
     """Read bits from bytes, MSB first."""
+
     __slots__ = ("_data", "_pos", "_bit")
 
     def __init__(self, data):
@@ -153,10 +107,9 @@ class BitReader:
         return self._pos * 8 + self._bit
 
 
-# ── rANS encoder / decoder ──
-
 class RANSEncoder:
-    """rANS encoder: M=1024, single stream, per-symbol CDF switching."""
+    """rANS encoder: M=1024, single stream"""
+
     __slots__ = ("_syms",)
 
     def __init__(self):
@@ -170,14 +123,17 @@ class RANSEncoder:
             return b""
         out = []
         state = RANS_L
+        # Encode in reverse so the decoder reads symbols in order (ANS is LIFO).
         for s, freq, cumfreq in reversed(self._syms):
             f = freq[s]
+            # Renormalization flushes low bytes so the encoding step won't overflow.
             while state >= f << 14:
                 out.append(state & 0xFF)
                 state >>= 8
+            # Fold symbol s into the state: state = (state/f)*M + state%f + cf.
             q, r = divmod(state, f)
             state = q * RANS_M + r + cumfreq[s]
-        for _ in range(4):
+        for _ in range(4):  # flush the final 4-byte state
             out.append(state & 0xFF)
             state >>= 8
         out.reverse()
@@ -185,23 +141,26 @@ class RANSEncoder:
 
 
 class RANSDecoder:
-    """rANS decoder: M=1024, single stream, per-symbol CDF switching."""
+    """rANS decoder: M=1024, single stream"""
+
     __slots__ = ("state", "_data", "_pos")
 
     def __init__(self, data):
         self._data = data
         self._pos = 0
         self.state = 0
+        # Get state from the encoder's 4-byte flush
         for _ in range(4):
             self.state = (self.state << 8) | self._data[self._pos]
             self._pos += 1
 
     def get(self, freq, cumfreq):
-        slot = self.state % RANS_M
+        slot = self.state % RANS_M  # low bits pick the symbol via its cf range
         s = 0
         while s < len(freq) - 1 and cumfreq[s + 1] <= slot:
             s += 1
         f = freq[s]
+        # Inverse of the encoding fold, then renormalize by pulling bytes back
         self.state = f * (self.state // RANS_M) + slot - cumfreq[s]
         while self.state < RANS_L and self._pos < len(self._data):
             self.state = (self.state << 8) | self._data[self._pos]
@@ -209,7 +168,77 @@ class RANSDecoder:
         return s
 
 
-# ── Table helpers ──
+# Alpha x activity rANS tables (12 x 4 = 48), trained on MUSDB18 and SQAM
+_RANS_ALPHA_NBINS = 12
+_RANS_ACT_NBINS = 4
+_RANS_NTABLES = 48
+_RANS_ALPHA_LO = -4.965784284662087
+_RANS_ALPHA_HI = 5.372394965238024
+_RANS_PAIR_SIGMA = [
+    0.863,
+    0.527,
+    0.238,
+    0.117,
+    0.073,
+    0.051,
+    0.030,
+    0.021,
+    0.011,
+    0.005,
+]
+_RANS_FREQ = [
+    [1009, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1],  # a=0 act=0
+    [1007, 3, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1],  # a=0 act=1
+    [64, 64, 64, 64, 64, 64, 64, 64, 64, 64, 64, 64, 64, 64, 64, 64],  # a=0 act=2
+    [64, 64, 64, 64, 64, 64, 64, 64, 64, 64, 64, 64, 64, 64, 64, 64],  # a=0 act=3
+    [995, 15, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1],  # a=1 act=0
+    [940, 70, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1],  # a=1 act=1
+    [917, 93, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1],  # a=1 act=2
+    [759, 245, 7, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1],  # a=1 act=3
+    [968, 42, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1],  # a=2 act=0
+    [906, 104, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1],  # a=2 act=1
+    [833, 171, 7, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1],  # a=2 act=2
+    [770, 226, 15, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1],  # a=2 act=3
+    [972, 38, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1],  # a=3 act=0
+    [828, 172, 11, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1],  # a=3 act=1
+    [729, 255, 27, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1],  # a=3 act=2
+    [671, 290, 47, 4, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1],  # a=3 act=3
+    [993, 16, 2, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1],  # a=4 act=0
+    [737, 220, 40, 12, 4, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1],  # a=4 act=1
+    [604, 332, 64, 11, 2, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1],  # a=4 act=2
+    [504, 393, 99, 16, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1],  # a=4 act=3
+    [1009, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1],  # a=5 act=0
+    [646, 207, 75, 37, 22, 13, 8, 5, 3, 2, 1, 1, 1, 1, 1, 1],  # a=5 act=1
+    [494, 320, 122, 46, 19, 9, 4, 2, 1, 1, 1, 1, 1, 1, 1, 1],  # a=5 act=2
+    [380, 380, 171, 60, 18, 5, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1],  # a=5 act=3
+    [1009, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1],  # a=6 act=0
+    [572, 199, 84, 49, 31, 22, 16, 12, 9, 7, 5, 4, 3, 2, 2, 7],  # a=6 act=1
+    [436, 270, 130, 72, 41, 25, 16, 10, 7, 5, 3, 2, 2, 1, 1, 3],  # a=6 act=2
+    [271, 305, 193, 114, 63, 34, 18, 10, 6, 3, 2, 1, 1, 1, 1, 1],  # a=6 act=3
+    [1009, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1],  # a=7 act=0
+    [453, 189, 89, 58, 40, 26, 21, 16, 15, 12, 12, 11, 9, 7, 8, 58],  # a=7 act=1
+    [339, 235, 126, 82, 57, 41, 29, 22, 17, 13, 10, 8, 7, 6, 5, 27],  # a=7 act=2
+    [185, 222, 166, 125, 92, 67, 49, 34, 24, 17, 12, 8, 6, 4, 3, 10],  # a=7 act=3
+    [765, 37, 28, 23, 21, 18, 17, 15, 13, 11, 10, 9, 8, 7, 6, 36],  # a=8 act=0
+    [310, 182, 101, 73, 58, 45, 29, 22, 21, 11, 12, 11, 8, 9, 8, 124],  # a=8 act=1
+    [223, 201, 128, 90, 69, 53, 43, 33, 26, 21, 16, 14, 11, 9, 8, 79],  # a=8 act=2
+    [135, 171, 138, 112, 91, 73, 59, 47, 38, 30, 24, 19, 15, 12, 10, 50],  # a=8 act=3
+    [597, 41, 36, 31, 26, 24, 22, 20, 19, 18, 17, 15, 14, 13, 12, 119],  # a=9 act=0
+    [105, 157, 92, 130, 66, 53, 26, 13, 1, 13, 26, 1, 26, 26, 1, 288],  # a=9 act=1
+    [109, 119, 89, 74, 66, 53, 47, 40, 35, 33, 30, 25, 22, 23, 19, 240],  # a=9 act=2
+    [78, 109, 97, 86, 77, 68, 61, 54, 48, 42, 37, 32, 28, 25, 21, 161],  # a=9 act=3
+    [382, 42, 40, 36, 32, 29, 26, 24, 23, 22, 21, 19, 19, 18, 17, 274],  # a=10 act=0
+    [1, 136, 136, 33, 67, 136, 67, 170, 1, 1, 34, 1, 1, 1, 1, 238],  # a=10 act=1
+    [45, 68, 55, 45, 44, 45, 37, 39, 29, 23, 26, 22, 21, 21, 19, 485],  # a=10 act=2
+    [45, 66, 62, 58, 54, 51, 48, 45, 42, 40, 37, 35, 32, 30, 28, 351],  # a=10 act=3
+    [207, 28, 29, 28, 27, 25, 23, 22, 21, 19, 18, 18, 17, 16, 16, 510],  # a=11 act=0
+    [64, 64, 64, 64, 64, 64, 64, 64, 64, 64, 64, 64, 64, 64, 64, 64],  # a=11 act=1
+    [20, 43, 38, 36, 25, 20, 14, 34, 20, 25, 23, 27, 25, 9, 9, 656],  # a=11 act=2
+    [24, 36, 35, 34, 33, 31, 30, 29, 28, 27, 26, 26, 25, 24, 23, 593],  # a=11 act=3
+]
+_RANS_CF = [None] * _RANS_NTABLES
+_RANS_COST_Q8 = [None] * _RANS_NTABLES
+
 
 def _cumfreq(freq):
     """Build cumulative frequency list from frequency array."""
@@ -219,44 +248,64 @@ def _cumfreq(freq):
     return cf
 
 
-def _lut_lookup(alpha):
-    """Look up LUT bin index for given alpha."""
-    idx = bisect.bisect_right(_RANS_LUT_ALPHA_EDGES, alpha) - 1
-    return max(0, min(_RANS_LUT_NBINS - 1, idx))
+# Pre-build CFs and cost tables
+for _bk in range(_RANS_NTABLES):
+    _RANS_CF[_bk] = _cumfreq(_RANS_FREQ[_bk])
+    _RANS_COST_Q8[_bk] = [
+        int(round(-math.log2(max(f, 1) / RANS_M) * 256.0)) for f in _RANS_FREQ[_bk]
+    ]
 
 
-def build_band_tables(gain):
-    """Build per-band rANS tables for a given gain.
+def _alpha_bin(band, gain):
+    """Compute alpha bin from band and gain. Decoder-symmetric."""
+    pair = band // 2
+    alpha = gain * _RANS_PAIR_SIGMA[pair]
+    la = math.log2(max(alpha, 1e-6))
+    idx = int(
+        (la - _RANS_ALPHA_LO) / (_RANS_ALPHA_HI - _RANS_ALPHA_LO) * _RANS_ALPHA_NBINS
+    )
+    return max(0, min(_RANS_ALPHA_NBINS - 1, idx))
 
-    Adjacent bands are paired. Returns (freq_lists, cf_lists, cost_tables).
+
+def _prev_band_activity(q_flat, band):
+    """Compute activity bin from previous band's decoded coefficients
+
+    Returns 0-3 based on non-zero fraction of band-1
     """
-    freq_lists = [None] * N_BANDS
-    cf_lists = [None] * N_BANDS
-    cost_tables = [None] * N_BANDS
-    clamped_gain = max(0.1, min(5.0, gain))
+    if band == 0:
+        return 0
+    s = BAND_EDGES[band - 1]
+    e = BAND_EDGES[band]
+    w = e - s
+    nz = int(np.count_nonzero(q_flat[s:e]))
+    frac = nz / w
+    if frac < 0.1:
+        return 0
+    elif frac < 0.3:
+        return 1
+    elif frac < 0.6:
+        return 2
+    else:
+        return 3
 
-    for pi in range(N_BANDS // 2):
-        b0, b1 = 2 * pi, 2 * pi + 1
-        bw0 = BAND_EDGES[b0 + 1] - BAND_EDGES[b0]
-        bw1 = BAND_EDGES[b1 + 1] - BAND_EDGES[b1]
-        a0 = _RANS_K * BAND_WEIGHTS[b0] / clamped_gain
-        a1 = _RANS_K * BAND_WEIGHTS[b1] / clamped_gain
-        pair_alpha = (a0 * bw0 + a1 * bw1) / (bw0 + bw1)
-        bin_idx = _lut_lookup(pair_alpha)
 
-        freq_l = _RANS_LUT_FREQ[bin_idx]
-        freq = np.array(freq_l, dtype=np.int32)
-        cf = _cumfreq(freq)
-        cost_q8 = np.array([
-            int(round(-math.log2(max(f, 1) / RANS_M) * 256.0)) for f in freq
-        ], dtype=np.int32)
+def rans_table_idx(band, gain, activity):
+    """Compute the rANS probability table index.
 
-        for b in (b0, b1):
-            freq_lists[b] = freq_l
-            cf_lists[b] = cf
-            cost_tables[b] = cost_q8
+    table_idx = alpha_bin * N_ACT + activity_bin.
+    Both alpha and activity are decoder-symmetric.
+    """
+    abin = _alpha_bin(band, gain)
+    return abin * _RANS_ACT_NBINS + activity
 
-    return freq_lists, cf_lists, cost_tables
+
+def get_rans_tables(table_idx):
+    """Return (freq, cf, cost_q8) for a rANS probability table index."""
+    return (
+        _RANS_FREQ[table_idx],
+        _RANS_CF[table_idx],
+        _RANS_COST_Q8[table_idx],
+    )
 
 
 def coeff_cost_q8(cost_q8, value):
@@ -274,8 +323,7 @@ def coeff_cost_q8(cost_q8, value):
     return c
 
 
-# ── Rice coding helpers ──
-
+# Rice helpers
 def zigzag_enc(val):
     return ((-val << 1) - 1) if val < 0 else (val << 1)
 

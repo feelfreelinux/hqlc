@@ -15,14 +15,16 @@ mkdir build && cd build
 cmake .. -DHQLC_TOOLS=ON -GNinja && ninja
 ```
 
-This produces `hqlc_enc`, a simple encode/decode tool:
+This produces `hqlc`, the CLI tool:
 
 ```
-hqlc_enc input.wav output.wav -b 96000    # rate-controlled at 96 kbps
-hqlc_enc input.wav output.wav -g 2.0      # fixed gain
+hqlc input.wav output.wav -b 96000         # roundtrip at 96 kbps (for ABX testing)
+hqlc -e input.wav output.hqlc -b 128000    # encode to bitstream
+hqlc -d output.hqlc decoded.wav            # decode bitstream to WAV
+ffmpeg -i in.flac -f wav - | hqlc - out.wav  # pipe from ffmpeg
 ```
 
-The public API is in [`include/hqlc.h`](include/hqlc.h) and should be self-descriptive. See [`src/hqlc_enc.c`](src/hqlc_enc.c) for a complete usage example. For ESP-IDF integration, there's a sample component and linker script in `benchmark/esp-bench/components/hqlc`.
+The public API is in [`include/hqlc.h`](include/hqlc.h) and should be self-descriptive. See [`src/hqlc_cli.c`](src/hqlc_cli.c) for a complete usage example. For ESP-IDF integration, there's a sample component and linker script in `benchmark/esp-bench/components/hqlc`.
 
 ## Python reference
 
@@ -53,41 +55,39 @@ The current implementation has no SIMD/NEON optimizations since ESP32 was the pr
 
 ### Memory and code size
 
-The encoder needs ~15 KB of RAM (3 KB state + 12 KB scratch) and the decoder ~16 KB (4 KB state + 12 KB scratch). The compiled library is about 27 KB on ESP32 (`-Os`), keeping the overall footprint small enough for memory-constrained targets.
+The encoder needs ~13.5 KB of RAM (~3.2 KB state + ~10.2 KB scratch) and the decoder ~10 KB (~2 KB state + ~8.2 KB scratch). The compiled library is about 27 KB on ESP32 (`-Os`), keeping the overall footprint small enough for memory-constrained targets.
 
-### Audio quality (ViSQOL MOS)
+### Audio quality (ViSQOL + Zimtohrli MOS)
 
-All codecs at 96 kbps stereo 48 kHz, scored with ViSQOL, higher is better.
+All codecs at 96 kbps stereo 48 kHz, scored with ViSQOL and Zimtohrli. Both are MOS-like objective metrics, higher is better. Rows are sorted by ViSQOL mean.
 
 **MUSDB18** (50 tracks, real mixed-style music):
 
-| Codec | Mean | Min | Max |
-|-------|------|-----|-----|
-| HQLC | 4.615 | 4.442 | 4.718 |
-| LC3 | 4.522 | 4.051 | 4.705 |
-| Opus | 4.506 | 4.111 | 4.711 |
-| AAC | 4.499 | 4.193 | 4.710 |
-| MP3 | 4.107 | 3.390 | 4.724 |
+| Codec | ViSQOL | (min–max) | Zim | (min–max) |
+|-------|--------|-----------|-----|-----------|
+| HQLC | 4.613 | 4.367–4.725 | 4.732 | 4.578–4.881 |
+| LC3 | 4.522 | 4.051–4.705 | 4.751 | 4.638–4.867 |
+| Opus | 4.506 | 4.111–4.711 | 4.850 | 4.755–4.930 |
+| AAC | 4.439 | 4.082–4.726 | 4.804 | 4.612–4.946 |
+| MP3 | 4.107 | 3.390–4.724 | 4.412 | 3.729–4.904 |
 
 **SQAM** (70 tracks, harder recordings):
 
-| Codec | Mean | Min | Max |
-|-------|------|-----|-----|
-| HQLC | 4.633 | 4.093 | 4.732 |
-| Opus | 4.570 | 4.061 | 4.732 |
-| LC3 | 4.516 | 3.972 | 4.732 |
-| AAC | 4.437 | 3.671 | 4.732 |
-| MP3 | 4.210 | 3.082 | 4.732 |
-
-HQLC scores highest on both datasets, but take this with a grain of salt. ViSQOL is an objective metric and likely doesn't fully capture artifacts like pre-echo, where codecs with more sophisticated psychoacoustic models (like Opus) may do better in practice. With that said, the scores do suggest that HQLC is quite competetive there. I should probably prepare an ABX test.
+| Codec | ViSQOL | (min–max) | Zim | (min–max) |
+|-------|--------|-----------|-----|-----------|
+| HQLC | 4.650 | 4.221–4.732 | 4.847 | 4.379–4.999 |
+| Opus | 4.570 | 4.061–4.732 | 4.895 | 4.642–5.000 |
+| LC3 | 4.516 | 3.972–4.732 | 4.778 | 2.893–4.995 |
+| AAC | 4.410 | 3.637–4.732 | 4.882 | 4.688–5.000 |
+| MP3 | 4.210 | 3.082–4.732 | 4.690 | 4.032–5.000 |
 
 ## Test clips
 
 The `test-clips/` directory contains short audio clips under open licenses, intended as freely redistributable replacements for the hard-case tracks from SQAM (which can't be included in the repo). These are used for CI regression tests with ViSQOL.
 
-- `bass_guitar.wav` — Serolillo, [CC BY 2.5](https://creativecommons.org/licenses/by/2.5), via Wikimedia Commons
-- `flamenco_percussion.wav` — from [Freesound](https://freesound.org)
-- Remaining clips — classical recordings from [Musopen](https://musopen.org) (public domain)
+- `bass_guitar.wav`: Serolillo, [CC BY 2.5](https://creativecommons.org/licenses/by/2.5), via Wikimedia Commons
+- `flamenco_percussion.wav`: from [Freesound](https://freesound.org)
+- Remaining clips: classical recordings from [Musopen](https://musopen.org) (public domain)
 
 ## License
 

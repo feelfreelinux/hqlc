@@ -1,4 +1,4 @@
-// hqlc — HQLC codec CLI tool.
+// hqlc - HQLC codec CLI tool.
 //
 // Usage:
 //   hqlc [options] input output
@@ -43,7 +43,7 @@
 //   [0..1]   payload_len (LE16)
 //   [2..]    payload
 
-#define HQLC_FILE_VERSION 1
+#define HQLC_FILE_VERSION  1
 #define HQLC_FILE_HDR_SIZE 16
 
 // ── Helpers ──────────────────────────────────────────────────────────────
@@ -65,8 +65,8 @@ static uint16_t get_le16(const uint8_t *p) {
 }
 
 static uint32_t get_le32(const uint8_t *p) {
-  return (uint32_t)p[0] | ((uint32_t)p[1] << 8) |
-         ((uint32_t)p[2] << 16) | ((uint32_t)p[3] << 24);
+  return (uint32_t)p[0] | ((uint32_t)p[1] << 8) | ((uint32_t)p[2] << 16) |
+         ((uint32_t)p[3] << 24);
 }
 
 static int is_stdio(const char *path) {
@@ -90,31 +90,49 @@ static uint8_t *read_all(const char *path, size_t *out_len) {
   } else {
     f = fopen(path, "rb");
   }
-  if (!f) return NULL;
+  if (!f) {
+    return NULL;
+  }
 
   size_t cap = 1 << 20, len = 0;
   uint8_t *buf = (uint8_t *)malloc(cap);
-  if (!buf) { if (!is_stdio(path)) fclose(f); return NULL; }
+  if (!buf) {
+    if (!is_stdio(path)) {
+      fclose(f);
+    }
+    return NULL;
+  }
 
   while (1) {
     if (len == cap) {
       cap *= 2;
       uint8_t *tmp = (uint8_t *)realloc(buf, cap);
-      if (!tmp) { free(buf); if (!is_stdio(path)) fclose(f); return NULL; }
+      if (!tmp) {
+        free(buf);
+        if (!is_stdio(path)) {
+          fclose(f);
+        }
+        return NULL;
+      }
       buf = tmp;
     }
     size_t n = fread(buf + len, 1, cap - len, f);
     len += n;
-    if (n == 0) break;
+    if (n == 0) {
+      break;
+    }
   }
 
-  if (!is_stdio(path)) fclose(f);
+  if (!is_stdio(path)) {
+    fclose(f);
+  }
   *out_len = len;
   return buf;
 }
 
 // Read WAV from file or stdin, converting to interleaved s16.
-static int read_wav(const char *path, int *out_ch, int32_t *out_n_frames, int16_t **out_data) {
+static int
+read_wav(const char *path, int *out_ch, int32_t *out_n_frames, int16_t **out_data) {
   uint8_t *mem = NULL;
   size_t mem_len = 0;
   drwav wav;
@@ -122,18 +140,24 @@ static int read_wav(const char *path, int *out_ch, int32_t *out_n_frames, int16_
 
   if (is_stdio(path)) {
     mem = read_all(path, &mem_len);
-    if (!mem) return -1;
+    if (!mem) {
+      return -1;
+    }
     ok = drwav_init_memory(&wav, mem, mem_len, NULL);
   } else {
     ok = drwav_init_file(&wav, path, NULL);
   }
-  if (!ok) { free(mem); return -1; }
+  if (!ok) {
+    free(mem);
+    return -1;
+  }
 
   if (wav.sampleRate != HQLC_SAMPLE_RATE) {
     fprintf(stderr,
             "error: sample rate must be %d Hz (got %u Hz)\n"
             "  hint: resample with  ffmpeg -i input -ar 48000 output.wav\n",
-            HQLC_SAMPLE_RATE, wav.sampleRate);
+            HQLC_SAMPLE_RATE,
+            wav.sampleRate);
     drwav_uninit(&wav);
     free(mem);
     return -1;
@@ -148,7 +172,11 @@ static int read_wav(const char *path, int *out_ch, int32_t *out_n_frames, int16_
   *out_ch = (int)wav.channels;
   *out_n_frames = (int32_t)wav.totalPCMFrameCount;
   *out_data = (int16_t *)malloc((size_t)*out_n_frames * *out_ch * sizeof(int16_t));
-  if (!*out_data) { drwav_uninit(&wav); free(mem); return -1; }
+  if (!*out_data) {
+    drwav_uninit(&wav);
+    free(mem);
+    return -1;
+  }
 
   drwav_read_pcm_frames_s16(&wav, wav.totalPCMFrameCount, *out_data);
   drwav_uninit(&wav);
@@ -157,7 +185,8 @@ static int read_wav(const char *path, int *out_ch, int32_t *out_n_frames, int16_
 }
 
 // Write interleaved s16 PCM to WAV file or stdout.
-static int write_wav(const char *path, const int16_t *data, int32_t n_pcm_frames, int ch) {
+static int
+write_wav(const char *path, const int16_t *data, int32_t n_pcm_frames, int ch) {
   drwav_data_format fmt = {0};
   fmt.container = drwav_container_riff;
   fmt.format = DR_WAVE_FORMAT_PCM;
@@ -170,7 +199,9 @@ static int write_wav(const char *path, const int16_t *data, int32_t n_pcm_frames
     // Write to memory buffer, then dump to stdout
     void *wav_buf = NULL;
     size_t wav_len = 0;
-    if (!drwav_init_memory_write(&wav, &wav_buf, &wav_len, &fmt, NULL)) return -1;
+    if (!drwav_init_memory_write(&wav, &wav_buf, &wav_len, &fmt, NULL)) {
+      return -1;
+    }
     drwav_write_pcm_frames(&wav, (drwav_uint64)n_pcm_frames, data);
     drwav_uninit(&wav);
     set_binary_mode(stdout);
@@ -178,7 +209,9 @@ static int write_wav(const char *path, const int16_t *data, int32_t n_pcm_frames
     fflush(stdout);
     drwav_free(wav_buf, NULL);
   } else {
-    if (!drwav_init_file_write(&wav, path, &fmt, NULL)) return -1;
+    if (!drwav_init_file_write(&wav, path, &fmt, NULL)) {
+      return -1;
+    }
     drwav_write_pcm_frames(&wav, (drwav_uint64)n_pcm_frames, data);
     drwav_uninit(&wav);
   }
@@ -187,8 +220,8 @@ static int write_wav(const char *path, const int16_t *data, int32_t n_pcm_frames
 
 // ── Encode: WAV → .hqlc ─────────────────────────────────────────────────
 
-static int do_encode(const char *in, const char *out,
-                     hqlc_mode mode, uint32_t bitrate, float gain) {
+static int
+do_encode(const char *in, const char *out, hqlc_mode mode, uint32_t bitrate, float gain) {
   int ch;
   int32_t total_pcm;
   int16_t *pcm;
@@ -206,14 +239,20 @@ static int do_encode(const char *in, const char *out,
 
   hqlc_encoder *enc = (hqlc_encoder *)calloc(1, hqlc_encoder_size());
   hqlc_encoder_config cfg = {
-      .channels = (uint8_t)ch, .sample_rate = HQLC_SAMPLE_RATE, .mode = mode,
+      .channels = (uint8_t)ch,
+      .sample_rate = HQLC_SAMPLE_RATE,
+      .mode = mode,
   };
-  if (mode == HQLC_MODE_RC) cfg.bitrate = bitrate;
-  else cfg.gain = gain;
+  if (mode == HQLC_MODE_RC) {
+    cfg.bitrate = bitrate;
+  } else {
+    cfg.gain = gain;
+  }
 
   if (hqlc_encoder_init(enc, &cfg) != HQLC_OK) {
     fprintf(stderr, "error: encoder init failed\n");
-    free(pcm); free(enc);
+    free(pcm);
+    free(enc);
     return 1;
   }
   void *scratch = calloc(1, hqlc_encoder_scratch_size());
@@ -228,7 +267,9 @@ static int do_encode(const char *in, const char *out,
   }
   if (!fout) {
     fprintf(stderr, "error: cannot write '%s'\n", out);
-    free(pcm); free(enc); free(scratch);
+    free(pcm);
+    free(enc);
+    free(scratch);
     return 1;
   }
 
@@ -250,8 +291,12 @@ static int do_encode(const char *in, const char *out,
         enc, fp, HQLC_PCM16, compressed, HQLC_MAX_FRAME_BYTES, &comp_len, scratch);
     if (err != HQLC_OK) {
       fprintf(stderr, "error: encode failed at frame %d\n", f);
-      if (!is_stdio(out)) fclose(fout);
-      free(pcm); free(enc); free(scratch);
+      if (!is_stdio(out)) {
+        fclose(fout);
+      }
+      free(pcm);
+      free(enc);
+      free(scratch);
       return 1;
     }
     total_bytes += comp_len;
@@ -260,7 +305,9 @@ static int do_encode(const char *in, const char *out,
     fwrite(frame_hdr, 1, 2, fout);
     fwrite(compressed, 1, comp_len, fout);
   }
-  if (!is_stdio(out)) fclose(fout);
+  if (!is_stdio(out)) {
+    fclose(fout);
+  }
 
   float duration = (float)(n_frames * HQLC_FRAME_SAMPLES) / HQLC_SAMPLE_RATE;
   float avg_bps = (float)(total_bytes * 8) / duration;
@@ -269,7 +316,9 @@ static int do_encode(const char *in, const char *out,
   fprintf(stderr, "  %d frames, %.2fs, %dch\n", n_frames, duration, ch);
   fprintf(stderr, "  avg bitrate: %.0f bps (%.1f:1)\n", avg_bps, raw_bps / avg_bps);
 
-  free(pcm); free(enc); free(scratch);
+  free(pcm);
+  free(enc);
+  free(scratch);
   return 0;
 }
 
@@ -317,7 +366,8 @@ static int do_decode(const char *in, const char *out) {
   hqlc_decoder *dec = (hqlc_decoder *)calloc(1, hqlc_decoder_size());
   if (hqlc_decoder_init(dec, (uint8_t)ch, HQLC_SAMPLE_RATE) != HQLC_OK) {
     fprintf(stderr, "error: decoder init failed\n");
-    free(file_data); free(dec);
+    free(file_data);
+    free(dec);
     return 1;
   }
   void *scratch = calloc(1, hqlc_decoder_scratch_size());
@@ -329,14 +379,20 @@ static int do_decode(const char *in, const char *out) {
   for (uint32_t f = 0; f < n_frames; f++) {
     if (pos + 2 > file_len) {
       fprintf(stderr, "error: truncated .hqlc at frame %u\n", f);
-      free(file_data); free(dec); free(scratch); free(pcm_out);
+      free(file_data);
+      free(dec);
+      free(scratch);
+      free(pcm_out);
       return 1;
     }
     uint16_t frame_len = get_le16(file_data + pos);
     pos += 2;
     if (pos + frame_len > file_len) {
       fprintf(stderr, "error: truncated .hqlc at frame %u\n", f);
-      free(file_data); free(dec); free(scratch); free(pcm_out);
+      free(file_data);
+      free(dec);
+      free(scratch);
+      free(pcm_out);
       return 1;
     }
 
@@ -345,7 +401,10 @@ static int do_decode(const char *in, const char *out) {
         hqlc_decode_frame(dec, file_data + pos, frame_len, dp, HQLC_PCM16, scratch);
     if (err != HQLC_OK) {
       fprintf(stderr, "error: decode failed at frame %u\n", f);
-      free(file_data); free(dec); free(scratch); free(pcm_out);
+      free(file_data);
+      free(dec);
+      free(scratch);
+      free(pcm_out);
       return 1;
     }
     total_bytes += frame_len;
@@ -358,7 +417,10 @@ static int do_decode(const char *in, const char *out) {
 
   if (write_wav(out, trimmed, (int32_t)(out_frames * HQLC_FRAME_SAMPLES), ch) != 0) {
     fprintf(stderr, "error: cannot write '%s'\n", out);
-    free(file_data); free(dec); free(scratch); free(pcm_out);
+    free(file_data);
+    free(dec);
+    free(scratch);
+    free(pcm_out);
     return 1;
   }
 
@@ -368,14 +430,17 @@ static int do_decode(const char *in, const char *out) {
   fprintf(stderr, "  %u frames, %.2fs, %dch\n", n_frames, duration, ch);
   fprintf(stderr, "  avg bitrate: %.0f bps\n", avg_bps);
 
-  free(file_data); free(dec); free(scratch); free(pcm_out);
+  free(file_data);
+  free(dec);
+  free(scratch);
+  free(pcm_out);
   return 0;
 }
 
 // ── Roundtrip: WAV → encode → decode → WAV ──────────────────────────────
 
-static int do_roundtrip(const char *in, const char *out,
-                        hqlc_mode mode, uint32_t bitrate, float gain) {
+static int do_roundtrip(
+    const char *in, const char *out, hqlc_mode mode, uint32_t bitrate, float gain) {
   int ch;
   int32_t total_pcm;
   int16_t *pcm = NULL;
@@ -392,7 +457,8 @@ static int do_roundtrip(const char *in, const char *out,
 
   int n_frames = total_pcm / HQLC_FRAME_SAMPLES;
   if (n_frames < 2) {
-    fprintf(stderr, "error: file too short (need >= %d samples)\n", HQLC_FRAME_SAMPLES * 2);
+    fprintf(
+        stderr, "error: file too short (need >= %d samples)\n", HQLC_FRAME_SAMPLES * 2);
     goto cleanup;
   }
 
@@ -400,13 +466,19 @@ static int do_roundtrip(const char *in, const char *out,
   dec = (hqlc_decoder *)calloc(1, hqlc_decoder_size());
   enc_scratch = calloc(1, hqlc_encoder_scratch_size());
   dec_scratch = calloc(1, hqlc_decoder_scratch_size());
-  pcm_out = (int16_t *)calloc((size_t)n_frames * HQLC_FRAME_SAMPLES * ch, sizeof(int16_t));
+  pcm_out =
+      (int16_t *)calloc((size_t)n_frames * HQLC_FRAME_SAMPLES * ch, sizeof(int16_t));
 
   hqlc_encoder_config cfg = {
-      .channels = (uint8_t)ch, .sample_rate = HQLC_SAMPLE_RATE, .mode = mode,
+      .channels = (uint8_t)ch,
+      .sample_rate = HQLC_SAMPLE_RATE,
+      .mode = mode,
   };
-  if (mode == HQLC_MODE_RC) cfg.bitrate = bitrate;
-  else cfg.gain = gain;
+  if (mode == HQLC_MODE_RC) {
+    cfg.bitrate = bitrate;
+  } else {
+    cfg.gain = gain;
+  }
 
   if (hqlc_encoder_init(enc, &cfg) != HQLC_OK) {
     fprintf(stderr, "error: encoder init failed\n");
@@ -454,14 +526,22 @@ static int do_roundtrip(const char *in, const char *out,
   fprintf(stderr, "%s -> %s\n", in, out);
   fprintf(stderr, "  %d frames, %.2fs, %dch\n", n_frames, duration, ch);
   fprintf(stderr, "  mode: %s", mode == HQLC_MODE_RC ? "RC" : "fixed");
-  if (mode == HQLC_MODE_RC) fprintf(stderr, " (target %u bps)", bitrate);
-  else fprintf(stderr, " (gain %.2f)", gain);
+  if (mode == HQLC_MODE_RC) {
+    fprintf(stderr, " (target %u bps)", bitrate);
+  } else {
+    fprintf(stderr, " (gain %.2f)", gain);
+  }
   fprintf(stderr, "\n");
   fprintf(stderr, "  avg bitrate: %.0f bps (%.1f:1)\n", avg_bps, raw_bps / avg_bps);
   ret = 0;
 
 cleanup:
-  free(pcm); free(enc); free(dec); free(enc_scratch); free(dec_scratch); free(pcm_out);
+  free(pcm);
+  free(enc);
+  free(dec);
+  free(enc_scratch);
+  free(dec_scratch);
+  free(pcm_out);
   return ret;
 }
 
@@ -524,9 +604,12 @@ int main(int argc, char **argv) {
   }
 
   switch (op) {
-    case OP_ENCODE:    return do_encode(input_path, output_path, mode, bitrate, gain);
-    case OP_DECODE:    return do_decode(input_path, output_path);
-    case OP_ROUNDTRIP: return do_roundtrip(input_path, output_path, mode, bitrate, gain);
+  case OP_ENCODE:
+    return do_encode(input_path, output_path, mode, bitrate, gain);
+  case OP_DECODE:
+    return do_decode(input_path, output_path);
+  case OP_ROUNDTRIP:
+    return do_roundtrip(input_path, output_path, mode, bitrate, gain);
   }
   return 1;
 }
