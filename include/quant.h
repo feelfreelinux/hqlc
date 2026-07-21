@@ -15,7 +15,7 @@ extern "C" {
 #define QUANT_GAIN_Q        8
 #define QUANT_GAIN_BIAS     27
 #define QUANT_GAIN_MAX_CODE 127
-#define QUANT_GAIN_RC_MAX   67 // GAIN_BIAS + GAIN_Q * 5
+#define QUANT_GAIN_RC_MAX   75 // GAIN_BIAS + GAIN_Q * 6
 
 // Step exponent offset: E = 2*exp - gain_code - 59
 // step = 2^(E/8), split into octave + fractional pow2 LUT
