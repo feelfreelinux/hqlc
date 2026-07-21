@@ -61,9 +61,9 @@ The current implementation has no SIMD/NEON optimizations since ESP32 was the pr
 
 The encoder needs ~13.5 KB of RAM (~3.2 KB state + ~10.2 KB scratch) and the decoder ~10 KB (~2 KB state + ~8.2 KB scratch). The compiled library is about 27 KB on ESP32 (`-Os`), keeping the overall footprint small enough for memory-constrained targets.
 
-### Audio quality (ViSQOL + Zimtohrli MOS)
+### MOS metrics
 
-All codecs at 96 kbps stereo 48 kHz, scored with ViSQOL and Zimtohrli. Both are MOS-like objective metrics, higher is better. Rows are sorted by ViSQOL mean.
+All codecs at 96 kbps stereo 48 kHz, scored with ViSQOL and Zimtohrli. Both are MOS-like metrics, higher is better. Rows are sorted by ViSQOL mean.
 
 **MUSDB18** (50 tracks, real mixed-style music):
 
@@ -84,6 +84,8 @@ All codecs at 96 kbps stereo 48 kHz, scored with ViSQOL and Zimtohrli. Both are 
 | LC3 | 4.516 | 3.972–4.732 | 4.778 | 2.893–4.995 |
 | AAC | 4.410 | 3.637–4.732 | 4.882 | 4.688–5.000 |
 | MP3 | 4.210 | 3.082–4.732 | 4.690 | 4.032–5.000 |
+
+Both ViSQOL and Zim are just rough proxies for audio quality, and shouldn't be interpreted as HQLC being better than those codecs.
 
 ## Test clips
 
