@@ -43,7 +43,7 @@
 //   [0..1]   payload_len (LE16)
 //   [2..]    payload
 
-#define HQLC_FILE_VERSION  1
+#define HQLC_FILE_VERSION 2
 #define HQLC_FILE_HDR_SIZE 16
 
 /* Helpers */

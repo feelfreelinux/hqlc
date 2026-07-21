@@ -107,10 +107,9 @@ rans_enc_sym(hqlc_rans_enc *enc, uint16_t f, uint32_t rcp, uint16_t cf) {
 }
 
 size_t rans_enc_flush(hqlc_rans_enc *enc) {
-  // Emit the 4-byte final state, then left-align the stream to buf[0]
+  // Emit the 3-byte final state (renorm keeps state < 1 << 24), then
+  // left-align the stream to buf[0]
   uint32_t state = enc->state;
-  enc->buf[--enc->pos] = (uint8_t)(state & 0xFF);
-  state >>= 8;
   enc->buf[--enc->pos] = (uint8_t)(state & 0xFF);
   state >>= 8;
   enc->buf[--enc->pos] = (uint8_t)(state & 0xFF);
@@ -129,7 +128,7 @@ void rans_dec_init(hqlc_rans_dec *dec, const uint8_t *buf, size_t len) {
   dec->pos = 0;
   dec->state = 0;
   dec->overrun = false;
-  for (int i = 0; i < 4 && dec->pos < len; i++) {
+  for (int i = 0; i < 3 && dec->pos < len; i++) {
     dec->state = (dec->state << 8) | buf[dec->pos++];
   }
 }

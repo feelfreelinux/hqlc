@@ -233,6 +233,8 @@ static int probe_frame_bits(const int32_t *spec_q31,
         }
       }
       HQLC_BENCH_END(HQLC_BENCH_ENC_PROBE_BAND);
+      // Also count zero's as cost (symbol 0 per bin)
+      total_q8 += (int32_t)cost[0] * (w - nz);
       prev_nz = nz;
       prev_w = w;
     }
@@ -514,15 +516,17 @@ hqlc_error hqlc_encode_frame(hqlc_encoder *enc,
   // RC state update
   if (enc->mode == HQLC_MODE_RC) {
     int frame_bits = (int)(*out_len * 8);
-    // Only update res_bits for non-quiet frames
+    // Quiet frames bank reservoir credit
+    enc->res_bits += target_bpf - frame_bits;
+    enc->res_bits = fxp_clamp_i32(enc->res_bits, -(2 * target_bpf), 2 * target_bpf);
+
+    // Don't update gain EMA for quiet frames
     if (!quiet_frame) {
-      enc->res_bits += target_bpf - frame_bits;
-      enc->res_bits = fxp_clamp_i32(enc->res_bits, -(2 * target_bpf), 2 * target_bpf);
       // Gain EMA, alpha = 1/16
       enc->ema_gain_q8 += ((gain_code << 8) - enc->ema_gain_q8) >> 4;
     }
     enc->prev_gain_code = gain_code;
-    enc->prev_side_bits = (int)(side_bytes * 8) + 32; // +32: rANS state flush overhead
+    enc->prev_side_bits = (int)(side_bytes * 8) + 24; // +24: rANS state flush overhead
   }
 
   return HQLC_OK;

@@ -11,7 +11,7 @@ import numpy as np
 from .constants import FRAME_LEN
 
 TNS_MAX_ORDER = 4
-TNS_MAX_K = 0.75
+TNS_MAX_K = 0.92
 TNS_PRED_GAIN_THR = 1.5
 TNS_K_BITS = 4
 TNS_LAR_MAX = 3.5
@@ -169,6 +169,9 @@ def analyze(X):
     Returns (order, k_dequantized, q_indices, side_bits).
     """
     r = _autocorrelation(X[TNS_START_BIN:], TNS_MAX_ORDER)
+    # Gaussian lag window (b = 0.03), mirrors the c codec
+    lag = np.arange(1, TNS_MAX_ORDER + 1)
+    r[1:] = r[1:] * np.exp(-0.5 * (2.0 * np.pi * 0.03 * lag) ** 2)
     k_raw, order, pred_gain = _levinson_durbin(r, TNS_MAX_ORDER)
 
     if order == 0 or pred_gain < TNS_PRED_GAIN_THR:
