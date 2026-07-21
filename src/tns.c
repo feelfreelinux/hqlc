@@ -6,9 +6,18 @@
 #include "pcm.h"
 
 // TNS parameters
-#define TNS_MAX_K_Q30    Q30(0.75)
+#define TNS_MAX_K_Q30    Q30(0.92)
 #define TNS_K_THRESH_Q30 Q30(0.1)
 #define TNS_K_CLAMP_Q30  Q30(0.999)
+
+// Gaussian lag window w[k] = exp(-0.5 * (2*pi*0.03*k)^2), Q30
+// Smooths the envelope shape a bit, fitting more attack shape itself
+static const int32_t tns_lag_win_q30[TNS_MAX_ORDER] = {
+    1054834932,
+    1000088432,
+    915085284,
+    808079344,
+};
 
 // Dequant LUT, k = tanh(q * 0.25), Q30, index = q + 7
 const int32_t tns_k_dq_q30[15] = {
@@ -163,6 +172,11 @@ static int tns_levinson_durbin(const int64_t *r_raw, int max_order, int32_t *k_o
 
   if (r[0] <= 0) {
     return 0;
+  }
+
+  for (int k = 1; k <= max_order; k++) {
+    // Apply lag window to the autocorrelation values
+    r[k] = (int32_t)(((int64_t)r[k] * tns_lag_win_q30[k - 1]) >> 30);
   }
 
   int32_t error = r[0];
@@ -339,25 +353,33 @@ void tns_lattice_iir(
 
 /**
  * @brief Estimate pre-shift needed to prevent lattice overflow.
- *
- * Lattice gain ~ 1/(1 - max|k|).  Returns ceil(log2(gain)) + 1.
  */
-static int tns_preshift(const int32_t *k_q30, int order) {
-  int32_t max_abs_k = 0;
+static int tns_preshift(const int32_t *k_q30, int order, bool iir) {
+  int64_t gain_q30 = 1 << 30;
+  int bits = 0;
+
   for (int i = 0; i < order; i++) {
     int32_t ak = k_q30[i] < 0 ? -k_q30[i] : k_q30[i];
-    if (ak > max_abs_k) {
-      max_abs_k = ak;
+    if (iir) {
+      int32_t denom = (1 << 30) - ak;
+      if (denom <= 0) {
+        return 15; // near-unit pole
+      }
+      gain_q30 = (gain_q30 << 30) / denom;
+    } else {
+      gain_q30 = (gain_q30 * (((int64_t)1 << 30) + ak)) >> 30;
+    }
+    // Renormalize to [2^30, 2^31) so the Q30 math never overflows
+    while (gain_q30 >= ((int64_t)1 << 31)) {
+      gain_q30 >>= 1;
+      bits++;
+    }
+    if (bits >= 15) {
+      return 15;
     }
   }
 
-  int32_t denom = (1 << 30) - max_abs_k;
-  if (denom <= 0) {
-    return 15; // near-unit pole
-  }
-
-  int gain_bits = 31 - __builtin_clz((uint32_t)((1 << 30) / denom));
-  return gain_bits + 1;
+  return bits + (gain_q30 > (1 << 30) ? 1 : 0) + 1;
 }
 
 // Renormalize spectrum after filtering, reclaiming unused headroom
@@ -374,7 +396,7 @@ int tns_fir_safe(int32_t *spec_q31, const int32_t *k_q30, int order) {
     return 0;
   }
 
-  int preshift = tns_preshift(k_q30, order);
+  int preshift = tns_preshift(k_q30, order, false);
   int hr;
   tns_lattice_fir(spec_q31, k_q30, order, preshift, &hr);
   tns_renormalize(spec_q31, hr);
@@ -386,7 +408,7 @@ int tns_iir_safe(int32_t *spec_q31, const int32_t *k_q30, int order) {
     return 0;
   }
 
-  int preshift = tns_preshift(k_q30, order);
+  int preshift = tns_preshift(k_q30, order, true);
   int hr;
   tns_lattice_iir(spec_q31, k_q30, order, preshift, &hr);
   tns_renormalize(spec_q31, hr);
