@@ -14,6 +14,7 @@ add_library(hqlc_codec STATIC
     ${HQLC_ROOT}/src/entropy.c
     ${HQLC_ROOT}/src/entropy_tables.c
     ${HQLC_ROOT}/src/tns.c
+    ${HQLC_ROOT}/src/ms.c
 )
 target_include_directories(hqlc_codec PUBLIC ${HQLC_ROOT}/include)
 
