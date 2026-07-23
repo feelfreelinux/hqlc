@@ -380,8 +380,8 @@ int rans_activity_bin(const int16_t *quant, int band);
 
 
 #ifdef HQLC_TRAIN_TABLES
-// Offline table-training hooks (see scripts/train_entropy_tables.py).
-// Accumulates magnitude-symbol counts by final rANS table index.
+// Accumulates magnitude-symbol counts by final rANS table index
+// Used for training static entropy tables
 extern uint64_t rans_train_hist[RANS_NTABLES][RANS_MAX_SYM];
 extern int rans_train_enabled;
 void rans_train_reset(void);
