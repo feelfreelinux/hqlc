@@ -27,7 +27,13 @@
 #define DR_WAV_IMPLEMENTATION
 #include "dr_wav.h"
 
+#include "entropy.h"
 #include "hqlc.h"
+
+#ifdef HQLC_TRAIN_TABLES
+// Optional path for dumping the rANS table-training histogram (-T <file>).
+static const char *g_train_path = NULL;
+#endif
 
 /* HQLC container format */
 //
@@ -43,7 +49,7 @@
 //   [0..1]   payload_len (LE16)
 //   [2..]    payload
 
-#define HQLC_FILE_VERSION 2
+#define HQLC_FILE_VERSION 3
 #define HQLC_FILE_HDR_SIZE 16
 
 /* Helpers */
@@ -257,6 +263,12 @@ do_encode(const char *in, const char *out, hqlc_mode mode, uint32_t bitrate, flo
   }
   void *scratch = calloc(1, hqlc_encoder_scratch_size());
 
+#ifdef HQLC_TRAIN_TABLES
+  if (g_train_path) {
+    rans_train_reset();
+  }
+#endif
+
   // Open output and write header (n_frames is known upfront)
   FILE *fout;
   if (is_stdio(out)) {
@@ -308,6 +320,24 @@ do_encode(const char *in, const char *out, hqlc_mode mode, uint32_t bitrate, flo
   if (!is_stdio(out)) {
     fclose(fout);
   }
+
+#ifdef HQLC_TRAIN_TABLES
+  // Dump the per-table symbol histogram for table training
+  if (g_train_path) {
+    FILE *th = fopen(g_train_path, "w");
+    if (th) {
+      for (int t = 0; t < RANS_NTABLES; t++) {
+        for (int sym = 0; sym < RANS_MAX_SYM; sym++) {
+          fprintf(th, "%llu%c", (unsigned long long)rans_train_hist[t][sym],
+                  sym == RANS_MAX_SYM - 1 ? '\n' : ' ');
+        }
+      }
+      fclose(th);
+    } else {
+      fprintf(stderr, "warning: cannot write training histogram '%s'\n", g_train_path);
+    }
+  }
+#endif
 
   float duration = (float)(n_frames * HQLC_FRAME_SAMPLES) / HQLC_SAMPLE_RATE;
   float avg_bps = (float)(total_bytes * 8) / duration;
@@ -561,6 +591,9 @@ static void usage(const char *argv0) {
           "Encoder options:\n"
           "  -b <bps>      Rate-controlled mode (default: 128000)\n"
           "  -g <gain>     Fixed-gain mode\n"
+#ifdef HQLC_TRAIN_TABLES
+          "  -T <file>     Dump rANS table-training histogram while encoding\n"
+#endif
           "\n"
           "Use \"-\" for stdin/stdout.\n",
           argv0);
@@ -585,6 +618,14 @@ int main(int argc, char **argv) {
     } else if (strcmp(argv[i], "-g") == 0 && i + 1 < argc) {
       mode = HQLC_MODE_FIXED;
       gain = (float)atof(argv[++i]);
+    } else if (strcmp(argv[i], "-T") == 0 && i + 1 < argc) {
+#ifdef HQLC_TRAIN_TABLES
+      op = OP_ENCODE;
+      g_train_path = argv[++i];
+#else
+      fprintf(stderr, "error: -T requires a build with -DHQLC_TRAIN_TABLES=ON\n");
+      return 1;
+#endif
     } else if (strcmp(argv[i], "-h") == 0 || strcmp(argv[i], "--help") == 0) {
       usage(argv[0]);
       return 0;

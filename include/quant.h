@@ -96,6 +96,7 @@ int quant_gain_encode(float gain);
  * @param gain_code Quantizer gain code.
  * @param nf Noise-fill factor.
  * @param seed Seed for the noise generator.
+ * @param skip_bands Optional per-band skip mask (used to skip flagged M/S side bands)
  * @param spec_q31 Dequantized Q31 BFP spectrum to update.
  * @param loss_bits_io BFP exponent for `spec_q31`, updated if renormalized.
  */
@@ -104,6 +105,7 @@ void nf_run_length_fill(const int16_t *quant,
                         int gain_code,
                         int nf,
                         uint32_t seed,
+                        const bool *skip_bands,
                         int32_t *spec_q31,
                         int *loss_bits_io);
 

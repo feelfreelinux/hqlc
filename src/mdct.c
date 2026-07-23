@@ -35,26 +35,6 @@ static inline uint32_t mag_or_i32(int32_t v) {
 }
 
 /**
- * @brief Align one BFP sample into a common exponent domain.
- */
-static inline int32_t align_bfp_sample(int32_t sample, int shift) {
-  return (shift < 31) ? fxp_shr_rnd_i32(sample, shift) : 0;
-}
-
-/**
- * @brief Apply the final PCM exponent after overlap-add.
- */
-static inline int32_t apply_pcm_exp(int32_t sample, int exp_shift) {
-  if (exp_shift > 0) {
-    return fxp_shl_sat_i32(sample, exp_shift);
-  }
-  if (exp_shift < 0) {
-    return fxp_shr_rnd_i32(sample, -exp_shift);
-  }
-  return sample;
-}
-
-/**
  * @brief Convert a Q31 PCM sample to clamped signed 16-bit PCM.
  */
 static inline int16_t pcm_q31_to_i16(int32_t sample_q31) {
@@ -87,10 +67,22 @@ static inline int32_t ola_mix_q31(int32_t prev_sample,
     curr_windowed = -curr_windowed;
   }
 
-  int32_t prev_aligned = align_bfp_sample(prev_windowed, prev_shift);
-  int32_t curr_aligned = align_bfp_sample(curr_windowed, curr_shift);
+  // Align the windowed samples to the current bfp domain
+  int32_t prev_aligned =
+      (prev_shift < 31) ? fxp_shr_rnd_i32(prev_windowed, prev_shift) : 0;
+  int32_t curr_aligned =
+      (curr_shift < 31) ? fxp_shr_rnd_i32(curr_windowed, curr_shift) : 0;
+
   int32_t mixed = fxp_sat_i64_to_i32((int64_t)prev_aligned + curr_aligned);
-  return apply_pcm_exp(mixed, pcm_exp);
+
+  // Apply the final PCM exponent after overlap-add
+  if (pcm_exp > 0) {
+    return fxp_shl_sat_i32(mixed, pcm_exp);
+  }
+  if (pcm_exp < 0) {
+    return fxp_shr_rnd_i32(mixed, -pcm_exp);
+  }
+  return mixed;
 }
 
 /**

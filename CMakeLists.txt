@@ -8,6 +8,7 @@ add_library(hqlc STATIC
     src/hqlc.c
     src/mdct.c
     src/mdct_tables.c
+    src/ms.c
     src/psy.c
     src/quant.c
     src/entropy.c
@@ -22,6 +23,13 @@ option(HQLC_TESTS "Build Unity unit tests" OFF)
 
 # Enables the encoder / decoder tool
 option(HQLC_TOOLS "Build CLI tools" OFF)
+
+# Enables the -T mode in cli, used for rANS table training
+option(HQLC_TRAIN_TABLES "Build rANS table-training histogram hooks" OFF)
+
+if (HQLC_TRAIN_TABLES)
+    target_compile_definitions(hqlc PUBLIC HQLC_TRAIN_TABLES)
+endif()
 
 if (HQLC_TESTS)
     enable_testing()
