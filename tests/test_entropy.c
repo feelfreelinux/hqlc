@@ -61,6 +61,34 @@ void test_rice_roundtrip(void) {
   }
 }
 
+void test_binary_rle_roundtrip(void) {
+  const bool cases[][20] = {
+      {false, false, false, false, false, false, false, false, false, false,
+       false, false, false, false, false, false, false, false, false, false},
+      {true, true, true, true, true, true, true, true, true, true,
+       true, true, true, true, true, true, true, true, true, true},
+      {false, true, false, true, false, true, false, true, false, true,
+       false, true, false, true, false, true, false, true, false, true},
+      {true, true, true, false, false, true, false, false, false, false,
+       true, true, false, true, true, true, false, false, false, true},
+  };
+
+  for (int c = 0; c < 4; c++) {
+    uint8_t buf[64];
+    hqlc_bitwriter w;
+    bw_init(&w, buf, sizeof(buf));
+    bw_write_binary_rle(&w, cases[c], 20, 1);
+    bw_flush(&w);
+
+    bool decoded[20];
+    hqlc_bitreader r;
+    br_init(&r, buf, bw_bytes(&w));
+    br_read_binary_rle(&r, decoded, 20, 1);
+
+    TEST_ASSERT_EQUAL_MEMORY(cases[c], decoded, sizeof(decoded));
+  }
+}
+
 void test_rans_highlevel_roundtrip(void) {
   int gain_code = 43; // gain=4.0 with GAIN_BIAS=27
 
@@ -83,11 +111,11 @@ void test_rans_highlevel_roundtrip(void) {
   quant[s10 + 3] = 100; // ESC + EG(0) overflow=85
 
   uint8_t out[4096];
-  size_t len = rans_encode_coeffs(quant, 1, gain_code, out, sizeof(out));
+  size_t len = rans_encode_coeffs(quant, 1, gain_code, NULL, out, sizeof(out));
   TEST_ASSERT_GREATER_THAN(0, len);
 
   int16_t decoded[HQLC_FRAME_SAMPLES];
-  rans_decode_coeffs(out, len, decoded, 1, gain_code);
+  rans_decode_coeffs(out, len, decoded, 1, gain_code, NULL);
 
   for (int b = 0; b < PSY_N_BANDS; b++) {
     int s = psy_band_edges[b];
@@ -107,18 +135,18 @@ void test_rans_corrupt_input_safe(void) {
   }
 
   uint8_t buf[4096];
-  size_t len = rans_encode_coeffs(quant, 1, gain_code, buf, sizeof(buf));
+  size_t len = rans_encode_coeffs(quant, 1, gain_code, NULL, buf, sizeof(buf));
   TEST_ASSERT_GREATER_THAN(4, len);
 
   int16_t decoded[HQLC_FRAME_SAMPLES];
 
   // Hard truncation: the decoder runs out of bytes and must report corruption.
-  TEST_ASSERT_FALSE(rans_decode_coeffs(buf, 3, decoded, 1, gain_code));
+  TEST_ASSERT_FALSE(rans_decode_coeffs(buf, 3, decoded, 1, gain_code, NULL));
 
   // Pure garbage at full length: must return without overreading or hanging.
   uint8_t junk[64];
   memset(junk, 0xA5, sizeof(junk));
-  (void)rans_decode_coeffs(junk, sizeof(junk), decoded, 1, gain_code);
+  (void)rans_decode_coeffs(junk, sizeof(junk), decoded, 1, gain_code, NULL);
 }
 
 void test_rans_freq_tables_normalized(void) {
@@ -139,6 +167,7 @@ int main(void) {
   RUN_TEST(test_zigzag_roundtrip);
   RUN_TEST(test_bitstream_roundtrip);
   RUN_TEST(test_rice_roundtrip);
+  RUN_TEST(test_binary_rle_roundtrip);
   RUN_TEST(test_rans_highlevel_roundtrip);
   RUN_TEST(test_rans_corrupt_input_safe);
   RUN_TEST(test_rans_freq_tables_normalized);

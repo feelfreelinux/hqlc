@@ -1,6 +1,8 @@
-name: Release builds
+name: Build binaries
 
 on:
+  push: {}
+  pull_request: {}
   release:
     types: [published]
 
@@ -11,10 +13,10 @@ jobs:
   build:
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v7
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
 
       - name: Install Zig
-        uses: mlugg/setup-zig@v2
+        uses: mlugg/setup-zig@d1434d08867e3ee9daa34448df10607b98908d29 # v2.2.1
         with:
           version: 0.15.1
 
@@ -36,7 +38,16 @@ jobs:
           done
           ls -la dist
 
+      - name: Upload artifacts
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: hqlc-binaries-${{ github.sha }}
+          path: |
+            dist/*.tar.gz
+            dist/*.zip
+
       - name: Upload release assets
+        if: github.event_name == 'release'
         env:
           GH_TOKEN: ${{ github.token }}
         run: gh release upload "${{ github.event.release.tag_name }}" dist/*.tar.gz dist/*.zip --clobber

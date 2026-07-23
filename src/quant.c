@@ -261,28 +261,38 @@ void nf_run_length_fill(const int16_t *quant,
                         int gain_code,
                         int nf,
                         uint32_t seed,
+                        const bool *skip_bands,
                         int32_t *spec_q31,
                         int *loss_bits_io) {
   int loss_bits = *loss_bits_io;
   int nf_scale = 8 - nf; // 1..8
   int E_bias = gain_code + QUANT_EXP_OFFSET;
 
-  // Max octave from band exponents
-  int max_fill_oct = -32767;
+  // Check whether any eligible bands need fill, and size headroom only for
+  // those bands. Skipped bands must not trigger widening if no fill will be
+  // written there.
+  int z = 0, has_fill = 0, max_fill_oct = -32767;
   for (int b = 0; b < PSY_N_BANDS; b++) {
-    int oct = (2 * (int)exp_indices[b] - E_bias) >> 3;
-    if (oct > max_fill_oct) {
-      max_fill_oct = oct;
+    int s = psy_band_edges[b];
+    int e = psy_band_edges[b + 1];
+    if (skip_bands && skip_bands[b]) {
+      z = 0;
+      continue;
     }
-  }
 
-  // Check if any fills exist
-  int z = 0, has_fill = 0;
-  for (int i = 0; i < PSY_ACTIVE_BINS; i++) {
-    z = (quant[i] == 0) ? z + 1 : 0;
-    if (z > 4) {
+    int band_has_fill = 0;
+    for (int i = s; i < e; i++) {
+      z = (quant[i] == 0) ? z + 1 : 0;
+      if (z > 4) {
+        band_has_fill = 1;
+      }
+    }
+    if (band_has_fill) {
+      int oct = (2 * (int)exp_indices[b] - E_bias) >> 3;
+      if (oct > max_fill_oct) {
+        max_fill_oct = oct;
+      }
       has_fill = 1;
-      break;
     }
   }
   if (!has_fill) {
@@ -304,6 +314,11 @@ void nf_run_length_fill(const int16_t *quant,
   for (int b = 0; b < PSY_N_BANDS; b++) {
     int s = psy_band_edges[b];
     int e = psy_band_edges[b + 1];
+    // Flagged M/S side bands are left as exact zeros (no anti-phase fill)
+    if (skip_bands && skip_bands[b]) {
+      z = 0;
+      continue;
+    }
     int E = 2 * (int)exp_indices[b] - E_bias;
     int octave = E >> 3;
     int32_t step_m = quant_pow2_eighth_q30[E & 7] >> 2;

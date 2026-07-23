@@ -1,10 +1,10 @@
 """Top-level encoder / decoder pipeline. Read the HQLC_DESIGN.md for details.
 
 Encode, per frame of 512 new samples:
-    MDCT -> transient-gated TNS -> band exponents (psy) -> quantize -> rANS.
+    MDCT -> transient-gated TNS -> M/S when eligible -> band exponents (psy) -> quantize -> rANS.
 
 Decide just reverses it:
-    rANS -> dequantize + noise fill -> TNS synthesis -> inverse MDCT + overlap-add.
+    rANS -> dequantize + noise fill -> M/S back into L/R -> TNS synthesis -> inverse MDCT + overlap-add.
 """
 
 import argparse
@@ -35,6 +35,7 @@ from .entropy import (
     rans_table_idx,
 )
 from .mdct import imdct_synthesis, mdct_analysis
+from .ms import ms_apply_side_exp_bias, ms_decode, ms_encode
 from .psy import compute_exponents, tilt_for_bitrate
 from .quantizer import (
     GAIN_Q,
@@ -150,8 +151,11 @@ def _estimate_noise_factor(scaled_abs, active):
     return max(0, min(7, nf))
 
 
-def _dequant_and_fill(q, gain, nf, env_dq, env_flat, seed, active):
-    """Dequantize, then fill noise into the run of quantized zeros"""
+def _dequant_and_fill(q, gain, nf, env_dq, env_flat, seed, active, skip_bins=None):
+    """Dequantize, then fill noise into the run of quantized zeros.
+
+    skip_bins (bool per bin) skips NF in given bands, use for S channel in M/S
+    """
     inv_gain = 1.0 / gain
     X_hat = np.zeros(N_BINS)
     X_hat[:active] = dequantize(q, env_dq * inv_gain)
@@ -163,17 +167,21 @@ def _dequant_and_fill(q, gain, nf, env_dq, env_flat, seed, active):
         if z > 4:
             # LCG seed
             seed = (13849 + seed * 31821) & 0xFFFF
+            if skip_bins is not None and skip_bins[i - 2]:
+                continue  # no noise fill on flagged side bands
             sign = -1.0 if (seed & 0x8000) else 1.0
             X_hat[i - 2] = sign * nf_amp * env_flat[i]
 
     return X_hat
 
 
-def _probe_bits(Xs, envs, gain, n_ch):
+def _probe_bits(Xs, envs, gain, n_ch, ms_flags=None):
     """Estimate rANS payload bits at a candidate gain (flat per-band steps).
 
     Sums the cost of every quantized coefficient without actually entropy-coding it
     """
+    from .ms import MS_RANS_ALPHA_SHIFT
+
     total_q8 = 0
     inv_gain = 1.0 / gain
 
@@ -182,39 +190,56 @@ def _probe_bits(Xs, envs, gain, n_ch):
         for b in range(N_BANDS):
             s, e = BAND_EDGES[b], BAND_EDGES[b + 1]
             act = _prev_band_activity(q, b)
-            _, _, cost_q8 = get_rans_tables(rans_table_idx(b, gain, act))
+            ashift = (
+                MS_RANS_ALPHA_SHIFT
+                if (ch == 1 and ms_flags is not None and ms_flags[b])
+                else 0
+            )
+            _, _, cost_q8 = get_rans_tables(rans_table_idx(b, gain, act, ashift))
             total_q8 += sum(coeff_cost_q8(cost_q8, int(v)) for v in q[s:e])
 
     return ((total_q8 + 128) >> 8) + 32  # +32 for rANS state flush
 
 
-def _analyze_frame(padded, start, n_ch, tilt_db, detectors, tns_hang):
+def _analyze_frame(padded, start, n_ch, tilt_db, detectors, tns_hang, ms_flags=None):
     """MDCT + transient-gated TNS + exponents for one frame"""
     N = FRAME_LEN
-    Xs, tns_orders, tns_q_ks, transients = [], [], [], []
+    # MDCT + transient detection per channel
+    raw, eligible = [], []
     for ch in range(n_ch):
         block = padded[ch][start : start + BLOCK_SIZE]
-        X = mdct_analysis(block)
-
+        raw.append(mdct_analysis(block))
         # TNS runs when a transient fires this frame or the hangover is still up
         transient = detectors[ch].detect(block[N:])
-        eligible = transient or tns_hang[ch] > 0
+        eligible.append(transient or tns_hang[ch] > 0)
         tns_hang[ch] = 1 if transient else max(0, tns_hang[ch] - 1)
 
+    # Apply M/S stereo coding only on non-transient and eligible channels
+    if ms_flags is not None:
+        if eligible[0] or eligible[1]:
+            ms_flags[:] = False
+        else:
+            ms_encode(raw[0], raw[1], ms_flags)
+
+    # Transient-gated TNS
+    Xs, tns_orders, tns_q_ks = [], [], []
+    for ch in range(n_ch):
+        X = raw[ch]
         order, q_k = 0, np.zeros(0, dtype=np.int32)
-        if eligible:
+        if eligible[ch]:
             order, k_dq, q_k, _ = tns_analyze(X)
             if order > 0:
                 X = lattice_fir(X, k_dq)
-
         Xs.append(X)
         tns_orders.append(order)
         tns_q_ks.append(q_k)
-        transients.append(eligible)
 
-    exp_indices = [
-        compute_exponents(Xs[ch], tilt_db, transients[ch]) for ch in range(n_ch)
-    ]
+    exp_indices = [compute_exponents(Xs[ch], tilt_db, eligible[ch]) for ch in range(n_ch)]
+
+    # Coarsen the flagged side-channel exponents
+    if ms_flags is not None:
+        ms_apply_side_exp_bias(exp_indices[0], exp_indices[1], ms_flags)
+
     return Xs, tns_orders, tns_q_ks, exp_indices
 
 
@@ -229,13 +254,15 @@ def encode(channels, gain):
     )  # default tilt for fixed-gain mode, probably should scale with bitrate
     detectors = [TransientDetector() for _ in range(n_ch)]
     tns_hang = [0] * n_ch
+    use_ms = n_ch == 2
+    ms_flags = np.zeros(N_BANDS, dtype=bool) if use_ms else None
     payloads = []
     total_bits = 0
 
     for fi in range(n_frames):
         start = fi * N
         Xs, tns_orders, tns_q_ks, exp_indices = _analyze_frame(
-            padded, start, n_ch, tilt_db, detectors, tns_hang
+            padded, start, n_ch, tilt_db, detectors, tns_hang, ms_flags
         )
 
         envs = [_step_factors(exp_indices[ch], tns_orders[ch]) for ch in range(n_ch)]
@@ -252,6 +279,7 @@ def encode(channels, gain):
             exp_indices,
             all_quants,
             noise_factors,
+            ms_flags if use_ms else None,
         )
         payloads.append(payload)
         total_bits += frame_bits
@@ -266,14 +294,25 @@ def decode(payloads, n_channels, n_samples):
     total_len = N + n_samples + pad_end
     outputs = [np.zeros(total_len) for _ in range(n_channels)]
 
+    active = BAND_EDGES[-1]
+    use_ms = n_channels == 2
     for fi, payload in enumerate(payloads):
         start = fi * N
-        gain, tns_orders, tns_ks, exp_indices, all_quants, noise_factors = decode_frame(
-            payload, n_channels
+        gain, tns_orders, tns_ks, exp_indices, all_quants, noise_factors, ms_flags = (
+            decode_frame(payload, n_channels, use_ms)
         )
 
+        # Calculate the skip bins from ms mask
+        skip_bins = None
+        if use_ms:
+            skip_bins = np.zeros(active, dtype=bool)
+            for b in range(N_BANDS):
+                if ms_flags[b]:
+                    skip_bins[BAND_EDGES[b] : BAND_EDGES[b + 1]] = True
+
+        # dequant + nf + TNS synthesis per channel
+        specs = []
         for ch in range(n_channels):
-            active = BAND_EDGES[-1]
             env_flat = _band_step_factors(exp_indices[ch])
             env_dq = _step_factors(exp_indices[ch], tns_orders[ch])
 
@@ -285,13 +324,25 @@ def decode(payloads, n_channels, n_samples):
             # Seed varies per frame and channel so the fill noise evolves
             seed = (0x9E3779B9 ^ (fi * 0x9E37) ^ (ch * 0x51ED)) & 0xFFFFFFFF
             X_hat = _dequant_and_fill(
-                q_flat, gain, noise_factors[ch], env_dq, env_flat, seed, active
+                q_flat,
+                gain,
+                noise_factors[ch],
+                env_dq,
+                env_flat,
+                seed,
+                active,
+                skip_bins if ch == 1 else None, # Skip NF on S channel
             )
 
             if tns_orders[ch] > 0:
                 X_hat = lattice_iir(X_hat, tns_ks[ch])
+            specs.append(X_hat)
 
-            outputs[ch][start : start + BLOCK_SIZE] += imdct_synthesis(X_hat)
+        if use_ms:
+            # Decode the M/S back into L/R
+            ms_decode(specs[0], specs[1], ms_flags)
+        for ch in range(n_channels):
+            outputs[ch][start : start + BLOCK_SIZE] += imdct_synthesis(specs[ch])
 
     return [np.clip(out[N : N + n_samples], -1.0, 1.0) for out in outputs]
 
@@ -327,19 +378,21 @@ def encode_rc(channels, bitrate):
     res_bits = 0
     detectors = [TransientDetector() for _ in range(n_ch)]
     tns_hang = [0] * n_ch
+    use_ms = n_ch == 2
+    ms_flags = np.zeros(N_BANDS, dtype=bool) if use_ms else None
     payloads = []
     total_bits = 0
 
     for fi in range(n_frames):
         start = fi * N
         Xs, tns_orders, tns_q_ks, exp_indices = _analyze_frame(
-            padded, start, n_ch, tilt_db, detectors, tns_hang
+            padded, start, n_ch, tilt_db, detectors, tns_hang, ms_flags
         )
 
-        # Probes always use flat per-band steps (matches C probe_frame_bits)
+        # Probes always use flat per-band steps
         envs_flat = [_band_step_factors(exp_indices[ch]) for ch in range(n_ch)]
 
-        # Rate control: slew-limited 2-probe gain search (matches C select_gain)
+        # Rate control: slew-limited 2-probe gain search
         quiet_frame = False
         borrow = max(-target_bpf, min(target_bpf, res_bits)) // 2
         effective_target = max(
@@ -347,7 +400,10 @@ def encode_rc(channels, bitrate):
         )
 
         gc0 = min(prev_gc, GAIN_RC_MAX)
-        b0 = _probe_bits(Xs, envs_flat, dequantize_gain(gc0), n_ch) + prev_side_bits
+        b0 = (
+            _probe_bits(Xs, envs_flat, dequantize_gain(gc0), n_ch, ms_flags)
+            + prev_side_bits
+        )
 
         if abs(b0 - effective_target) <= tol or b0 <= 0:
             chosen_code = gc0
@@ -360,7 +416,10 @@ def encode_rc(channels, bitrate):
                 delta = 1 if b0 < effective_target else -1
 
             gc1 = max(0, min(GAIN_RC_MAX, gc0 + delta))
-            b1 = _probe_bits(Xs, envs_flat, dequantize_gain(gc1), n_ch) + prev_side_bits
+            b1 = (
+                _probe_bits(Xs, envs_flat, dequantize_gain(gc1), n_ch, ms_flags)
+                + prev_side_bits
+            )
 
             if (
                 gc1 > gc0
@@ -391,6 +450,7 @@ def encode_rc(channels, bitrate):
             exp_indices,
             all_quants,
             noise_factors,
+            ms_flags if use_ms else None,
         )
         payloads.append(payload)
         total_bits += frame_bits
@@ -400,7 +460,12 @@ def encode_rc(channels, bitrate):
             res_bits = max(-(2 * target_bpf), min(2 * target_bpf, res_bits))
             ema_gc += (chosen_code - ema_gc) / 16.0
         prev_gc = chosen_code
-        prev_side_bits = count_side_bits(n_ch, tns_orders, tns_q_ks, exp_indices) + 32
+        prev_side_bits = (
+            count_side_bits(
+                n_ch, tns_orders, tns_q_ks, exp_indices, ms_flags if use_ms else None
+            )
+            + 32
+        )
 
     return payloads, total_bits, n_frames
 

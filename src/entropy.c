@@ -1,6 +1,7 @@
 #include "entropy.h"
 #include "hqlc.h"
 #include "hqlc_bench.h"
+#include "ms.h"
 #include "psy.h"
 #include "quant.h"
 
@@ -55,6 +56,51 @@ uint32_t br_read_rice(hqlc_bitreader *r, int k) {
   }
   uint32_t rem = (k > 0) ? br_read(r, k) : 0;
   return (q << k) | rem;
+}
+
+void bw_write_binary_rle(hqlc_bitwriter *w, const bool *flags, int n_flags, int rice_k) {
+  if (n_flags <= 0) {
+    return;
+  }
+
+  // Write the initial color bit
+  bw_write(w, flags[0] & 1, 1);
+  int pos = 0;
+  while (pos < n_flags) {
+    int run = 1;
+    while (pos + run < n_flags && flags[pos + run] == flags[pos]) {
+      run++;
+    }
+    if (pos + run < n_flags) {
+      bw_write(w, 1, 1); // another run follows
+      bw_write_rice(w, (uint32_t)(run - 1), rice_k);
+    }
+    pos += run;
+  }
+  bw_write(w, 0, 1); // terminator
+}
+
+void br_read_binary_rle(hqlc_bitreader *r, bool *flags, int n_flags, int rice_k) {
+  if (n_flags <= 0) {
+    return;
+  }
+
+  // Read the initial color bit
+  uint8_t cur = (uint8_t)br_read(r, 1);
+  int pos = 0;
+  for (int guard = 0; guard < n_flags && pos < n_flags; guard++) {
+    if (!br_read(r, 1)) {
+      break;
+    }
+    uint32_t run = br_read_rice(r, rice_k) + 1;
+    for (uint32_t i = 0; i < run && pos < n_flags; i++) {
+      flags[pos++] = cur;
+    }
+    cur ^= 1;
+  }
+  while (pos < n_flags) {
+    flags[pos++] = cur;
+  }
 }
 
 void rans_enc_init(hqlc_rans_enc *enc, uint8_t *buf, size_t cap) {
@@ -195,6 +241,26 @@ int rans_alpha_bin(int band, int gain_code) {
                                 rans_log2_sigma_q8[pair]);
 }
 
+#ifdef HQLC_TRAIN_TABLES
+// Optional rANS training histogram, used to adjust the entropy tables
+uint64_t rans_train_hist[RANS_NTABLES][RANS_MAX_SYM];
+int rans_train_enabled = 0;
+
+void rans_train_reset(void) {
+  memset(rans_train_hist, 0, sizeof(rans_train_hist));
+  rans_train_enabled = 1;
+}
+
+#define RANS_TRAIN_COUNT(tidx, sym)                                                               \
+  do {                                                                                             \
+    if (rans_train_enabled) {                                                                      \
+      rans_train_hist[(tidx)][(sym)]++;                                                            \
+    }                                                                                              \
+  } while (0)
+#else
+#define RANS_TRAIN_COUNT(tidx, sym) do {} while (0)
+#endif
+
 int rans_activity_bin(const int16_t *quant, int band) {
   if (band == 0) {
     return 0;
@@ -210,8 +276,12 @@ int rans_activity_bin(const int16_t *quant, int band) {
   return rans_activity_from(nz, e - s);
 }
 
-size_t rans_encode_coeffs(
-    const int16_t *quant, int n_ch, int gain_code, uint8_t *out, size_t out_cap) {
+size_t rans_encode_coeffs(const int16_t *quant,
+                          int n_ch,
+                          int gain_code,
+                          const bool *ms_flags,
+                          uint8_t *out,
+                          size_t out_cap) {
   hqlc_rans_enc enc;
   rans_enc_init(&enc, out, out_cap);
 
@@ -223,6 +293,12 @@ size_t rans_encode_coeffs(
       // Per-band table from alpha + activity of the previous band
       HQLC_BENCH_BEGIN(HQLC_BENCH_ENC_RANS_TBL);
       int abin = rans_alpha_bin(b, gain_code);
+      if (ch == 1 && ms_flags && ms_flags[b]) {
+        abin -= MS_RANS_ALPHA_SHIFT;
+        if (abin < 0) {
+          abin = 0;
+        }
+      }
       int act = rans_activity_bin(ch_q, b);
       int tidx = rans_table_idx(abin, act);
       const uint16_t *cf = rans_cf[tidx];
@@ -241,12 +317,14 @@ size_t rans_encode_coeffs(
         int16_t v = ch_q[i];
         if (v == 0) {
           rans_enc_sym(&enc, f0, rcp0, 0);
+          RANS_TRAIN_COUNT(tidx, 0);
           continue;
         }
 
         int mag = (v < 0) ? -v : v;
         uint8_t sym =
             (mag < RANS_MAX_SYM - 1) ? (uint8_t)mag : (uint8_t)(RANS_MAX_SYM - 1);
+        RANS_TRAIN_COUNT(tidx, sym);
 
         rans_enc_sign(&enc, (v > 0) ? 0 : 1);
 
@@ -272,8 +350,12 @@ size_t rans_encode_coeffs(
   return rans_enc_flush(&enc);
 }
 
-bool rans_decode_coeffs(
-    const uint8_t *data, size_t len, int16_t *quant_out, int n_ch, int gain_code) {
+bool rans_decode_coeffs(const uint8_t *data,
+                        size_t len,
+                        int16_t *quant_out,
+                        int n_ch,
+                        int gain_code,
+                        const bool *ms_flags) {
   if (len == 0) {
     memset(quant_out, 0, (size_t)n_ch * HQLC_FRAME_SAMPLES * sizeof(int16_t));
     return true;
@@ -292,6 +374,12 @@ bool rans_decode_coeffs(
       // Per-band table from alpha + activity of the already-decoded prev band
       HQLC_BENCH_BEGIN(HQLC_BENCH_DEC_RANS_DEC);
       int abin = rans_alpha_bin(b, gain_code);
+      if (ch == 1 && ms_flags && ms_flags[b]) {
+        abin -= MS_RANS_ALPHA_SHIFT;
+        if (abin < 0) {
+          abin = 0;
+        }
+      }
       int act = rans_activity_bin(ch_q, b);
       int tidx = rans_table_idx(abin, act);
       const uint16_t *cf = rans_cf[tidx];
