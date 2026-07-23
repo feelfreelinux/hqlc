@@ -1,7 +1,8 @@
 """Frame serialization: side info encoding/decoding and bit counting.
 
 Frame layout:
-  [gain_code: 7b] [TNS per ch] [exponents] [noise factors] [padding] [rANS payload]
+  [gain_code: 7b] [M/S flags: RLE, stereo only] [TNS per ch] [exponents]
+  [noise factors] [padding] [rANS payload]
 
 TNS per channel:
   [active: 1b] [order-1: 3b if active] [LAR indices: 4b each if active]
@@ -26,19 +27,25 @@ from .entropy import (
     BitWriter,
     RANSDecoder,
     RANSEncoder,
+    binary_rle_bits,
     rans_table_idx,
     find_best_rice_k,
     get_rans_tables,
+    read_binary_rle,
+    write_binary_rle,
     zigzag_dec,
     zigzag_enc,
 )
+from .ms import MS_RANS_ALPHA_SHIFT
 from .quantizer import GAIN_BITS, dequantize_gain, quantize_gain
 from .tns import TNS_K_BITS, TNS_LAR_MAX
 
 
-def count_side_bits(n_ch, tns_orders, tns_q_ks, exp_indices):
+def count_side_bits(n_ch, tns_orders, tns_q_ks, exp_indices, ms_flags=None):
     """Count side information bits (gain + TNS + exponents + noise factors + pad)."""
     bits = GAIN_BITS
+    if ms_flags is not None and n_ch == 2:
+        bits += binary_rle_bits(ms_flags, 1)  # per-band M/S flags, binary RLE
     for ch in range(n_ch):
         bits += 1
         if tns_orders[ch] > 0:
@@ -66,13 +73,19 @@ def count_side_bits(n_ch, tns_orders, tns_q_ks, exp_indices):
     return bits
 
 
-def encode_frame(gain, tns_orders, tns_q_ks, exp_indices, all_quants, noise_factors):
-    """Encode one frame, returns (total_bits, payload_bytes)."""
+def encode_frame(
+    gain, tns_orders, tns_q_ks, exp_indices, all_quants, noise_factors, ms_flags=None
+):
+    """Encode one frame, returns (total_bits, payload_bytes)"""
     n_ch = len(tns_orders)
     side = BitWriter()
 
     gain_code = quantize_gain(gain)
     side.write(gain_code, GAIN_BITS)
+
+    # Per-band M/S flags, binary RLE
+    if ms_flags is not None:
+        write_binary_rle(side, [bool(ms_flags[b]) for b in range(N_BANDS)], 1)
 
     # TNS
     half = (1 << (TNS_K_BITS - 1)) - 1
@@ -130,7 +143,8 @@ def encode_frame(gain, tns_orders, tns_q_ks, exp_indices, all_quants, noise_fact
         for b in range(N_BANDS):
             q = all_quants[ch][b]
             act = _prev_band_activity(q_flat, b)
-            tidx = rans_table_idx(b, gain_dq, act)
+            ashift = MS_RANS_ALPHA_SHIFT if (ch == 1 and ms_flags is not None and ms_flags[b]) else 0
+            tidx = rans_table_idx(b, gain_dq, act, ashift)
             fd, cf, _ = get_rans_tables(tidx)
             for v in q:
                 mag = abs(int(v))
@@ -151,14 +165,20 @@ def encode_frame(gain, tns_orders, tns_q_ks, exp_indices, all_quants, noise_fact
     return len(payload) * 8, payload
 
 
-def decode_frame(payload, n_channels):
+def decode_frame(payload, n_channels, has_ms=False):
     """Decode one frame from payload bytes.
 
-    Returns (gain, tns_orders, tns_ks, exp_indices, all_quants, noise_factors).
+    ms_flags is None unless has_ms
+    Returns (gain, tns_orders, tns_ks, exp_indices, all_quants, noise_factors, ms_flags)
     """
     br = BitReader(payload)
     gain_code = br.read(GAIN_BITS)
     gain = dequantize_gain(gain_code)
+
+    # Per-band M/S flags, binary RLE
+    ms_flags = None
+    if has_ms:
+        ms_flags = read_binary_rle(br, N_BANDS, 1)
 
     # TNS
     half = (1 << (TNS_K_BITS - 1)) - 1
@@ -213,7 +233,8 @@ def decode_frame(payload, n_channels):
             bw_len = BAND_EDGES[b + 1] - BAND_EDGES[b]
             q = np.zeros(bw_len, dtype=np.int32)
             act = _prev_band_activity(q_flat, b)
-            tidx = rans_table_idx(b, gain, act)
+            ashift = MS_RANS_ALPHA_SHIFT if (ch == 1 and ms_flags is not None and ms_flags[b]) else 0
+            tidx = rans_table_idx(b, gain, act, ashift)
             fd, cf, _ = get_rans_tables(tidx)
             for i in range(bw_len):
                 sym = rans_dec.get(fd, cf)
@@ -243,4 +264,4 @@ def decode_frame(payload, n_channels):
         else:
             tns_ks.append(np.zeros(0, dtype=np.float64))
 
-    return gain, tns_orders, tns_ks, exp_indices, all_quants, noise_factors
+    return gain, tns_orders, tns_ks, exp_indices, all_quants, noise_factors, ms_flags
