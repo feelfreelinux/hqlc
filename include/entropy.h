@@ -393,9 +393,7 @@ void rans_train_reset(void);
  * @param quant Quantized coefficients to encode.
  * @param n_ch Number of channels.
  * @param gain_code Quantizer gain code.
- * @param ms_flags Per-band M/S flags (NULL, or all-zero, for dual mono). On a
- *        flagged band the ch1 (side) alpha bin is shifted down to match the
- *        coarser biased-S distribution.
+ * @param ms_flags Per-band M/S flags (null or zero for dual mono)
  * @param out Output buffer.
  * @param out_cap Output buffer capacity in bytes.
  * @return Number of encoded bytes written.
@@ -415,8 +413,7 @@ size_t rans_encode_coeffs(const int16_t *quant,
  * @param quant_out Destination for decoded coefficients.
  * @param n_ch Number of channels.
  * @param gain_code Quantizer gain code.
- * @param ms_flags Per-band M/S flags (NULL, or all-zero, for dual mono); must
- *        match the encoder so the alpha shift is applied identically.
+ * @param ms_flags Per-band M/S flags (null or zero for dual mono)
  * @return True on success, or false if the stream is corrupt or truncated.
  */
 bool rans_decode_coeffs(const uint8_t *data,
