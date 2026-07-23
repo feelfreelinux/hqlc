@@ -202,13 +202,33 @@ static inline uint32_t br_read(hqlc_bitreader *r, int n) {
 /**
  * @brief Read a Rice-coded unsigned value.
  *
- * Decodes `unary(q)` followed by a `k`-bit remainder.
+ * Decodes `unary(q)` followed by the `k`-bit remainder.
  *
  * @param r Bit reader state.
  * @param k Rice parameter.
  * @return Decoded value.
  */
 uint32_t br_read_rice(hqlc_bitreader *r, int k);
+
+/**
+ * @brief Write a run-length-coded binary flag vector.
+ *
+ * @param w Bit writer state.
+ * @param flags Binary flags to write.
+ * @param n_flags Number of flags.
+ * @param rice_k Rice parameter for run lengths.
+ */
+void bw_write_binary_rle(hqlc_bitwriter *w, const bool *flags, int n_flags, int rice_k);
+
+/**
+ * @brief Read a run-length-coded binary flag vector.
+ *
+ * @param r Bit reader state.
+ * @param flags Destination flags.
+ * @param n_flags Number of flags to read.
+ * @param rice_k Rice parameter for run lengths.
+ */
+void br_read_binary_rle(hqlc_bitreader *r, bool *flags, int n_flags, int rice_k);
 
 /**
  * @brief Return the number of bits consumed.
@@ -357,18 +377,33 @@ int rans_alpha_bin(int band, int gain_code);
  */
 int rans_activity_bin(const int16_t *quant, int band);
 
+
+
+#ifdef HQLC_TRAIN_TABLES
+// Accumulates magnitude-symbol counts by final rANS table index
+// Used for training static entropy tables
+extern uint64_t rans_train_hist[RANS_NTABLES][RANS_MAX_SYM];
+extern int rans_train_enabled;
+void rans_train_reset(void);
+#endif
+
 /**
  * @brief Encode quantized coefficients with rANS.
  *
  * @param quant Quantized coefficients to encode.
  * @param n_ch Number of channels.
  * @param gain_code Quantizer gain code.
+ * @param ms_flags Per-band M/S flags (null or zero for dual mono)
  * @param out Output buffer.
  * @param out_cap Output buffer capacity in bytes.
  * @return Number of encoded bytes written.
  */
-size_t rans_encode_coeffs(
-    const int16_t *quant, int n_ch, int gain_code, uint8_t *out, size_t out_cap);
+size_t rans_encode_coeffs(const int16_t *quant,
+                          int n_ch,
+                          int gain_code,
+                          const bool *ms_flags,
+                          uint8_t *out,
+                          size_t out_cap);
 
 /**
  * @brief Decode quantized coefficients from an rANS byte stream.
@@ -378,10 +413,15 @@ size_t rans_encode_coeffs(
  * @param quant_out Destination for decoded coefficients.
  * @param n_ch Number of channels.
  * @param gain_code Quantizer gain code.
+ * @param ms_flags Per-band M/S flags (null or zero for dual mono)
  * @return True on success, or false if the stream is corrupt or truncated.
  */
-bool rans_decode_coeffs(
-    const uint8_t *data, size_t len, int16_t *quant_out, int n_ch, int gain_code);
+bool rans_decode_coeffs(const uint8_t *data,
+                        size_t len,
+                        int16_t *quant_out,
+                        int n_ch,
+                        int gain_code,
+                        const bool *ms_flags);
 
 #ifdef __cplusplus
 }
