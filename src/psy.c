@@ -9,23 +9,21 @@ const uint16_t psy_band_edges[PSY_N_BANDS + 1] = {
     89, 107, 127, 152, 180, 215, 255, 303, 360, 427,
 };
 
-/* Fine-band exponent tables */
-
-// 48 fine bands: single-bin below 844 Hz (18 bands), ERB-spaced above
+// 48 fine bands, single-bin spaced below 844 Hz (18 bands), ERB-spaced above
 const uint16_t psy_fine_band_edges[PSY_N_FINE_BANDS + 1] = {
     0,   1,   2,   3,   4,   5,   6,   7,   8,   9,   10,  11,  12,  13,  14,  15, 16,
     17,  18,  20,  23,  26,  29,  33,  37,  42,  47,  53,  59,  66,  74,  83,  92, 102,
     114, 127, 141, 157, 174, 193, 214, 238, 264, 293, 325, 361, 400, 427, 512,
 };
 
-// Maps each fine band to its parent coarse band (by center frequency)
+// Maps psy_fine_band_edges to psy_band_edges (by center frequency)
 static const uint8_t psy_fb_coarse[PSY_N_FINE_BANDS] = {
     0,  0,  0,  1,  1,  1,  1,  1,  2,  2,  2,  2,  2,  3,  3,  3,
     3,  3,  4,  4,  4,  5,  5,  6,  6,  7,  7,  8,  9,  9,  10, 10,
     11, 12, 12, 13, 13, 14, 15, 15, 16, 16, 17, 18, 18, 19, 19, 19,
 };
 
-// Number of active fine bands (excludes the inaudible [427,512) tail)
+// Number of active fine bands
 #define PSY_N_ACTIVE_FINE 47
 
 int psy_tilt_for_bitrate(uint32_t bitrate) {
@@ -36,11 +34,6 @@ int psy_tilt_for_bitrate(uint32_t bitrate) {
   int tilt = 35 - (int)((128000 - bitrate) * 5 / 32000);
   return (tilt < 15) ? 15 : tilt;
 }
-
-// EXP_Q7: working format for exponent math, 128 units per exponent index.
-// Since exp = round(2*log2(psd) + bias) and 2*log2(x)*128 = log2(x)*256,
-// the Q8 output of fxp_log2_q8_u64 is already in EXP_Q7.
-#define EXP_Q7_FRAC_BITS 7
 
 int psy_tilt_step_q7(int tilt_db) {
   // dB tilt to per-fine-band step in EXP_Q7, spread over the 47 active
@@ -136,13 +129,13 @@ void psy_fine_band_exponents(const int32_t *spec_q31,
     }
     for (int b = 0; b < PSY_N_BANDS; b++) {
       int32_t exp_q7 = wl[b] / psy_hat_ws[b] + bias;
-      exp_indices[b] = fxp_clamp_i32(fxp_round_to_int(exp_q7, EXP_Q7_FRAC_BITS),
-                                     PSY_EXP_INDEX_MIN,
-                                     PSY_EXP_INDEX_MAX);
+      exp_indices[b] = fxp_clamp_i32(
+          fxp_round_to_int(exp_q7, 7), PSY_EXP_INDEX_MIN, PSY_EXP_INDEX_MAX);
     }
     return;
   }
-  // Transients: plain geometric mean per coarse band
+
+  // Simple geometric mean per coarse band
   int32_t log_sum[PSY_N_BANDS] = {0};
   int32_t tilt_acc = 0;
 
@@ -154,7 +147,7 @@ void psy_fine_band_exponents(const int32_t *spec_q31,
 
   for (int b = 0; b < PSY_N_BANDS; b++) {
     int32_t exp_q7 = log_sum[b] / fb_per_coarse[b] + bias;
-    exp_indices[b] = fxp_clamp_i32(
-        fxp_round_to_int(exp_q7, EXP_Q7_FRAC_BITS), PSY_EXP_INDEX_MIN, PSY_EXP_INDEX_MAX);
+    exp_indices[b] =
+        fxp_clamp_i32(fxp_round_to_int(exp_q7, 7), PSY_EXP_INDEX_MIN, PSY_EXP_INDEX_MAX);
   }
 }
