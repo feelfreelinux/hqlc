@@ -16,6 +16,8 @@
 hqlc_bench_ctx *hqlc_bench = NULL;
 #endif
 
+#define HQLC_NO_NOISE_FILL
+
 // Interpolated quantizer steps on tonal frames, flat on TNS (transient)
 // frames. The TNS flag is transmitted, so both sides gate identically.
 static inline bool env_interp_active(int tns_order) {
@@ -748,6 +750,7 @@ hqlc_error hqlc_decode_frame(hqlc_decoder *dec,
                   &loss_bits[ch]);
     HQLC_BENCH_END(HQLC_BENCH_DEC_DEQUANT);
 
+#ifndef HQLC_NO_NOISE_FILL
     // Noise fill, seed varied per frame and channel so the noise differs accross frames.
     HQLC_BENCH_BEGIN(HQLC_BENCH_DEC_NF);
     uint32_t nf_seed =
@@ -764,6 +767,7 @@ hqlc_error hqlc_decode_frame(hqlc_decoder *dec,
                        spec_q31,
                        &loss_bits[ch]);
     HQLC_BENCH_END(HQLC_BENCH_DEC_NF);
+#endif
 
     // TNS synthesis / inverse filter
     HQLC_BENCH_BEGIN(HQLC_BENCH_DEC_TNS);
