@@ -39,7 +39,7 @@ static const char *g_train_path = NULL;
 //
 // Header (16 bytes):
 //   [0..3]   magic "HQLC"
-//   [4]      version (1)
+//   [4]      version (4)
 //   [5]      channels (1 or 2)
 //   [6..7]   reserved
 //   [8..11]  sample_rate (LE32)
@@ -49,7 +49,7 @@ static const char *g_train_path = NULL;
 //   [0..1]   payload_len (LE16)
 //   [2..]    payload
 
-#define HQLC_FILE_VERSION 3
+#define HQLC_FILE_VERSION  4
 #define HQLC_FILE_HDR_SIZE 16
 
 /* Helpers */

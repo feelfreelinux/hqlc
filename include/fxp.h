@@ -10,8 +10,12 @@ extern "C" {
 #define FXP_Q31_MAX ((int32_t)0x7FFFFFFF)
 #define FXP_Q31_MIN ((int32_t)0x80000000)
 
-#define Q8(x)  ((int32_t)((x) * 256.0 + 0.5))
-#define Q30(x) ((int32_t)((x) * (1 << 30) + 0.5))
+// compile time float to qformat mapping
+#define FXP_Q(x, n) ((int32_t)((x) * (double)(1u << (n)) + 0.5))
+
+// Shorthand for common q formats
+#define FXP_Q8(x)  FXP_Q(x, 8)
+#define FXP_Q30(x) FXP_Q(x, 30)
 
 /**
  * @brief Return the saturating absolute value of a 32-bit integer.

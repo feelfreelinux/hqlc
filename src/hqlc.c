@@ -31,8 +31,6 @@ typedef struct {
   int32_t exp_indices[HQLC_MAX_CHANNELS * PSY_N_BANDS];
   // Quantized coefficients
   int16_t quant[HQLC_MAX_CHANNELS * HQLC_FRAME_SAMPLES];
-  // 3-bit noise factor per channel
-  int noise_factors[HQLC_MAX_CHANNELS];
 
   // Per-stage temporaries (only one active at a time)
   union {
@@ -51,9 +49,6 @@ typedef struct {
   int16_t quant_buf[HQLC_MAX_CHANNELS * HQLC_FRAME_SAMPLES];
   // Exponent indices for each band
   int32_t exp_indices[HQLC_MAX_CHANNELS * PSY_N_BANDS];
-
-  // 3-bit noise factor per channel
-  int noise_factors[HQLC_MAX_CHANNELS];
 
   // Per-stage temporaries
   union {
@@ -476,15 +471,15 @@ hqlc_error hqlc_encode_frame(hqlc_encoder *enc,
                           &target_bpf);
   HQLC_BENCH_END(HQLC_BENCH_ENC_SELECT_GAIN);
 
-  // Quantize + NF estimate per channel
+  // Quantize per channel
   HQLC_BENCH_BEGIN(HQLC_BENCH_ENC_QUANT_FWD);
   for (int ch = 0; ch < n_ch; ch++) {
-    s->noise_factors[ch] = quant_forward_nf(&spec_q31[ch * HQLC_FRAME_SAMPLES],
-                                            loss_bits[ch],
-                                            &exp_indices[ch * PSY_N_BANDS],
-                                            gain_code,
-                                            env_interp_active(tns[ch].order),
-                                            &quant[ch * HQLC_FRAME_SAMPLES]);
+    quant_forward(&spec_q31[ch * HQLC_FRAME_SAMPLES],
+                  loss_bits[ch],
+                  &exp_indices[ch * PSY_N_BANDS],
+                  gain_code,
+                  env_interp_active(tns[ch].order),
+                  &quant[ch * HQLC_FRAME_SAMPLES]);
   }
   HQLC_BENCH_END(HQLC_BENCH_ENC_QUANT_FWD);
 
@@ -544,11 +539,6 @@ hqlc_error hqlc_encode_frame(hqlc_encoder *enc,
     for (int b = 0; b < PSY_N_BANDS; b++) {
       bw_write_rice(&bw, zigzag_enc(dd[b]), k);
     }
-  }
-
-  // Noise factors (3 bits per channel)
-  for (int ch = 0; ch < n_ch; ch++) {
-    bw_write(&bw, (uint32_t)s->noise_factors[ch], 3);
   }
 
   bw_flush(&bw);
@@ -701,11 +691,6 @@ hqlc_error hqlc_decode_frame(hqlc_decoder *dec,
     }
   }
 
-  // Noise factors (3 bits per channel)
-  for (int ch = 0; ch < n_ch; ch++) {
-    s->noise_factors[ch] = (int)br_read(&br, 3);
-  }
-
   // Byte-align to find rANS stream start
   size_t bits_used = br_bits(&br);
   int pad = (int)((8 - bits_used % 8) % 8);
@@ -748,21 +733,21 @@ hqlc_error hqlc_decode_frame(hqlc_decoder *dec,
                   &loss_bits[ch]);
     HQLC_BENCH_END(HQLC_BENCH_DEC_DEQUANT);
 
-    // Noise fill, seed varied per frame and channel so the noise differs accross frames.
+    // Noise fill, seeded per frame and channel so the texture differs across frames.
     HQLC_BENCH_BEGIN(HQLC_BENCH_DEC_NF);
     uint32_t nf_seed =
         NF_SEED_BIAS ^ (dec->frame_count * 0x9E37u) ^ ((uint32_t)ch * 0x51EDu);
 
     // skip S bands (only ch 1 of M/S)
     const bool *skip = ch == 1 ? ms_flags : NULL;
-    nf_run_length_fill(ch_quant,
-                       ch_exp,
-                       gain_code,
-                       s->noise_factors[ch],
-                       nf_seed,
-                       skip,
-                       spec_q31,
-                       &loss_bits[ch]);
+    noise_fill(ch_quant,
+               ch_exp,
+               gain_code,
+               env_interp_active(tns[ch].order),
+               nf_seed,
+               skip,
+               spec_q31,
+               &loss_bits[ch]);
     HQLC_BENCH_END(HQLC_BENCH_DEC_NF);
 
     // TNS synthesis / inverse filter

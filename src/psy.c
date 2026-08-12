@@ -37,8 +37,8 @@ int psy_tilt_for_bitrate(uint32_t bitrate) {
 
 int psy_tilt_step_q7(int tilt_db) {
   // dB tilt to per-fine-band step in EXP_Q7, spread over the 47 active
-  // fine bands at ~1.505 dB per exponent unit: step ~= tilt_db * 1.81
-  return (tilt_db * 118612 + 32768) >> 16;
+  // fine bands at ~1.505 dB per exponent unit: step = tilt_db * 1.81
+  return (tilt_db * FXP_Q(1.81, 16) + 32768) >> 16;
 }
 
 // Fine bands per coarse band, divisor for the transient path
