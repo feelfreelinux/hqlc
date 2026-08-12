@@ -25,20 +25,24 @@ extern "C" {
 #define QUANT_TOTAL_Q 51
 
 // Deadzone: |scaled| < DZ = zero, rounding bias = 1 - DZ. DZ = 0.65
-#define QUANT_DZ_THRESH_Q8 ((int32_t)(65 * 256 / 100 + 1))
-#define QUANT_DZ_BIAS_Q8   Q8(0.35)
+// +1 makes the compare strict at boundary
+#define QUANT_DZ_THRESH_Q8 (FXP_Q(0.65, 8) + 1)
+#define QUANT_DZ_BIAS_Q8   FXP_Q8(0.35)
 
 // Centroid: MMSE-optimal reconstruction offset for Laplacian source
 #define QUANT_CENTROID 0.15
+
+// Noise fill seed
+#define NF_SEED_BIAS 0x9E3779B9u
 
 // 2^(f/8) for f=0..7, Q30, shared between quantizer and psy
 extern const int32_t quant_pow2_eighth_q30[8];
 
 /**
- * @brief Quantize a spectrum and estimate its noise-fill factor.
+ * @brief Quantize a spectrum.
  *
- * For each bin, scales by the quantizer step, applies the deadzone, rounds the
- * result, and accumulates the noise-fill estimate in the same pass.
+ * For each bin, scales by the quantizer step, applies the deadzone, and rounds
+ * the result.
  *
  * @param spec_q31 Input spectrum in Q31 BFP format.
  * @param loss_bits BFP exponent for `spec_q31`.
@@ -46,14 +50,13 @@ extern const int32_t quant_pow2_eighth_q30[8];
  * @param gain_code Quantizer gain code.
  * @param interp True to interpolate per-bin exponents, false to use band centers.
  * @param quant_out Destination for quantized coefficients.
- * @return 3-bit noise-fill factor in the range 0..7.
  */
-int quant_forward_nf(const int32_t *spec_q31,
-                     int loss_bits,
-                     const int32_t *exp_indices,
-                     int gain_code,
-                     bool interp,
-                     int16_t *quant_out);
+void quant_forward(const int32_t *spec_q31,
+                   int loss_bits,
+                   const int32_t *exp_indices,
+                   int gain_code,
+                   bool interp,
+                   int16_t *quant_out);
 
 /**
  * @brief Reconstruct a spectrum from quantized coefficients.
@@ -82,32 +85,26 @@ void quant_inverse(const int16_t *quant_in,
  */
 int quant_gain_encode(float gain);
 
-// Noise fill seed
-#define NF_SEED_BIAS 0x9E3779B9u
-
 /**
- * @brief Fill long zero runs with deterministic pseudorandom noise.
+ * @brief Reconstruct a sparse noise floor from decoded zero occupancy.
  *
- * Operates on an already dequantized BFP spectrum and fills runs longer than
- * four consecutive zeros using flat per-band steps.
- *
- * @param quant Quantized coefficients used to find zero runs.
+ * @param quant Quantized coefficients used to measure per-band zero occupancy.
  * @param exp_indices Per-band exponent indices.
  * @param gain_code Quantizer gain code.
- * @param nf Noise-fill factor.
+ * @param interp Use interpolated per-bin exponents when true
  * @param seed Seed for the noise generator.
  * @param skip_bands Optional per-band skip mask (used to skip flagged M/S side bands)
  * @param spec_q31 Dequantized Q31 BFP spectrum to update.
- * @param loss_bits_io BFP exponent for `spec_q31`, updated if renormalized.
+ * @param loss_bits_io BFP exponent for `spec_q31`, updated if renormalized
  */
-void nf_run_length_fill(const int16_t *quant,
-                        const int32_t *exp_indices,
-                        int gain_code,
-                        int nf,
-                        uint32_t seed,
-                        const bool *skip_bands,
-                        int32_t *spec_q31,
-                        int *loss_bits_io);
+void noise_fill(const int16_t *quant,
+                const int32_t *exp_indices,
+                int gain_code,
+                bool interp,
+                uint32_t seed,
+                const bool *skip_bands,
+                int32_t *spec_q31,
+                int *loss_bits_io);
 
 #ifdef __cplusplus
 }

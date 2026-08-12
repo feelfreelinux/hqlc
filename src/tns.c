@@ -6,9 +6,9 @@
 #include "pcm.h"
 
 // TNS parameters
-#define TNS_MAX_K_Q30    Q30(0.92)
-#define TNS_K_THRESH_Q30 Q30(0.1)
-#define TNS_K_CLAMP_Q30  Q30(0.999)
+#define TNS_MAX_K_Q30    FXP_Q30(0.92)
+#define TNS_K_THRESH_Q30 FXP_Q30(0.1)
+#define TNS_K_CLAMP_Q30  FXP_Q30(0.999)
 
 // Gaussian lag window w[k] = exp(-0.5 * (2*pi*0.03*k)^2), Q30
 // Smooths the envelope shape a bit, fitting more attack shape itself
