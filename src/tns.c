@@ -6,9 +6,8 @@
 #include "pcm.h"
 
 // TNS parameters
-#define TNS_MAX_K_Q30    FXP_Q30(0.92)
-#define TNS_K_THRESH_Q30 FXP_Q30(0.1)
-#define TNS_K_CLAMP_Q30  FXP_Q30(0.999)
+#define TNS_MAX_K_Q30   FXP_Q30(0.92)
+#define TNS_K_CLAMP_Q30 FXP_Q30(0.999)
 
 // Gaussian lag window w[k] = exp(-0.5 * (2*pi*0.03*k)^2), Q30
 // Smooths the envelope shape a bit, fitting more attack shape itself
@@ -196,11 +195,6 @@ static int tns_levinson_durbin(const int64_t *r_raw, int max_order, int32_t *k_o
 
     ki = fxp_clamp_i32(ki, -TNS_K_CLAMP_Q30, TNS_K_CLAMP_Q30);
 
-    // Early stop if |ki| < threshold
-    if (ki > -TNS_K_THRESH_Q30 && ki < TNS_K_THRESH_Q30) {
-      break;
-    }
-
     // Update error: error *= (1 - ki^2)
     int32_t ki_sq = (int32_t)(((int64_t)ki * ki) >> 30);
     error = (int32_t)(((int64_t)error * ((1 << 30) - ki_sq)) >> 30);
@@ -232,8 +226,8 @@ static int tns_levinson_durbin(const int64_t *r_raw, int max_order, int32_t *k_o
     memcpy(a, a_new, (size_t)(i + 1) * sizeof(int32_t));
   }
 
-  // Require prediction gain >= 1.5 (i.e. 2*r[0] >= 3*error).
-  if (order == 0 || 2 * (int64_t)r[0] < 3 * (int64_t)error) {
+  // Require prediction gain >= 1.2 (i.e. 5*r[0] >= 6*error).
+  if (order == 0 || 5 * (int64_t)r[0] < 6 * (int64_t)error) {
     return 0;
   }
 
