@@ -387,6 +387,7 @@ hqlc_error hqlc_encode_frame(hqlc_encoder *enc,
   memset(tns, 0, sizeof(tns));
 
   bool tns_eligible[HQLC_MAX_CHANNELS] = {false, false};
+  bool tns_attack[HQLC_MAX_CHANNELS] = {false, false};
 
   for (int ch = 0; ch < n_ch; ch++) {
     int32_t *ch_spec = &spec_q31[ch * HQLC_FRAME_SAMPLES];
@@ -394,6 +395,7 @@ hqlc_error hqlc_encode_frame(hqlc_encoder *enc,
     // Perform TNS detection on raw spectrum before MDCT
     bool tr = tns_detect_transient(&enc->tns_det[ch], pcm, fmt, n_ch, ch);
     tns_eligible[ch] = tr || enc->tns_hang[ch] > 0;
+    tns_attack[ch] = tr;
 
     // Update the 1 frame hangover
     enc->tns_hang[ch] = tr ? 1 : (enc->tns_hang[ch] > 0 ? enc->tns_hang[ch] - 1 : 0);
@@ -442,7 +444,7 @@ hqlc_error hqlc_encode_frame(hqlc_encoder *enc,
 
     HQLC_BENCH_BEGIN(HQLC_BENCH_ENC_TNS);
     if (tns_eligible[ch]) {
-      tns_analyze(ch_spec, &tns[ch]);
+      tns_analyze(ch_spec, !tns_attack[ch], &tns[ch]);
       if (tns[ch].order > 0) {
         loss_bits[ch] += tns_fir_safe(ch_spec, tns[ch].k_q30, tns[ch].order);
       }

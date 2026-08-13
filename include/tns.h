@@ -84,9 +84,10 @@ bool tns_detect_transient(tns_detect_state *st,
  * @brief Analyze a spectrum and produce TNS filter parameters.
  *
  * @param spec_q31 MDCT spectrum, HQLC_FRAME_SAMPLES elements. Not modified.
+ * @param hangover Frame is TNS-eligible only through the hangover, not its own attack.
  * @param out Destination for TNS analysis results.
  */
-void tns_analyze(const int32_t *spec_q31, tns_info *out);
+void tns_analyze(const int32_t *spec_q31, bool hangover, tns_info *out);
 
 /**
  * @brief Apply the encoder TNS lattice FIR filter in place.

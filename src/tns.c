@@ -9,13 +9,23 @@
 #define TNS_MAX_K_Q30   FXP_Q30(0.92)
 #define TNS_K_CLAMP_Q30 FXP_Q30(0.999)
 
-// Gaussian lag window w[k] = exp(-0.5 * (2*pi*0.03*k)^2), Q30
-// Smooths the envelope shape a bit, fitting more attack shape itself
+// Gaussian lag window w[k] = exp(-0.5 * (2*pi*f0*k)^2), Q30
+// Smooths the envelope shape a bit, fitting more attack shape
+//
+// Hangover frames use a softer window, so post-attack frames dont smear quantization noise
+// all over the spectrum. this can be seen as overshoot in HF energy on some frames
 static const int32_t tns_lag_win_q30[TNS_MAX_ORDER] = {
     1054834932,
     1000088432,
     915085284,
     808079344,
+};
+
+static const int32_t tns_lag_win_soft_q30[TNS_MAX_ORDER] = {
+    1022040948,
+    881401074,
+    688677203,
+    487522531,
 };
 
 // Dequant LUT, k = tanh(q * 0.25), Q30, index = q + 7
@@ -152,10 +162,14 @@ static void tns_autocorrelation(const int32_t *spec, int n, int64_t *r) {
  *
  * @param r_raw     Autocorrelation values (int64, max_order+1 elements)
  * @param max_order Maximum filter order to solve for
+ * @param hangover  Frame is eligible only through the hangover, not its own attack
  * @param k_out     Output reflection coefficients in Q30
  * @return Actual filter order (0 if prediction gain is insufficient)
  */
-static int tns_levinson_durbin(const int64_t *r_raw, int max_order, int32_t *k_out) {
+static int tns_levinson_durbin(const int64_t *r_raw,
+                               int max_order,
+                               bool hangover,
+                               int32_t *k_out) {
   if (r_raw[0] <= 0) {
     return 0;
   }
@@ -173,9 +187,11 @@ static int tns_levinson_durbin(const int64_t *r_raw, int max_order, int32_t *k_o
     return 0;
   }
 
+  // Softer window on hangover frames
+  const int32_t *lag_win = hangover ? tns_lag_win_soft_q30 : tns_lag_win_q30;
   for (int k = 1; k <= max_order; k++) {
     // Apply lag window to the autocorrelation values
-    r[k] = (int32_t)(((int64_t)r[k] * tns_lag_win_q30[k - 1]) >> 30);
+    r[k] = (int32_t)(((int64_t)r[k] * lag_win[k - 1]) >> 30);
   }
 
   int32_t error = r[0];
@@ -226,20 +242,22 @@ static int tns_levinson_durbin(const int64_t *r_raw, int max_order, int32_t *k_o
     memcpy(a, a_new, (size_t)(i + 1) * sizeof(int32_t));
   }
 
-  // Require prediction gain >= 1.2 (i.e. 5*r[0] >= 6*error).
-  if (order == 0 || 5 * (int64_t)r[0] < 6 * (int64_t)error) {
+  // Matches >= 1.5 on hangover, 1.2 else
+  int64_t gate_num = hangover ? 2 : 5;
+  int64_t gate_den = hangover ? 3 : 6;
+  if (order == 0 || gate_num * (int64_t)r[0] < gate_den * (int64_t)error) {
     return 0;
   }
 
   return order;
 }
 
-void tns_analyze(const int32_t *spec_q31, tns_info *out) {
+void tns_analyze(const int32_t *spec_q31, bool hangover, tns_info *out) {
   int64_t r[TNS_MAX_ORDER + 1];
   tns_autocorrelation(spec_q31 + TNS_START_BIN, HQLC_FRAME_SAMPLES - TNS_START_BIN, r);
 
   int32_t k_raw[TNS_MAX_ORDER];
-  int order = tns_levinson_durbin(r, TNS_MAX_ORDER, k_raw);
+  int order = tns_levinson_durbin(r, TNS_MAX_ORDER, hangover, k_raw);
   if (order == 0) {
     return;
   }

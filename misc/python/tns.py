@@ -12,10 +12,16 @@ from .constants import FRAME_LEN
 
 TNS_MAX_ORDER = 4
 TNS_MAX_K = 0.92
-TNS_PRED_GAIN_THR = 1.2
 TNS_K_BITS = 4
 TNS_LAR_MAX = 3.5
 TNS_START_BIN = 20  # ~940 Hz
+
+# Hangover frames use a softer window, and a stricter gate
+TNS_LAG_WIN_B = 0.03
+TNS_LAG_WIN_B_HANGOVER = 0.05
+
+TNS_PRED_GAIN_THR = 1.2
+TNS_PRED_GAIN_THR_HANGOVER = 1.5
 
 
 # Sub-block energy below this is treated as silence (the C impl carries it in Q30)
@@ -159,7 +165,7 @@ def lattice_iir(y, k):
     return x
 
 
-def analyze(X):
+def analyze(X, hangover=False):
     """TNS analysis on the HF spectrum (bins >= TNS_START_BIN).
 
     Needs to be transient-gated at the caller (detector + hangover)
@@ -167,12 +173,14 @@ def analyze(X):
     Returns (order, k_dequantized, q_indices, side_bits).
     """
     r = _autocorrelation(X[TNS_START_BIN:], TNS_MAX_ORDER)
-    # Gaussian lag window (b = 0.03), mirrors the c codec
+    # Gaussian lag window, mirrors the c codec
+    b = TNS_LAG_WIN_B_HANGOVER if hangover else TNS_LAG_WIN_B
     lag = np.arange(1, TNS_MAX_ORDER + 1)
-    r[1:] = r[1:] * np.exp(-0.5 * (2.0 * np.pi * 0.03 * lag) ** 2)
+    r[1:] = r[1:] * np.exp(-0.5 * (2.0 * np.pi * b * lag) ** 2)
     k_raw, order, pred_gain = _levinson_durbin(r, TNS_MAX_ORDER)
 
-    if order == 0 or pred_gain < TNS_PRED_GAIN_THR:
+    thr = TNS_PRED_GAIN_THR_HANGOVER if hangover else TNS_PRED_GAIN_THR
+    if order == 0 or pred_gain < thr:
         return 0, np.zeros(0), np.zeros(0, dtype=np.int32), 1
 
     k_raw = np.clip(k_raw, -TNS_MAX_K, TNS_MAX_K)

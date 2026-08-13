@@ -169,13 +169,14 @@ def _analyze_frame(padded, start, n_ch, tilt_db, detectors, tns_hang, ms_flags=N
     """
     N = FRAME_LEN
     # MDCT + transient detection per channel
-    raw, eligible = [], []
+    raw, eligible, attack = [], [], []
     for ch in range(n_ch):
         block = padded[ch][start : start + BLOCK_SIZE]
         raw.append(mdct_analysis(block))
         # TNS runs when a transient fires this frame or the hangover is still up
         transient = detectors[ch].detect(block[N:])
         eligible.append(transient or tns_hang[ch] > 0)
+        attack.append(transient)
         tns_hang[ch] = 1 if transient else max(0, tns_hang[ch] - 1)
 
     # Apply M/S stereo coding only on non-transient and eligible channels
@@ -191,7 +192,7 @@ def _analyze_frame(padded, start, n_ch, tilt_db, detectors, tns_hang, ms_flags=N
         X = raw[ch]
         order, q_k = 0, np.zeros(0, dtype=np.int32)
         if eligible[ch]:
-            order, k_dq, q_k, _ = tns_analyze(X)
+            order, k_dq, q_k, _ = tns_analyze(X, not attack[ch])
             if order > 0:
                 X = lattice_fir(X, k_dq)
         Xs.append(X)
