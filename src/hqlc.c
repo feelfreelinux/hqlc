@@ -16,6 +16,10 @@
 hqlc_bench_ctx *hqlc_bench = NULL;
 #endif
 
+// Boost for transient frames, letting it use more bits
+// 1/4 = 25% boost in the rate controller
+#define RC_TRANSIENT_BOOST 4
+
 // Interpolated quantizer steps on tonal frames, flat on TNS (transient)
 // frames. The TNS flag is transmitted, so both sides gate identically.
 static inline bool env_interp_active(int tns_order) {
@@ -291,6 +295,7 @@ static int select_gain(hqlc_encoder *enc,
                        const int32_t *exp_indices,
                        int n_ch,
                        const bool *ms_flags,
+                       bool transient,
                        bool *quiet_frame_out,
                        int *target_bpf_out) {
   *quiet_frame_out = false;
@@ -307,8 +312,10 @@ static int select_gain(hqlc_encoder *enc,
     tol = 8;
   }
 
+  // Attacks get a larger share of the budget, resevoir absorbs it later
   int borrow = fxp_clamp_i32(enc->res_bits, -target_bpf, target_bpf);
-  int effective_target = target_bpf + borrow / 2;
+  int boost = transient ? target_bpf / RC_TRANSIENT_BOOST : 0;
+  int effective_target = target_bpf + borrow / 2 + boost;
   effective_target = fxp_clamp_i32(effective_target, target_bpf / 4, target_bpf * 3);
 
   int gc0 = enc->prev_gain_code;
@@ -467,6 +474,7 @@ hqlc_error hqlc_encode_frame(hqlc_encoder *enc,
                           exp_indices,
                           n_ch,
                           enc->ms_flags,
+                          tns_eligible[0] || (n_ch > 1 && tns_eligible[1]),
                           &quiet_frame,
                           &target_bpf);
   HQLC_BENCH_END(HQLC_BENCH_ENC_SELECT_GAIN);
