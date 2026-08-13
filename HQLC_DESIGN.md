@@ -220,15 +220,4 @@ Transient frames get a 25% budget boost, which is later compensated on steady fr
 
 ## Patent status
 
-To the best of my knowledge, every building block in HQLC is either public domain or based on long-expired patents:
-
-- **MDCT / DCT-IV via FFT** - standard signal processing, public domain.
-- **KBD window** - published by Kaiser and Bessel, no patent restrictions.
-- **Band exponents / DPCM coding** - basic quantization and differential coding techniques, public domain.
-- **TNS** - the original Fraunhofer patents from the mid-90s have expired. The underlying techniques (Levinson-Durbin, lattice filters, LAR quantization) are textbook DSP.
-- **Deadzone quantization** - standard quantization theory, public domain.
-- **Rice coding** - public domain.
-- **rANS** - explicitly placed in the public domain by Jarek Duda.
-- **Rate control / bit reservoir** - basic rate control strategies are not patentable; specific implementations in other codecs may be, but HQLC's approach is straightforward and original.
-
 This codec is designed to be fully patent-free and royalty-free. That said, I'm not a lawyer - if you're shipping a product, do your own due diligence.
