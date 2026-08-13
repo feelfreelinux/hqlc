@@ -287,7 +287,7 @@ _RANS_FREQ = [
     [25, 38, 38, 37, 36, 35, 34, 33, 32, 31, 30, 29, 29, 27, 26, 544],  # a=11 act=3
 ]
 _RANS_CF = [None] * _RANS_NTABLES
-_RANS_COST_Q8 = [None] * _RANS_NTABLES
+_RANS_COST_BITS = [None] * _RANS_NTABLES
 
 
 def _cumfreq(freq):
@@ -301,9 +301,7 @@ def _cumfreq(freq):
 # Pre-build CFs and cost tables
 for _bk in range(_RANS_NTABLES):
     _RANS_CF[_bk] = _cumfreq(_RANS_FREQ[_bk])
-    _RANS_COST_Q8[_bk] = [
-        int(round(-math.log2(max(f, 1) / RANS_M) * 256.0)) for f in _RANS_FREQ[_bk]
-    ]
+    _RANS_COST_BITS[_bk] = [-math.log2(max(f, 1) / RANS_M) for f in _RANS_FREQ[_bk]]
 
 
 def _alpha_bin(band, gain):
@@ -353,26 +351,26 @@ def rans_table_idx(band, gain, activity, alpha_shift=0):
 
 
 def get_rans_tables(table_idx):
-    """Return (freq, cf, cost_q8) for a rANS probability table index."""
+    """Return (freq, cf, cost_bits) for a rANS probability table index."""
     return (
         _RANS_FREQ[table_idx],
         _RANS_CF[table_idx],
-        _RANS_COST_Q8[table_idx],
+        _RANS_COST_BITS[table_idx],
     )
 
 
-def coeff_cost_q8(cost_q8, value):
-    """Cost in Q8 bits for one signed quantized coefficient."""
+def coeff_cost(cost_bits, value):
+    """Cost in bits for one signed quantized coefficient."""
     mag = abs(value)
     if mag < RANS_MAX_SYM - 1:
-        c = int(cost_q8[mag])
+        c = cost_bits[mag]
     else:
-        c = int(cost_q8[RANS_MAX_SYM - 1])
+        c = cost_bits[RANS_MAX_SYM - 1]
         overflow = mag - (RANS_MAX_SYM - 1)
         nbits = (overflow + 1).bit_length() - 1
-        c += (2 * nbits + 1) * 256  # EG(0) prefix + suffix
+        c += 2 * nbits + 1  # EG(0) prefix + suffix
     if value != 0:
-        c += 256  # sign bit
+        c += 1  # sign bit
     return c
 
 

@@ -2,7 +2,7 @@
 
 Frame layout:
   [gain_code: 7b] [M/S flags: RLE, stereo only] [TNS per ch] [exponents]
-  [noise factors] [padding] [rANS payload]
+  [padding] [rANS payload]
 
 TNS per channel:
   [active: 1b] [order-1: 3b if active] [LAR indices: 4b each if active]
@@ -11,7 +11,6 @@ Exponents:
   Ch0: Rice-coded DPCM (3-bit k + zigzag + Rice codes)
   Ch1+: Rice-coded delta from ch0
 
-Noise factor: 3 bits per channel
 + padding 0-7 bits to byte-align before rANS payload
 """
 
@@ -42,7 +41,7 @@ from .tns import TNS_K_BITS, TNS_LAR_MAX
 
 
 def count_side_bits(n_ch, tns_orders, tns_q_ks, exp_indices, ms_flags=None):
-    """Count side information bits (gain + TNS + exponents + noise factors + pad)."""
+    """Count side information bits (gain + TNS + exponents + pad)."""
     bits = GAIN_BITS
     if ms_flags is not None and n_ch == 2:
         bits += binary_rle_bits(ms_flags, 1)  # per-band M/S flags, binary RLE
@@ -68,14 +67,11 @@ def count_side_bits(n_ch, tns_orders, tns_q_ks, exp_indices, ms_flags=None):
         k = find_best_rice_k(deltas)
         bits += 3 + sum((zigzag_enc(d) >> k) + 1 + k for d in deltas)
 
-    bits += 3 * n_ch  # noise factors (3 bits per channel)
     bits += (8 - bits % 8) % 8  # byte alignment
     return bits
 
 
-def encode_frame(
-    gain, tns_orders, tns_q_ks, exp_indices, all_quants, noise_factors, ms_flags=None
-):
+def encode_frame(gain, tns_orders, tns_q_ks, exp_indices, all_quants, ms_flags=None):
     """Encode one frame, returns (total_bits, payload_bytes)"""
     n_ch = len(tns_orders)
     side = BitWriter()
@@ -118,10 +114,6 @@ def encode_frame(
         side.write(k, 3)
         for d in ch_deltas:
             side.write_rice(zigzag_enc(d), k)
-
-    # Noise factors, 3 bits per channel (8 means no noise, clamped to 7)
-    for ch in range(n_ch):
-        side.write(min(noise_factors[ch], 7), 3)
 
     # Byte align
     pad = (8 - side.total_bits() % 8) % 8
@@ -169,7 +161,7 @@ def decode_frame(payload, n_channels, has_ms=False):
     """Decode one frame from payload bytes.
 
     ms_flags is None unless has_ms
-    Returns (gain, tns_orders, tns_ks, exp_indices, all_quants, noise_factors, ms_flags)
+    Returns (gain, tns_orders, tns_ks, exp_indices, all_quants, ms_flags)
     """
     br = BitReader(payload)
     gain_code = br.read(GAIN_BITS)
@@ -208,9 +200,6 @@ def decode_frame(payload, n_channels, has_ms=False):
         k = br.read(3)
         for b in range(N_BANDS):
             exp_indices[ch][b] = exp_indices[0][b] + zigzag_dec(br.read_rice(k))
-
-    # Noise factors (3 bits per channel)
-    noise_factors = [br.read(3) for _ in range(n_channels)]
 
     # Byte align to rANS start
     bits_used = br.bits_read()
@@ -264,4 +253,4 @@ def decode_frame(payload, n_channels, has_ms=False):
         else:
             tns_ks.append(np.zeros(0, dtype=np.float64))
 
-    return gain, tns_orders, tns_ks, exp_indices, all_quants, noise_factors, ms_flags
+    return gain, tns_orders, tns_ks, exp_indices, all_quants, ms_flags
