@@ -1,5 +1,7 @@
 """Core constants and band definitions for HQLC."""
 
+import math
+
 # Frame / block dimensions
 FRAME_LEN = 512
 BLOCK_SIZE = 1024
@@ -115,6 +117,9 @@ for _fc in _FINE_CENTERS:
 EXP_INDEX_BIAS = 43
 EXP_INDEX_MAX = 63
 EXP_INDEX_MIN = 0
+
+# One exponent index is a quarter octave of step size, so ~1.505 dB
+DB_PER_EXP_INDEX = 20.0 * math.log10(2.0) / 4.0
 
 # Quantizer parameters
 DEAD_ZONE = 0.65  # below this threshold, coefficient quantizes to zero

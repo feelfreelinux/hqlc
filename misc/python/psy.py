@@ -8,6 +8,7 @@ import numpy as np
 
 from .constants import (
     BAND_EDGES,
+    DB_PER_EXP_INDEX,
     EXP_INDEX_BIAS,
     EXP_INDEX_MAX,
     EXP_INDEX_MIN,
@@ -30,9 +31,13 @@ def tilt_for_bitrate(bitrate):
     return max(15, tilt)
 
 
-def tilt_step_q7(tilt_db):
-    """Per-fine-band tilt increment in EXP_Q7 (128 per exponent index unit)"""
-    return (int(tilt_db) * 118612 + 32768) >> 16
+def tilt_step(tilt_db):
+    """Per-fine-band tilt increment, in exponent-index units.
+
+    The tilt is spread evenly over the active fine bands, at DB_PER_EXP_INDEX
+    per exponent index. The C reference keeps the same step in EXP_Q7.
+    """
+    return tilt_db / (N_ACTIVE_FINE * DB_PER_EXP_INDEX)
 
 
 def compute_exponents(X, tilt_db=FINE_TILT_DB, transient=False):
@@ -61,7 +66,7 @@ def compute_exponents(X, tilt_db=FINE_TILT_DB, transient=False):
             psd[fb] = sm
 
     # Tilt increment per fine band, in exponent-index units
-    tilt_per_fb = tilt_step_q7(tilt_db) / 128.0
+    tilt_per_fb = tilt_step(tilt_db)
 
     if not transient:
         # Hat-basis: each fine band's tilted log-PSD is split between its two

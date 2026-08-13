@@ -12,14 +12,14 @@ from .constants import FRAME_LEN
 
 TNS_MAX_ORDER = 4
 TNS_MAX_K = 0.92
-TNS_PRED_GAIN_THR = 1.5
+TNS_PRED_GAIN_THR = 1.2
 TNS_K_BITS = 4
 TNS_LAR_MAX = 3.5
 TNS_START_BIN = 20  # ~940 Hz
 
 
-# Adapted from the C impl, hence the shifts
-TNS_DETECT_FLOOR = (1 << 20) / float(1 << 30)
+# Sub-block energy below this is treated as silence (the C impl carries it in Q30)
+TNS_DETECT_FLOOR = 2.0**-10
 
 TNS_DETECT_SUBBLOCKS = 8
 TNS_DETECT_RATIO = 8
@@ -72,7 +72,7 @@ def _autocorrelation(x, max_order):
     return r
 
 
-def _levinson_durbin(r, max_order, k_threshold=0.1):
+def _levinson_durbin(r, max_order):
     """Does the levinson-durbin recursion to compute (reflection_coeffs, order, prediction_gain)"""
     if r[0] < 1e-30:
         return np.zeros(0, dtype=np.float64), 0, 1.0
@@ -84,8 +84,6 @@ def _levinson_durbin(r, max_order, k_threshold=0.1):
         for j in range(i):
             acc += a[j] * r[i - j]
         ki = np.clip(-acc / error, -0.999, 0.999)
-        if abs(ki) < k_threshold:
-            break
         error *= 1.0 - ki * ki
         if error < 1e-30:
             break
