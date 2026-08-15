@@ -1,7 +1,5 @@
 #include "quant.h"
 
-#include <math.h>
-
 #include "fxp.h"
 #include "hqlc.h"
 #include "hqlc_bench.h"
@@ -11,10 +9,20 @@
 // Tuned empirically, but seems to match what other codecs do too
 #define NF_START_BIN 75
 
+// Quantizer scale: step = 2^(E/8), E = 2*exp - gain_code - 59
+#define QUANT_EXP_OFFSET 59
+
+// Q31 spectrum * Q28 inverse step -> Q8 quantizer domain
+#define QUANT_TOTAL_Q 51
+
+// Deadzone threshold and MMSE reconstruction centroid for a Laplacian source
+#define QUANT_DZ_THRESH_Q8 (FXP_Q8(0.65) + 1)
+#define QUANT_CENTROID_Q8   FXP_Q8(0.15)
+
 // Quantizer step: step = 2^(E/8) with E = 2*exp - gain_code - QUANT_EXP_OFFSET,
 // decomposed as pow2_eighth[E % 8] * 2^(E / 8)
 // 2^(f/8) for f=0..7, Q30
-const int32_t quant_pow2_eighth_q30[8] = {
+static const int32_t quant_pow2_eighth_q30[8] = {
     1073741824,
     1170923762,
     1276901417,
@@ -24,6 +32,15 @@ const int32_t quant_pow2_eighth_q30[8] = {
     1805811301,
     1969251188,
 };
+
+quant_scale quant_forward_scale(int exp_index, int gain_code, int spectrum_exp) {
+  int inverse_step_eighths = gain_code + QUANT_EXP_OFFSET - 2 * exp_index;
+  quant_scale scale = {
+      .multiplier_q28 = quant_pow2_eighth_q30[inverse_step_eighths & 7] >> 2,
+      .product_rshift = QUANT_TOTAL_Q - spectrum_exp - (inverse_step_eighths >> 3),
+  };
+  return scale;
+}
 
 // Reciprocals of the band-center distances, for the per-bin interpolation
 static const uint16_t seg_rcp_q15[PSY_N_BANDS - 1] = {
@@ -82,12 +99,12 @@ static inline void quant_bin(int16_t *out, int32_t scaled_q8, int32_t sign) {
   *out = (int16_t)((q ^ sign) - sign);
 }
 
-void quant_forward(const int32_t *spec_q31,
-                   int loss_bits,
+void quant_forward(const bfp_i32 *spectrum,
                    const int32_t *exp_indices,
                    int gain_code,
                    bool interp,
                    int16_t *quant_out) {
+  const int32_t *spec_q31 = spectrum->data;
   for (int i = PSY_ACTIVE_BINS; i < HQLC_FRAME_SAMPLES; i++) {
     quant_out[i] = 0;
   }
@@ -101,8 +118,6 @@ void quant_forward(const int32_t *spec_q31,
     bin_exp_flat(exp_indices, bin_exp);
   }
 
-  int E_bias = gain_code + QUANT_EXP_OFFSET;
-
   int i = 0;
   while (i < PSY_ACTIVE_BINS) {
     int32_t be = bin_exp[i];
@@ -111,33 +126,32 @@ void quant_forward(const int32_t *spec_q31,
       run_end++;
     }
 
-    int neg_E = E_bias - 2 * (int)be;
-    int32_t inv_step_m = quant_pow2_eighth_q30[neg_E & 7] >> 2;
-    int total_shift = QUANT_TOTAL_Q - loss_bits - (neg_E >> 3);
+    quant_scale scale = quant_forward_scale((int)be, gain_code, spectrum->exp2);
 
-    if (total_shift >= 64) {
+    if (scale.product_rshift >= 64) {
       // Step too coarse: the whole run quantizes to zero
       for (; i < run_end; i++) {
         quant_bin(&quant_out[i], 0, 0);
       }
-    } else if (total_shift >= 32) {
+    } else if (scale.product_rshift >= 32) {
       // Common case: only the high word of the product is needed
-      int small_shift = total_shift - 32;
+      int small_shift = scale.product_rshift - 32;
       for (; i < run_end; i++) {
         int32_t x = spec_q31[i];
         int32_t sign = x >> 31;
-        int32_t abs_spec = (x ^ sign) - sign;
-        int32_t hi = (int32_t)((int64_t)abs_spec * inv_step_m >> 32);
+        int32_t abs_spec = fxp_abs_i32(x);
+        int32_t hi = fxp_mul_rshift_i32(abs_spec, scale.multiplier_q28, 32);
         int32_t scaled_q8 = hi >> small_shift;
 
         quant_bin(&quant_out[i], scaled_q8, sign);
       }
-    } else if (total_shift > 0) {
+    } else if (scale.product_rshift > 0) {
       for (; i < run_end; i++) {
         int32_t x = spec_q31[i];
         int32_t sign = x >> 31;
-        int32_t abs_spec = (x ^ sign) - sign;
-        int32_t scaled_q8 = (int32_t)((int64_t)abs_spec * inv_step_m >> total_shift);
+        int32_t abs_spec = fxp_abs_i32(x);
+        int32_t scaled_q8 = (int32_t)((int64_t)abs_spec * scale.multiplier_q28 >>
+                                      scale.product_rshift);
 
         quant_bin(&quant_out[i], scaled_q8, sign);
       }
@@ -146,9 +160,9 @@ void quant_forward(const int32_t *spec_q31,
       for (; i < run_end; i++) {
         int32_t x = spec_q31[i];
         int32_t sign = x >> 31;
-        int32_t abs_spec = (x ^ sign) - sign;
-        int32_t scaled_q8 =
-            fxp_sat_i64_to_i32((int64_t)abs_spec * inv_step_m << (-total_shift));
+        int32_t abs_spec = fxp_abs_i32(x);
+        int32_t scaled_q8 = fxp_sat_i64_to_i32(
+            (int64_t)abs_spec * scale.multiplier_q28 << (-scale.product_rshift));
 
         quant_bin(&quant_out[i], scaled_q8, sign);
       }
@@ -162,8 +176,8 @@ void quant_inverse(const int16_t *quant_in,
                    const int32_t *exp_indices,
                    int gain_code,
                    bool interp,
-                   int32_t *spec_q31,
-                   int *loss_bits_out) {
+                   bfp_i32 *spectrum) {
+  int32_t *spec_q31 = spectrum->data;
   int max_exp = exp_indices[0];
   for (int b = 1; b < PSY_N_BANDS; b++) {
     if (exp_indices[b] > max_exp) {
@@ -190,7 +204,7 @@ void quant_inverse(const int16_t *quant_in,
     int E = 2 * (int)bin_exp[i] - gain_code - QUANT_EXP_OFFSET;
     int32_t step_m = quant_pow2_eighth_q30[E & 7] >> 2;
     int oct_shift = max_oct - (E >> 3);
-    int32_t dq_q8 = mag * 256 + FXP_Q8(QUANT_CENTROID);
+    int32_t dq_q8 = fxp_rescale_i32(mag, 0, 8) + QUANT_CENTROID_Q8;
     uint64_t val =
         (oct_shift < 63) ? (uint64_t)((int64_t)dq_q8 * step_m >> oct_shift) : 0;
     if (val > max_val) {
@@ -202,7 +216,7 @@ void quant_inverse(const int16_t *quant_in,
     for (int i = 0; i < HQLC_FRAME_SAMPLES; i++) {
       spec_q31[i] = 0;
     }
-    *loss_bits_out = 0;
+    spectrum->exp2 = 0;
     return;
   }
 
@@ -223,18 +237,12 @@ void quant_inverse(const int16_t *quant_in,
     int E = 2 * (int)bin_exp[i] - gain_code - QUANT_EXP_OFFSET;
     int32_t step_m = quant_pow2_eighth_q30[E & 7] >> 2;
     int total_shift = (max_oct - (E >> 3)) + norm_shift;
-    int32_t dq_q8 = mag * 256 + FXP_Q8(QUANT_CENTROID);
+    int32_t dq_q8 = fxp_rescale_i32(mag, 0, 8) + QUANT_CENTROID_Q8;
     spec_q31[i] =
         (total_shift < 63) ? sign * (int32_t)((int64_t)dq_q8 * step_m >> total_shift) : 0;
   }
 
-  *loss_bits_out = max_oct - headroom + 27;
-}
-
-int quant_gain_encode(float gain) {
-  float v = log2f(gain > 1e-12f ? gain : 1e-12f) * QUANT_GAIN_Q;
-  int code = (int)(v >= 0.0f ? (v + 0.5f) : (v - 0.5f)) + QUANT_GAIN_BIAS;
-  return fxp_clamp_i32(code, 0, QUANT_GAIN_MAX_CODE);
+  spectrum->exp2 = max_oct - headroom + 27;
 }
 
 void noise_fill(const int16_t *quant,
@@ -243,8 +251,8 @@ void noise_fill(const int16_t *quant,
                 bool interp,
                 uint32_t seed,
                 const bool *skip_bands,
-                int32_t *spec_q31,
-                int *loss_bits_io) {
+                bfp_i32 *spectrum) {
+  int32_t *spec_q31 = spectrum->data;
   int32_t bin_exp[PSY_ACTIVE_BINS];
   if (interp) {
     bin_exp_interp(exp_indices, bin_exp);
@@ -280,20 +288,21 @@ void noise_fill(const int16_t *quant,
     // zero fraction for the band
     int32_t z_q15 = (nz << 15) / n;
 
-    if (z_q15 >= FXP_Q(1.0, 15)) {
+    if (z_q15 >= FXP_Q15(1.0)) {
       // All zeros bands get the last entry from the nf probabilities
-      z_q15 = FXP_Q(1.0, 15) - 1;
+      z_q15 = FXP_Q15(1.0) - 1;
     }
     int zi = z_q15 >> 10;
 
     // Only the excess of zeros over nonzeros counts as evidence of a missing
     // noise floor. Every zero bin is filled at that excess
-    int32_t excess_q15 = (z_q15 << 1) - FXP_Q(1.0, 15);
+    int32_t excess_q15 = (z_q15 << 1) - FXP_Q15(1.0);
     if (excess_q15 <= 0) {
       // less than 50% is zeros - skip NF, enough spectral information is present
       continue;
     }
-    factor_q8[b] = (uint8_t)((nf_laplace_rms_q8[zi] * excess_q15 + (1 << 14)) >> 15);
+    factor_q8[b] = (uint8_t)fxp_mul_rshift_rnd_i32(
+        nf_laplace_rms_q8[zi], excess_q15, 15);
     if (factor_q8[b] == 0) {
       continue;
     }
@@ -308,16 +317,9 @@ void noise_fill(const int16_t *quant,
     return;
   }
 
-  int loss_bits = *loss_bits_io;
   const int nf_guard_bits = 3;
-  int fill_loss = max_fill_oct - nf_guard_bits;
-  if (fill_loss > loss_bits) {
-    int delta = fill_loss - loss_bits;
-    for (int i = 0; i < HQLC_FRAME_SAMPLES; i++) {
-      spec_q31[i] >>= delta;
-    }
-    loss_bits = fill_loss;
-  }
+  int fill_exp2 = max_fill_oct - nf_guard_bits;
+  bfp_i32_coarsen(spectrum, fill_exp2);
 
   for (int b = 0; b < PSY_N_BANDS; b++) {
     // Skipped and pre-start bands never acquire a factor, so this gates both
@@ -331,8 +333,8 @@ void noise_fill(const int16_t *quant,
       int E = 2 * (int)bin_exp[i] - gain_code - QUANT_EXP_OFFSET;
       int octave = E >> 3;
       int32_t step_m = quant_pow2_eighth_q30[E & 7] >> 2;
-      int32_t fill_m = (int32_t)((uint64_t)factor_q8[b] * (uint32_t)step_m >> 8);
-      int shift = loss_bits - octave - nf_guard_bits;
+      int32_t fill_m = fxp_mul_rshift_i32(factor_q8[b], step_m, 8);
+      int shift = spectrum->exp2 - octave - nf_guard_bits;
       int32_t fill_q31;
       if (shift >= 32) {
         fill_q31 = 0;
@@ -351,6 +353,4 @@ void noise_fill(const int16_t *quant,
       spec_q31[i] = (seed & 0x80000000u) ? -fill_q31 : fill_q31;
     }
   }
-
-  *loss_bits_io = loss_bits;
 }

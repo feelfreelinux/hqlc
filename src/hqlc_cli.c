@@ -326,7 +326,7 @@ do_encode(const char *in, const char *out, hqlc_mode mode, uint32_t bitrate, flo
   if (g_train_path) {
     FILE *th = fopen(g_train_path, "w");
     if (th) {
-      for (int t = 0; t < RANS_NTABLES; t++) {
+    for (int t = 0; t < RANS_COEF_NTABLES; t++) {
         for (int sym = 0; sym < RANS_MAX_SYM; sym++) {
           fprintf(th, "%llu%c", (unsigned long long)rans_train_hist[t][sym],
                   sym == RANS_MAX_SYM - 1 ? '\n' : ' ');

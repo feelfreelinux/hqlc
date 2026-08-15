@@ -2,6 +2,9 @@
 
 #include "fxp.h"
 
+#define PSY_N_FINE_BANDS  48
+#define PSY_N_ACTIVE_FINE 47
+
 // pre-calculated band edges, 20 bands + 1 end, ERB scale
 // Stops at bin 427 (~20 kHz), zero'ed above that
 const uint16_t psy_band_edges[PSY_N_BANDS + 1] = {
@@ -10,7 +13,7 @@ const uint16_t psy_band_edges[PSY_N_BANDS + 1] = {
 };
 
 // 48 fine bands, single-bin spaced below 844 Hz (18 bands), ERB-spaced above
-const uint16_t psy_fine_band_edges[PSY_N_FINE_BANDS + 1] = {
+static const uint16_t psy_fine_band_edges[PSY_N_FINE_BANDS + 1] = {
     0,   1,   2,   3,   4,   5,   6,   7,   8,   9,   10,  11,  12,  13,  14,  15, 16,
     17,  18,  20,  23,  26,  29,  33,  37,  42,  47,  53,  59,  66,  74,  83,  92, 102,
     114, 127, 141, 157, 174, 193, 214, 238, 264, 293, 325, 361, 400, 427, 512,
@@ -22,9 +25,6 @@ static const uint8_t psy_fb_coarse[PSY_N_FINE_BANDS] = {
     3,  3,  4,  4,  4,  5,  5,  6,  6,  7,  7,  8,  9,  9,  10, 10,
     11, 12, 12, 13, 13, 14, 15, 15, 16, 16, 17, 18, 18, 19, 19, 19,
 };
-
-// Number of active fine bands
-#define PSY_N_ACTIVE_FINE 47
 
 int psy_tilt_for_bitrate(uint32_t bitrate) {
   // 35 dB at >=128 kbps, ramps down 5 dB per 32 kbps, floor at 15 dB
@@ -38,7 +38,7 @@ int psy_tilt_for_bitrate(uint32_t bitrate) {
 int psy_tilt_step_q7(int tilt_db) {
   // dB tilt to per-fine-band step in EXP_Q7, spread over the 47 active
   // fine bands at ~1.505 dB per exponent unit: step = tilt_db * 1.81
-  return (tilt_db * FXP_Q(1.81, 16) + 32768) >> 16;
+  return fxp_mul_rshift_rnd_i32(tilt_db, FXP_Q16(1.81), 16);
 }
 
 // Fine bands per coarse band, divisor for the transient path
@@ -75,17 +75,23 @@ static inline uint64_t psy_div_u52(uint64_t num, uint32_t den) {
   return ((uint64_t)q_hi << 20) + rem / den;
 }
 
+// The exponent-index domain uses 2*log2(PSD) in Q7. Reinterpreting the raw
+// log2(PSD) Q8 result as Q7 performs that factor-of-two conversion exactly.
+static inline int32_t psy_psd_to_log_index_q7(uint64_t psd) {
+  return (psd == 0) ? 0 : fxp_log2_q8_u64(psd);
+}
+
 // 20 coarse-band exponents from 47 fine-band PSDs. Non-transient frames get
 // 1-2-1 PSD smoothing + hat-basis aggregation, transient frames use a plain
 // geometric mean (flat steps, attacks need a sharp envelope)
-void psy_fine_band_exponents(const int32_t *spec_q31,
-                             int loss_bits,
-                             int tilt_step,
+void psy_fine_band_exponents(const bfp_i32 *spectrum,
+                             int tilt_step_q7,
                              int transient,
                              int32_t *exp_indices) {
+  const int32_t *spec_q31 = spectrum->data;
   // Bias in EXP_Q7
-  int32_t bias_v = 4 * loss_bits - 49;
-  int32_t bias = bias_v * 128 + (bias_v < 0);
+  int32_t bias_index = 4 * spectrum->exp2 - 49;
+  int32_t bias_q7 = bias_index * 128 + (bias_index < 0);
 
   // Per-fine-band mean power per bin
   uint64_t psd[PSY_N_ACTIVE_FINE];
@@ -117,37 +123,37 @@ void psy_fine_band_exponents(const int32_t *spec_q31,
   // band centers, mirroring the quantizer's per-bin interpolation weights
   if (!transient) {
     // weight * lg sums stay well under 2^31, 32-bit accumulators suffice
-    int32_t wl[PSY_N_BANDS] = {0};
-    int32_t tilt_acc = 0;
+    int32_t weighted_log_q7[PSY_N_BANDS] = {0};
+    int32_t tilt_acc_q7 = 0;
     for (int fb = 0; fb < PSY_N_ACTIVE_FINE; fb++) {
-      int32_t lg = ((psd[fb] == 0) ? 0 : fxp_log2_q8_u64(psd[fb])) + tilt_acc;
-      tilt_acc += tilt_step;
+      int32_t log_index_q7 = psy_psd_to_log_index_q7(psd[fb]) + tilt_acc_q7;
+      tilt_acc_q7 += tilt_step_q7;
       int k = psy_hat_w[fb].k;
       int32_t t = psy_hat_w[fb].t;
-      wl[k] += (256 - t) * lg;
-      wl[k + 1] += t * lg;
+      weighted_log_q7[k] += (256 - t) * log_index_q7;
+      weighted_log_q7[k + 1] += t * log_index_q7;
     }
     for (int b = 0; b < PSY_N_BANDS; b++) {
-      int32_t exp_q7 = wl[b] / psy_hat_ws[b] + bias;
+      int32_t log_index_q7 = weighted_log_q7[b] / psy_hat_ws[b] + bias_q7;
       exp_indices[b] = fxp_clamp_i32(
-          fxp_round_to_int(exp_q7, 7), PSY_EXP_INDEX_MIN, PSY_EXP_INDEX_MAX);
+          fxp_round_to_int(log_index_q7, 7), PSY_EXP_INDEX_MIN, PSY_EXP_INDEX_MAX);
     }
     return;
   }
 
   // Simple geometric mean per coarse band
-  int32_t log_sum[PSY_N_BANDS] = {0};
-  int32_t tilt_acc = 0;
+  int32_t log_index_sum_q7[PSY_N_BANDS] = {0};
+  int32_t tilt_acc_q7 = 0;
 
   for (int fb = 0; fb < PSY_N_ACTIVE_FINE; fb++) {
-    int32_t log_psd = (psd[fb] == 0) ? 0 : fxp_log2_q8_u64(psd[fb]);
-    log_sum[psy_fb_coarse[fb]] += log_psd + tilt_acc;
-    tilt_acc += tilt_step;
+    int32_t log_index_q7 = psy_psd_to_log_index_q7(psd[fb]);
+    log_index_sum_q7[psy_fb_coarse[fb]] += log_index_q7 + tilt_acc_q7;
+    tilt_acc_q7 += tilt_step_q7;
   }
 
   for (int b = 0; b < PSY_N_BANDS; b++) {
-    int32_t exp_q7 = log_sum[b] / fb_per_coarse[b] + bias;
-    exp_indices[b] =
-        fxp_clamp_i32(fxp_round_to_int(exp_q7, 7), PSY_EXP_INDEX_MIN, PSY_EXP_INDEX_MAX);
+    int32_t log_index_q7 = log_index_sum_q7[b] / fb_per_coarse[b] + bias_q7;
+    exp_indices[b] = fxp_clamp_i32(
+        fxp_round_to_int(log_index_q7, 7), PSY_EXP_INDEX_MIN, PSY_EXP_INDEX_MAX);
   }
 }

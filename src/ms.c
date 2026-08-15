@@ -2,6 +2,10 @@
 
 #include "psy.h"
 
+// S-channel exponent bias on flagged bands:
+//   bias = clamp(exp0 - exp1 - MS_BIAS_GAP, 0, MS_BIAS_CAP)
+#define MS_BIAS_GAP 2
+#define MS_BIAS_CAP 6
 
 // Pre-shift to keep the energy calculations from overflowing within uint64
 #define MS_GATE_ENERGY_SHIFT 7
@@ -14,34 +18,8 @@
 #define MS_GATE_RESET_NUM 13ULL
 #define MS_GATE_RESET_DEN 32ULL
 
-// Align two BFP spectra into a shared exponent domain.
-static int spec_bfp_align(int32_t *spec0_q31,
-                          int32_t *spec1_q31,
-                          int loss_bits0,
-                          int loss_bits1,
-                          int headroom_bits) {
-  int target_loss = (loss_bits0 > loss_bits1) ? loss_bits0 : loss_bits1;
-  target_loss += headroom_bits;
-
-  int shift0 = target_loss - loss_bits0;
-  int shift1 = target_loss - loss_bits1;
-  for (int i = 0; i < PSY_ACTIVE_BINS; i++) {
-    spec0_q31[i] >>= shift0;
-    spec1_q31[i] >>= shift1;
-  }
-
-  return target_loss;
-}
-
-static bool ms_gate(const int32_t *spec0_q31,
-                    const int32_t *spec1_q31,
-                    int loss_bits0,
-                    int loss_bits1,
-                    bool *ms_flags) {
-  // Calculate common loss bits and shift factors for both channels.
-  int common_loss_bits = (loss_bits0 > loss_bits1) ? loss_bits0 : loss_bits1;
-  int shift0 = common_loss_bits - loss_bits0;
-  int shift1 = common_loss_bits - loss_bits1;
+static bool ms_gate(const bfp_i32 *channel0, const bfp_i32 *channel1, bool *ms_flags) {
+  bfp_alignment alignment = bfp_i32_alignment(channel0, channel1, 0);
 
   bool any = false;
   for (int b = 0; b < PSY_N_BANDS; b++) {
@@ -50,8 +28,10 @@ static bool ms_gate(const int32_t *spec0_q31,
 
     for (int i = psy_band_edges[b]; i < psy_band_edges[b + 1]; i++) {
       // Calculate the mid/side energy for each channel, shifted accordingly
-      int64_t ch0 = ((int64_t)spec0_q31[i] >> shift0) >> MS_GATE_ENERGY_SHIFT;
-      int64_t ch1 = ((int64_t)spec1_q31[i] >> shift1) >> MS_GATE_ENERGY_SHIFT;
+      int64_t ch0 =
+          ((int64_t)channel0->data[i] >> alignment.a_rshift) >> MS_GATE_ENERGY_SHIFT;
+      int64_t ch1 =
+          ((int64_t)channel1->data[i] >> alignment.b_rshift) >> MS_GATE_ENERGY_SHIFT;
       int64_t mid = ch0 + ch1;
       int64_t side = ch0 - ch1;
 
@@ -74,37 +54,28 @@ static bool ms_gate(const int32_t *spec0_q31,
   return any;
 }
 
-void ms_encode(int32_t *spec0_q31,
-               int32_t *spec1_q31,
-               int *loss_bits0,
-               int *loss_bits1,
-               bool *ms_flags) {
-  if (!ms_gate(spec0_q31, spec1_q31, *loss_bits0, *loss_bits1, ms_flags)) {
+void ms_encode(bfp_i32 *channel0, bfp_i32 *channel1, bool *ms_flags) {
+  if (!ms_gate(channel0, channel1, ms_flags)) {
     return;
   }
 
   // Align BFP into same domain before replacing flagged L/R bands with M/S.
-  *loss_bits0 = spec_bfp_align(spec0_q31, spec1_q31, *loss_bits0, *loss_bits1, 0);
-  *loss_bits1 = *loss_bits0;
+  bfp_i32_align_pair(channel0, channel1, 0);
 
   for (int b = 0; b < PSY_N_BANDS; b++) {
     if (!ms_flags[b]) {
       continue;
     }
     for (int i = psy_band_edges[b]; i < psy_band_edges[b + 1]; i++) {
-      int64_t ch0 = spec0_q31[i];
-      int64_t ch1 = spec1_q31[i];
-      spec0_q31[i] = (int32_t)((ch0 + ch1) >> 1); // M
-      spec1_q31[i] = (int32_t)((ch0 - ch1) >> 1); // S
+      int64_t ch0 = channel0->data[i];
+      int64_t ch1 = channel1->data[i];
+      channel0->data[i] = (int32_t)((ch0 + ch1) >> 1); // M
+      channel1->data[i] = (int32_t)((ch0 - ch1) >> 1); // S
     }
   }
 }
 
-void ms_decode(int32_t *spec0_q31,
-               int32_t *spec1_q31,
-               int *loss_bits0,
-               int *loss_bits1,
-               bool *ms_flags) {
+void ms_decode(bfp_i32 *mid, bfp_i32 *side, const bool *ms_flags) {
   bool has_ms = false;
   for (int b = 0; b < PSY_N_BANDS; b++) {
     if (ms_flags[b]) {
@@ -119,18 +90,17 @@ void ms_decode(int32_t *spec0_q31,
   }
 
   // Give headroom for the M/S bands after quant inverse.
-  *loss_bits0 = spec_bfp_align(spec0_q31, spec1_q31, *loss_bits0, *loss_bits1, 1);
-  *loss_bits1 = *loss_bits0;
+  bfp_i32_align_pair(mid, side, 1);
 
   for (int b = 0; b < PSY_N_BANDS; b++) {
     if (!ms_flags[b]) {
       continue;
     }
     for (int i = psy_band_edges[b]; i < psy_band_edges[b + 1]; i++) {
-      int32_t mid = spec0_q31[i];
-      int32_t side = spec1_q31[i];
-      spec0_q31[i] = mid + side; // L
-      spec1_q31[i] = mid - side; // R
+      int32_t mid_value = mid->data[i];
+      int32_t side_value = side->data[i];
+      mid->data[i] = mid_value + side_value; // L
+      side->data[i] = mid_value - side_value; // R
     }
   }
 }

@@ -14,20 +14,16 @@ extern "C" {
 #define RANS_M_BITS  10
 #define RANS_L       (1u << 16)
 #define RANS_MAX_SYM 16 // 0-14 magnitudes + 15 ESC
-#define RANS_N_PAIRS 10
+#define RANS_COEF_NPAIRS 10
 
 // rANS probability tables: 12 alpha x 4 activity = 48 tables
-#define RANS_ALPHA_NBINS    12
-#define RANS_ACT_NBINS      4
-#define RANS_NTABLES        48
+#define RANS_ALPHA_NBINS 12
+#define RANS_ACT_NBINS   4
+#define RANS_COEF_NTABLES (RANS_ALPHA_NBINS * RANS_ACT_NBINS)
+
+// Trained alpha-bin range, Q8
 #define RANS_ALPHA_LO_Q8    (-1271)
 #define RANS_ALPHA_RANGE_Q8 2647
-
-// 48 rANS probability tables in cumulative form, freq[s] = cf[s + 1] - cf[s]
-extern const uint16_t rans_cf[RANS_NTABLES][RANS_MAX_SYM + 1];
-extern const uint32_t rans_rcp[RANS_NTABLES][RANS_MAX_SYM];
-extern const int16_t rans_cost_q8[RANS_NTABLES][RANS_MAX_SYM];
-extern const int16_t rans_log2_sigma_q8[RANS_N_PAIRS];
 
 /**
  * @brief Convert a signed value to zigzag form.
@@ -339,8 +335,8 @@ static inline int rans_table_idx(int alpha_bin, int activity) {
   if (tidx < 0) {
     tidx = 0;
   }
-  if (tidx >= RANS_NTABLES) {
-    tidx = RANS_NTABLES - 1;
+  if (tidx >= RANS_COEF_NTABLES) {
+    tidx = RANS_COEF_NTABLES - 1;
   }
   return tidx;
 }
@@ -377,33 +373,42 @@ int rans_alpha_bin(int band, int gain_code);
  */
 int rans_activity_bin(const int16_t *quant, int band);
 
-
+/**
+ * @brief Estimate the exponent envelope cost in Q8 bits.
+ *
+ * This is shared by rate control and the rANS encoder's mode selection.
+ */
+int rans_exp_payload_cost_q8(const int32_t *exp_indices,
+                             int n_ch,
+                             const bool *ms_flags);
 
 #ifdef HQLC_TRAIN_TABLES
 // Accumulates magnitude-symbol counts by final rANS table index
 // Used for training static entropy tables
-extern uint64_t rans_train_hist[RANS_NTABLES][RANS_MAX_SYM];
+extern uint64_t rans_train_hist[RANS_COEF_NTABLES][RANS_MAX_SYM];
 extern int rans_train_enabled;
 void rans_train_reset(void);
 #endif
 
 /**
- * @brief Encode quantized coefficients with rANS.
+ * @brief Encode quantized coefficients + envelope with rANS
  *
- * @param quant Quantized coefficients to encode.
+ * @param quant Quantized coefficients to encode
  * @param n_ch Number of channels.
- * @param gain_code Quantizer gain code.
+ * @param gain_code Quantizer gain code
  * @param ms_flags Per-band M/S flags (null or zero for dual mono)
+ * @param exp_indices Pointer to the exponent envelope, needs to be of size PSY_N_BANDS
  * @param out Output buffer.
  * @param out_cap Output buffer capacity in bytes.
  * @return Number of encoded bytes written.
  */
-size_t rans_encode_coeffs(const int16_t *quant,
-                          int n_ch,
-                          int gain_code,
-                          const bool *ms_flags,
-                          uint8_t *out,
-                          size_t out_cap);
+size_t rans_encode_payload(const int16_t *quant,
+                           int n_ch,
+                           int gain_code,
+                           const bool *ms_flags,
+                           const int32_t *exp_indices,
+                           uint8_t *out,
+                           size_t out_cap);
 
 /**
  * @brief Decode quantized coefficients from an rANS byte stream.
@@ -414,14 +419,16 @@ size_t rans_encode_coeffs(const int16_t *quant,
  * @param n_ch Number of channels.
  * @param gain_code Quantizer gain code.
  * @param ms_flags Per-band M/S flags (null or zero for dual mono)
+ * @param exp_indices pointer to an array where exponents will be decoded too. Needs to be of size PSY_N_BANDS
  * @return True on success, or false if the stream is corrupt or truncated.
  */
-bool rans_decode_coeffs(const uint8_t *data,
-                        size_t len,
-                        int16_t *quant_out,
-                        int n_ch,
-                        int gain_code,
-                        const bool *ms_flags);
+bool rans_decode_payload(const uint8_t *data,
+                         size_t len,
+                         int16_t *quant_out,
+                         int n_ch,
+                         int gain_code,
+                         const bool *ms_flags,
+                         int32_t *exp_indices);
 
 #ifdef __cplusplus
 }

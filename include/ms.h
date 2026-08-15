@@ -4,10 +4,7 @@
 #include <stdbool.h>
 #include <stdint.h>
 
-// S-channel exponent bias on flagged bands:
-//   bias = clamp(exp0 - exp1 - MS_BIAS_GAP, 0, MS_BIAS_CAP)
-#define MS_BIAS_GAP 2
-#define MS_BIAS_CAP 6
+#include "fxp.h"
 
 // Flagged S bands use biased exponents. At the cap, bias=6 raises the quantizer
 // step by 2^(6/4), shrinking |q| by 1.5. One alpha bin spans about 2647/12 Q8 = 0.862, so 1.5/0.862 rounded up is 2
@@ -23,11 +20,7 @@ extern "C" {
  * Aligns both spectra to a common BFP exponent before the butterfly. Unflagged
  * bands remain L/R, so the output is a per-band L/M and R/S patchwork.
  */
-void ms_encode(int32_t *spec0_q31,
-               int32_t *spec1_q31,
-               int *loss_bits0,
-               int *loss_bits1,
-               bool *ms_flags);
+void ms_encode(bfp_i32 *channel0, bfp_i32 *channel1, bool *ms_flags);
 
 /**
  * @brief Replace flagged M/S bands with L/R in place.
@@ -35,11 +28,7 @@ void ms_encode(int32_t *spec0_q31,
  * Aligns both reconstructed spectra to a common exponent with one extra bit of
  * headroom before summing/differencing. Unflagged bands pass through unchanged.
  */
-void ms_decode(int32_t *spec0_q31,
-               int32_t *spec1_q31,
-               int *loss_bits0,
-               int *loss_bits1,
-               bool *ms_flags);
+void ms_decode(bfp_i32 *mid, bfp_i32 *side, const bool *ms_flags);
 
 /**
  * @brief Coarsen flagged side-channel exponents to match the M/S bit allocation.

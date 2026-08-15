@@ -22,8 +22,8 @@ static void transform_roundtrip(const int16_t *sig, int want, int16_t *out_frame
 
   for (int f = 0; f < FRAMES; f++) {
     const int16_t *curr = &sig[f * N];
-    int32_t spec[N];
-    int loss;
+    int32_t spec_data[N];
+    bfp_i32 spectrum = bfp_i32_view(spec_data, N, 0);
     TEST_ASSERT_EQUAL_INT(HQLC_OK,
                           mdct_forward((const uint8_t *)prev,
                                        (const uint8_t *)curr,
@@ -31,16 +31,12 @@ static void transform_roundtrip(const int16_t *sig, int want, int16_t *out_frame
                                        HQLC_PCM16,
                                        1,
                                        0,
-                                       spec,
-                                       N,
+                                       &spectrum,
                                        scratch,
-                                       sizeof(scratch),
-                                       &loss));
+                                       sizeof(scratch)));
     int16_t dec[N];
     TEST_ASSERT_EQUAL_INT(HQLC_OK,
-                          mdct_inverse_ola(spec,
-                                           N,
-                                           loss,
+                          mdct_inverse_ola(&spectrum,
                                            &ola,
                                            (uint8_t *)dec,
                                            HQLC_PCM16,

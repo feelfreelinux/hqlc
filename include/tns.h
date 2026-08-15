@@ -4,6 +4,7 @@
 #include <stdbool.h>
 #include <stdint.h>
 
+#include "fxp.h"
 #include "hqlc.h"
 
 #ifdef __cplusplus
@@ -16,17 +17,8 @@ extern "C" {
 #define TNS_K_BITS   4
 #define TNS_LAR_HALF 7
 
-// Start TNS analysis and filter at ~940 Hz
-#define TNS_START_BIN 20
-
 // Transient detector runs 8 sub-blocks of 64 samples
 #define TNS_DETECT_SUBBLOCKS 8
-
-// Ratio for transient detection (higher = less sensitive)
-#define TNS_DETECT_RATIO 8
-
-// Absolute HP-energy floor per sub-block (16-bit sample scale)
-#define TNS_DETECT_FLOOR (1u << 20)
 
 // Per-channel detector state (zero-init = preceding silence)
 typedef struct {
@@ -41,25 +33,13 @@ typedef struct {
   int32_t k_q30[TNS_MAX_ORDER]; /**< dequantized reflection coeffs Q30 */
 } tns_info;
 
-extern const int32_t tns_k_dq_q30[15];
-
 /**
  * @brief Dequantize a LAR index to a reflection coefficient.
  *
  * @param q Quantized LAR index in the range -7..7.
  * @return Reflection coefficient in Q30 format.
  */
-static inline int32_t tns_dequant_k(int q) {
-  return tns_k_dq_q30[q + 7];
-}
-
-/**
- * @brief Quantize a reflection coefficient to a LAR index.
- *
- * @param k_q30 Reflection coefficient in Q30 format.
- * @return Quantized LAR index in the range -7..7.
- */
-int tns_quant_k(int32_t k_q30);
+int32_t tns_dequant_k(int q);
 
 /**
  * @brief Detect an attack transient in the current frame.
@@ -90,54 +70,28 @@ bool tns_detect_transient(tns_detect_state *st,
 void tns_analyze(const int32_t *spec_q31, bool hangover, tns_info *out);
 
 /**
- * @brief Apply the encoder TNS lattice FIR filter in place.
+ * @brief Apply the TNS analysis filter with automatic headroom management.
  *
- * @param spec_q31 Spectrum to filter, HQLC_FRAME_SAMPLES elements.
+ * Ensures the required input headroom, runs the lattice FIR filter, then
+ * renormalizes the result and updates its BFP exponent.
+ *
+ * @param spectrum Spectrum to filter in place, including its BFP exponent.
  * @param k_q30 Reflection coefficients in Q30 format.
  * @param order Filter order.
- * @param input_rshift Right shift applied to each input sample, or 0 for none.
- * @param out_hr If non-NULL, receives output block headroom.
  */
-void tns_lattice_fir(
-    int32_t *spec_q31, const int32_t *k_q30, int order, int input_rshift, int *out_hr);
+void tns_apply_analysis_filter(bfp_i32 *spectrum, const int32_t *k_q30, int order);
 
 /**
- * @brief Apply the decoder TNS lattice IIR filter in place.
+ * @brief Apply the TNS synthesis filter with automatic headroom management.
  *
- * @param spec_q31 Spectrum to filter, HQLC_FRAME_SAMPLES elements.
+ * Ensures the required input headroom, runs the lattice IIR filter, then
+ * renormalizes the result and updates its BFP exponent.
+ *
+ * @param spectrum Spectrum to filter in place, including its BFP exponent.
  * @param k_q30 Reflection coefficients in Q30 format.
  * @param order Filter order.
- * @param input_rshift Right shift applied to each input sample, or 0 for none.
- * @param out_hr If non-NULL, receives output block headroom.
  */
-void tns_lattice_iir(
-    int32_t *spec_q31, const int32_t *k_q30, int order, int input_rshift, int *out_hr);
-
-/**
- * @brief Apply the FIR filter with automatic headroom management.
- *
- * Pre-shifts the spectrum, runs the lattice FIR filter, then renormalizes the
- * result.
- *
- * @param spec_q31 Spectrum to filter in place.
- * @param k_q30 Reflection coefficients in Q30 format.
- * @param order Filter order.
- * @return Net `loss_bits` adjustment for the caller to add.
- */
-int tns_fir_safe(int32_t *spec_q31, const int32_t *k_q30, int order);
-
-/**
- * @brief Apply the IIR filter with automatic headroom management.
- *
- * Pre-shifts the spectrum, runs the lattice IIR filter, then renormalizes the
- * result.
- *
- * @param spec_q31 Spectrum to filter in place.
- * @param k_q30 Reflection coefficients in Q30 format.
- * @param order Filter order.
- * @return Net `loss_bits` adjustment for the caller to add.
- */
-int tns_iir_safe(int32_t *spec_q31, const int32_t *k_q30, int order);
+void tns_apply_synthesis_filter(bfp_i32 *spectrum, const int32_t *k_q30, int order);
 
 #ifdef __cplusplus
 }
