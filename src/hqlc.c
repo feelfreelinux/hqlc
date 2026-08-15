@@ -467,7 +467,7 @@ hqlc_error hqlc_encode_frame(hqlc_encoder *enc,
 
     HQLC_BENCH_BEGIN(HQLC_BENCH_ENC_PSY);
     psy_fine_band_exponents(
-        &spectra[ch], enc->tilt_step_q7, tns_eligible[ch] ? 1 : 0, ch_exp);
+        &spectra[ch], enc->tilt_step_q7, tns_eligible[ch], ch_exp);
     HQLC_BENCH_END(HQLC_BENCH_ENC_PSY);
   }
 

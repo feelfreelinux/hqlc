@@ -86,7 +86,7 @@ static inline int32_t psy_psd_to_log_index_q7(uint64_t psd) {
 // geometric mean (flat steps, attacks need a sharp envelope)
 void psy_fine_band_exponents(const bfp_i32 *spectrum,
                              int tilt_step_q7,
-                             int transient,
+                             bool transient,
                              int32_t *exp_indices) {
   const int32_t *spec_q31 = spectrum->data;
   // Bias in EXP_Q7

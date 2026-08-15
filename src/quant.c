@@ -9,6 +9,12 @@
 // Tuned empirically, but seems to match what other codecs do too
 #define NF_START_BIN 75
 
+// The first band the NF cliff fill triggers on (last few bands only)
+#define NF_CLIFF_START_BAND 17
+
+// Min drop for the NF cliff fill rule to trigger
+#define NF_CLIFF_MIN_DROP 4
+
 // Quantizer scale: step = 2^(E/8), E = 2*exp - gain_code - 59
 #define QUANT_EXP_OFFSET 59
 
@@ -80,6 +86,29 @@ static void bin_exp_interp(const int32_t *exp_indices, int32_t *bin_exp) {
   // Flat region after last band center
   for (int i = prev; i < PSY_ACTIVE_BINS; i++) {
     bin_exp[i] = exp_indices[PSY_N_BANDS - 1];
+  }
+}
+
+/**
+ * @brief Coarsen the exponent after a cliff for NF
+ *
+ * The 1-2-1 smoothing done on exponents in the psy biases the step a bit.
+ * A louder exponent will influence the exponent next to it, up to +6dB.
+ * Its needed for quantization, but we try to correct for it in NF, to prevent overshoot.
+ */
+static void bin_exp_cliff(const int32_t *exp_indices, int32_t *bin_exp) {
+  for (int b = NF_CLIFF_START_BAND; b < PSY_N_BANDS; b++) {
+    int drop = (int)exp_indices[b - 1] - (int)exp_indices[b];
+    if (drop <= NF_CLIFF_MIN_DROP) {
+      continue;
+    }
+    int fill_exp = (int)exp_indices[b] - 3 * (drop - NF_CLIFF_MIN_DROP) / 4;
+    if (fill_exp < PSY_EXP_INDEX_MIN) {
+      fill_exp = PSY_EXP_INDEX_MIN;
+    }
+    for (int i = psy_band_edges[b]; i < psy_band_edges[b + 1]; i++) {
+      bin_exp[i] = fill_exp;
+    }
   }
 }
 
@@ -259,6 +288,7 @@ void noise_fill(const int16_t *quant,
   } else {
     bin_exp_flat(exp_indices, bin_exp);
   }
+  bin_exp_cliff(exp_indices, bin_exp);
 
   // We derive the level from the zero occupancy in each band's quantized bins
   uint8_t factor_q8[PSY_N_BANDS] = {0};

@@ -40,6 +40,9 @@ def tilt_step(tilt_db):
     return tilt_db / (N_ACTIVE_FINE * DB_PER_EXP_INDEX)
 
 
+_LOG_FLOOR = -400.0  # 2*log2 of an empty band: drives the exponent to the floor
+
+
 def compute_exponents(X, tilt_db=FINE_TILT_DB, transient=False):
     """Compute 20 coarse-band exponent indices from the MDCT spectrum.
 
@@ -79,7 +82,8 @@ def compute_exponents(X, tilt_db=FINE_TILT_DB, transient=False):
         k = 0
         exp = np.zeros(N_BANDS, dtype=np.int32)
         for fb in range(N_ACTIVE_FINE):
-            lg = (2.0 * math.log2(psd[fb]) if psd[fb] > 0.0 else 0.0) + tilt_acc
+            # psd==0 must go to the FLOOR, not lg=0 to match python
+            lg = (2.0 * math.log2(psd[fb]) if psd[fb] > 0.0 else _LOG_FLOOR) + tilt_acc
             tilt_acc += tilt_per_fb
             x = (edges[fb] + edges[fb + 1]) >> 1  # fine-band center bin
             if x <= centers[0]:
@@ -113,7 +117,7 @@ def compute_exponents(X, tilt_db=FINE_TILT_DB, transient=False):
     tilt_acc = 0.0
     for fb in range(N_ACTIVE_FINE):
         b = FB_COARSE[fb]
-        log_idx = 2.0 * math.log2(psd[fb]) if psd[fb] > 0.0 else 0.0
+        log_idx = 2.0 * math.log2(psd[fb]) if psd[fb] > 0.0 else _LOG_FLOOR
         log_sum[b] += log_idx + tilt_acc
         cnt[b] += 1
         tilt_acc += tilt_per_fb

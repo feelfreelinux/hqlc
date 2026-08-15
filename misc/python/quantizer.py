@@ -14,18 +14,29 @@ import math
 
 import numpy as np
 
-from .constants import BAND_EDGES, CENTROID, DEAD_ZONE, EXP_INDEX_BIAS, N_BANDS
+from .constants import (
+    BAND_EDGES,
+    CENTROID,
+    DEAD_ZONE,
+    EXP_INDEX_BIAS,
+    EXP_INDEX_MIN,
+    N_BANDS,
+)
 
 # Gain quantization: 7-bit code, log2 Q3 (8 codes per octave)
 GAIN_BITS = 7
 GAIN_Q = 8
 GAIN_BIAS = 27  # code 59 / gain 16 / 128 kbps-ish with rANS
 GAIN_MAX_CODE = (1 << GAIN_BITS) - 1  # 127
-GAIN_RC_MAX = GAIN_BIAS + GAIN_Q * 5  # cap: gain = 32 (5 octaves above unity)
+GAIN_RC_MAX = GAIN_BIAS + GAIN_Q * 6  # cap: gain = 64 (6 octaves above unity)
 
 NF_SEED_BIAS = 0x9E3779B9
 NF_START_BIN = 75  # ~3.5 kHz, below this the holes are left alone
 NF_OCCUPANCY_STEPS = 32  # resolution of the zero-fraction to level table
+
+# NF cliff rule, see quant.c in c
+NF_CLIFF_FIRST_BAND = 17
+NF_CLIFF_MIN_DROP = 4
 
 
 def quantize_gain(gain):
@@ -84,7 +95,23 @@ NF_LAPLACE_RMS = [
 ]
 
 
-def noise_fill(X_hat, q, step, seed, skip_bands=None):
+def _cliff_fill_step(exp_indices, b, gain):
+    """Fill step across a spectral cliff, or None when the band is not past one.
+    See quant.c in C for details
+    """
+    if b < NF_CLIFF_FIRST_BAND:
+        return None
+    drop = int(exp_indices[b - 1]) - int(exp_indices[b])
+    if drop <= NF_CLIFF_MIN_DROP:
+        return None
+    fill_exp = max(
+        EXP_INDEX_MIN,
+        int(exp_indices[b]) - 3 * (drop - NF_CLIFF_MIN_DROP) // 4,
+    )
+    return exp_to_step_factor(fill_exp) / gain
+
+
+def noise_fill(X_hat, q, step, seed, exp_indices, gain, skip_bands=None):
     """Replace zeroed bins above NF_START_BIN with pseudorandom noise, in place.
 
     The fill level comes from each band's zero occupancy, scaled by the excess of zeros over nonzeros.
@@ -96,6 +123,7 @@ def noise_fill(X_hat, q, step, seed, skip_bands=None):
         # NF_START_BIN sits on a band edge, so partial bands never occur
         if s < NF_START_BIN or (skip_bands is not None and skip_bands[b]):
             continue
+        cliff_step = _cliff_fill_step(exp_indices, b, gain)
 
         zeros = [i for i in range(s, e) if q[i] == 0]
         if not zeros:
@@ -120,6 +148,6 @@ def noise_fill(X_hat, q, step, seed, skip_bands=None):
             seed ^= (seed << 5) & 0xFFFFFFFF
 
             sign = -1.0 if (seed & 0x80000000) else 1.0
-            X_hat[i] = sign * factor * step[i]
+            X_hat[i] = sign * factor * (step[i] if cliff_step is None else cliff_step)
 
     return seed

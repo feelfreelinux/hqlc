@@ -48,12 +48,12 @@ int psy_tilt_step_q7(int tilt_db);
  *
  * @param spectrum MDCT spectrum in Q31 BFP format, 512 bins.
  * @param tilt_step_q7 Per-fine-band tilt in EXP_Q7 format.
- * @param transient Nonzero for TNS-eligible transient frames.
+ * @param transient true for TNS-eligible transient frames.
  * @param exp_indices Destination for 20 exponent indices in the range 0..63.
  */
 void psy_fine_band_exponents(const bfp_i32 *spectrum,
                              int tilt_step_q7,
-                             int transient,
+                             bool transient,
                              int32_t *exp_indices);
 
 #ifdef __cplusplus

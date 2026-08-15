@@ -95,8 +95,17 @@ def _levinson_durbin(r, max_order):
             break
         k_out.append(ki)
         new_a = np.zeros(max_order, dtype=np.float64)
+        overflowed = False
         for j in range(i):
-            new_a[j] = a[j] + ki * a[i - 1 - j]
+            v = a[j] + ki * a[i - 1 - j]
+            # The C keeps a[] as int32 Q30, so |a| >= 2.0 overflows and it bails
+            # Matching logic here
+            if abs(v) >= 2.0:
+                overflowed = True
+                break
+            new_a[j] = v
+        if overflowed:
+            break
         new_a[i] = ki
         a = new_a
     order = len(k_out)

@@ -30,6 +30,7 @@ from .constants import (
 from .entropy import (
     _prev_band_activity,
     coeff_cost,
+    exp_payload_bits,
     get_rans_tables,
     rans_table_idx,
 )
@@ -123,7 +124,7 @@ def _envelope_quantize(Xs, envs, gain):
     return all_quants
 
 
-def _dequant_and_fill(q, gain, env_dq, seed, active, skip_bands=None):
+def _dequant_and_fill(q, gain, env_dq, exp_indices, seed, active, skip_bands=None):
     """Dequantize, then fill the quantized-away noise floor back in.
 
     skip_bands (bool per band) skips NF in given bands, use for S channel in M/S
@@ -131,18 +132,19 @@ def _dequant_and_fill(q, gain, env_dq, seed, active, skip_bands=None):
     step = env_dq / gain
     X_hat = np.zeros(N_BINS)
     X_hat[:active] = dequantize(q, step)
-    noise_fill(X_hat, q, step, seed, skip_bands)
+    noise_fill(X_hat, q, step, seed, exp_indices, gain, skip_bands)
     return X_hat
 
 
-def _probe_bits(Xs, envs, gain, n_ch, ms_flags=None):
+def _probe_bits(Xs, envs, gain, n_ch, exp_indices, ms_flags=None):
     """Estimate rANS payload bits at a candidate gain (flat per-band steps).
 
-    Sums the cost of every quantized coefficient without actually entropy-coding it
+    Sums the cost of every quantized coefficient without actually entropy-coding
+    it, plus the envelope, which shares the payload but not the gain dependency
     """
     from .ms import MS_RANS_ALPHA_SHIFT
 
-    total_bits = 0.0
+    total_bits = exp_payload_bits(exp_indices, n_ch, ms_flags)
     inv_gain = 1.0 / gain
 
     for ch in range(n_ch):
@@ -158,7 +160,7 @@ def _probe_bits(Xs, envs, gain, n_ch, ms_flags=None):
             _, _, cost_bits = get_rans_tables(rans_table_idx(b, gain, act, ashift))
             total_bits += sum(coeff_cost(cost_bits, int(v)) for v in q[s:e])
 
-    return int(round(total_bits)) + 32  # +32 for rANS state flush
+    return int(round(total_bits))
 
 
 def _analyze_frame(padded, start, n_ch, tilt_db, detectors, tns_hang, ms_flags=None):
@@ -277,6 +279,7 @@ def decode(payloads, n_channels, n_samples):
                 q_flat,
                 gain,
                 env_dq,
+                exp_indices[ch],
                 seed,
                 active,
                 ms_flags if ch == 1 else None,  # Skip NF on flagged S bands
@@ -321,7 +324,8 @@ def encode_rc(channels, bitrate):
 
     prev_gc = quantize_gain(16.0)
     ema_gc = float(prev_gc)
-    prev_side_bits = 150
+
+    prev_overhead_bits = 64
     res_bits = 0
     detectors = [TransientDetector() for _ in range(n_ch)]
     tns_hang = [0] * n_ch
@@ -341,17 +345,21 @@ def encode_rc(channels, bitrate):
 
         # Rate control: slew-limited 2-probe gain search
         quiet_frame = False
-        borrow = max(-target_bpf, min(target_bpf, res_bits)) // 2
+        borrow = max(-target_bpf, min(target_bpf, res_bits))
         # Attacks get a larger share of the budget, reservoir absorbs it later
         boost = target_bpf // RC_TRANSIENT_BOOST if any(eligible) else 0
         effective_target = max(
-            target_bpf // 4, min(target_bpf * 3, target_bpf + borrow + boost)
+            target_bpf // 4,
+            # int() to truncate toward zero on a negative reservoir, like the C
+            min(target_bpf * 3, target_bpf + int(borrow / 2) + boost),
         )
 
         gc0 = min(prev_gc, GAIN_RC_MAX)
         b0 = (
-            _probe_bits(Xs, envs_flat, dequantize_gain(gc0), n_ch, ms_flags)
-            + prev_side_bits
+            _probe_bits(
+                Xs, envs_flat, dequantize_gain(gc0), n_ch, exp_indices, ms_flags
+            )
+            + prev_overhead_bits
         )
 
         if abs(b0 - effective_target) <= tol or b0 <= 0:
@@ -366,8 +374,10 @@ def encode_rc(channels, bitrate):
 
             gc1 = max(0, min(GAIN_RC_MAX, gc0 + delta))
             b1 = (
-                _probe_bits(Xs, envs_flat, dequantize_gain(gc1), n_ch, ms_flags)
-                + prev_side_bits
+                _probe_bits(
+                    Xs, envs_flat, dequantize_gain(gc1), n_ch, exp_indices, ms_flags
+                )
+                + prev_overhead_bits
             )
 
             if (
@@ -399,16 +409,16 @@ def encode_rc(channels, bitrate):
         payloads.append(payload)
         total_bits += frame_bits
 
+        # Quiet frames bank reservoir credit, but leave the gain EMA frozen
+        res_bits += target_bpf - frame_bits
+        res_bits = max(-(2 * target_bpf), min(2 * target_bpf, res_bits))
         if not quiet_frame:
-            res_bits += target_bpf - frame_bits
-            res_bits = max(-(2 * target_bpf), min(2 * target_bpf, res_bits))
             ema_gc += (chosen_code - ema_gc) / 16.0
         prev_gc = chosen_code
-        prev_side_bits = (
-            count_side_bits(
-                n_ch, tns_orders, tns_q_ks, exp_indices, ms_flags if use_ms else None
-            )
-            + 32
+        # +24: rANS state flush, the envelope is estimated per candidate frame
+        prev_overhead_bits = (
+            count_side_bits(n_ch, tns_orders, tns_q_ks, ms_flags if use_ms else None)
+            + 24
         )
 
     return payloads, total_bits, n_frames
