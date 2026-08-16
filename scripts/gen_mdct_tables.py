@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """Generate MDCT lookup tables (KBD window + twiddle factors).
 
-Outputs: include/mdct_tables.h, src/mdct_tables.c
+Outputs: src/mdct_tables.c (declarations live in src/mdct_tables.h)
 """
 
 import os

@@ -22,7 +22,6 @@ from .bitstream import (
 from .constants import (
     BAND_EDGES,
     BLOCK_SIZE,
-    DEAD_ZONE,
     FRAME_LEN,
     FS,
     N_BANDS,
@@ -30,7 +29,8 @@ from .constants import (
 )
 from .entropy import (
     _prev_band_activity,
-    coeff_cost_q8,
+    coeff_cost,
+    exp_payload_bits,
     get_rans_tables,
     rans_table_idx,
 )
@@ -40,15 +40,20 @@ from .psy import compute_exponents, tilt_for_bitrate
 from .quantizer import (
     GAIN_Q,
     GAIN_RC_MAX,
+    NF_SEED_BIAS,
     dequantize,
     dequantize_gain,
     exp_to_step_factor,
+    noise_fill,
     quantize,
     quantize_gain,
 )
 from .tns import TransientDetector, lattice_fir, lattice_iir
 from .tns import analyze as tns_analyze
 
+# Boost for transient frames, letting them use more bits
+# 1/4 = 25% boost in the rate controller
+RC_TRANSIENT_BOOST = 4
 
 def _pad_channels(channels):
     """Pad channel arrays for MDCT overlap."""
@@ -68,7 +73,7 @@ def _pad_channels(channels):
 def _band_step_factors(exp_indices):
     """Flat per-band step factor per bin
 
-    Used on TNS frames, for the RC probe, and for the NF fill amplitude.
+    Used on TNS frames and for the RC probe.
     The caller can get the actual step factor by dividing this by the global gain.
     """
     active = BAND_EDGES[-1]
@@ -108,85 +113,42 @@ def _step_factors(exp_indices, tns_order):
 
 
 def _envelope_quantize(Xs, envs, gain):
-    """Deadzone-quantize each channel, split the symbols into bands.
-
-    Returns (all_quants, all_scaled_abs) all_scaled_abs[ch] is the pre-deadzone |X * gain / step| that the NF estimator uses
-    """
+    """Deadzone-quantize each channel, split the symbols into bands."""
     inv_gain = 1.0 / gain
     all_quants = []
-    all_scaled_abs = []
     for ch in range(len(Xs)):
-        q, abs_scaled = quantize(Xs[ch], envs[ch] * inv_gain)
+        q = quantize(Xs[ch], envs[ch] * inv_gain)
         all_quants.append(
             [q[BAND_EDGES[b] : BAND_EDGES[b + 1]].copy() for b in range(N_BANDS)]
         )
-        all_scaled_abs.append(abs_scaled)
-    return all_quants, all_scaled_abs
+    return all_quants
 
 
-def _estimate_noise_factor(scaled_abs, active):
-    """Estimate the noise fill factor from pre-deadzone |scaled| values.
+def _dequant_and_fill(q, gain, env_dq, exp_indices, seed, active, skip_bands=None):
+    """Dequantize, then fill the quantized-away noise floor back in.
 
-    Averages |X|/step over the bins the decoder will fill (runs of >4 sub-deadzone bins, 2-bin lag).
-    Returns nf in 0..7, 0 = strongest fill.
+    skip_bands (bool per band) skips NF in given bands, use for S channel in M/S
     """
-    z = 0
-    total = 0.0
-    ns = 0
-
-    for i in range(active):
-        if scaled_abs[i] < DEAD_ZONE:
-            z += 1
-        else:
-            z = 0
-        if z > 4:
-            total += scaled_abs[i - 2]
-            ns += 1
-
-    if ns == 0:
-        return 7
-
-    # matches C
-    nf = int(math.floor(8.5 - 16.0 * (total / ns)))
-    return max(0, min(7, nf))
-
-
-def _dequant_and_fill(q, gain, nf, env_dq, env_flat, seed, active, skip_bins=None):
-    """Dequantize, then fill noise into the run of quantized zeros.
-
-    skip_bins (bool per bin) skips NF in given bands, use for S channel in M/S
-    """
-    inv_gain = 1.0 / gain
+    step = env_dq / gain
     X_hat = np.zeros(N_BINS)
-    X_hat[:active] = dequantize(q, env_dq * inv_gain)
-
-    nf_amp = (8 - nf) / (16.0 * gain)
-    z = 0
-    for i in range(active):
-        z = z + 1 if q[i] == 0 else 0
-        if z > 4:
-            # LCG seed
-            seed = (13849 + seed * 31821) & 0xFFFF
-            if skip_bins is not None and skip_bins[i - 2]:
-                continue  # no noise fill on flagged side bands
-            sign = -1.0 if (seed & 0x8000) else 1.0
-            X_hat[i - 2] = sign * nf_amp * env_flat[i]
-
+    X_hat[:active] = dequantize(q, step)
+    noise_fill(X_hat, q, step, seed, exp_indices, gain, skip_bands)
     return X_hat
 
 
-def _probe_bits(Xs, envs, gain, n_ch, ms_flags=None):
+def _probe_bits(Xs, envs, gain, n_ch, exp_indices, ms_flags=None):
     """Estimate rANS payload bits at a candidate gain (flat per-band steps).
 
-    Sums the cost of every quantized coefficient without actually entropy-coding it
+    Sums the cost of every quantized coefficient without actually entropy-coding
+    it, plus the envelope, which shares the payload but not the gain dependency
     """
     from .ms import MS_RANS_ALPHA_SHIFT
 
-    total_q8 = 0
+    total_bits = exp_payload_bits(exp_indices, n_ch, ms_flags)
     inv_gain = 1.0 / gain
 
     for ch in range(n_ch):
-        q, _ = quantize(Xs[ch], envs[ch] * inv_gain)  # flat per-bin symbols
+        q = quantize(Xs[ch], envs[ch] * inv_gain)  # flat per-bin symbols
         for b in range(N_BANDS):
             s, e = BAND_EDGES[b], BAND_EDGES[b + 1]
             act = _prev_band_activity(q, b)
@@ -195,23 +157,28 @@ def _probe_bits(Xs, envs, gain, n_ch, ms_flags=None):
                 if (ch == 1 and ms_flags is not None and ms_flags[b])
                 else 0
             )
-            _, _, cost_q8 = get_rans_tables(rans_table_idx(b, gain, act, ashift))
-            total_q8 += sum(coeff_cost_q8(cost_q8, int(v)) for v in q[s:e])
+            _, _, cost_bits = get_rans_tables(rans_table_idx(b, gain, act, ashift))
+            total_bits += sum(coeff_cost(cost_bits, int(v)) for v in q[s:e])
 
-    return ((total_q8 + 128) >> 8) + 32  # +32 for rANS state flush
+    return int(round(total_bits))
 
 
 def _analyze_frame(padded, start, n_ch, tilt_db, detectors, tns_hang, ms_flags=None):
-    """MDCT + transient-gated TNS + exponents for one frame"""
+    """MDCT + transient-gated TNS + exponents for one frame
+
+    Returns (Xs, tns_orders, tns_q_ks, exp_indices, eligible), where eligible[ch]
+    marks the channels the transient detector (or its hangover) fired on.
+    """
     N = FRAME_LEN
     # MDCT + transient detection per channel
-    raw, eligible = [], []
+    raw, eligible, attack = [], [], []
     for ch in range(n_ch):
         block = padded[ch][start : start + BLOCK_SIZE]
         raw.append(mdct_analysis(block))
         # TNS runs when a transient fires this frame or the hangover is still up
         transient = detectors[ch].detect(block[N:])
         eligible.append(transient or tns_hang[ch] > 0)
+        attack.append(transient)
         tns_hang[ch] = 1 if transient else max(0, tns_hang[ch] - 1)
 
     # Apply M/S stereo coding only on non-transient and eligible channels
@@ -227,7 +194,7 @@ def _analyze_frame(padded, start, n_ch, tilt_db, detectors, tns_hang, ms_flags=N
         X = raw[ch]
         order, q_k = 0, np.zeros(0, dtype=np.int32)
         if eligible[ch]:
-            order, k_dq, q_k, _ = tns_analyze(X)
+            order, k_dq, q_k, _ = tns_analyze(X, not attack[ch])
             if order > 0:
                 X = lattice_fir(X, k_dq)
         Xs.append(X)
@@ -240,7 +207,7 @@ def _analyze_frame(padded, start, n_ch, tilt_db, detectors, tns_hang, ms_flags=N
     if ms_flags is not None:
         ms_apply_side_exp_bias(exp_indices[0], exp_indices[1], ms_flags)
 
-    return Xs, tns_orders, tns_q_ks, exp_indices
+    return Xs, tns_orders, tns_q_ks, exp_indices, eligible
 
 
 def encode(channels, gain):
@@ -248,7 +215,6 @@ def encode(channels, gain):
     N = FRAME_LEN
     n_ch = len(channels)
     padded, n_frames, _ = _pad_channels(channels)
-    active = BAND_EDGES[-1]
     tilt_db = tilt_for_bitrate(
         96000
     )  # default tilt for fixed-gain mode, probably should scale with bitrate
@@ -261,16 +227,12 @@ def encode(channels, gain):
 
     for fi in range(n_frames):
         start = fi * N
-        Xs, tns_orders, tns_q_ks, exp_indices = _analyze_frame(
+        Xs, tns_orders, tns_q_ks, exp_indices, _ = _analyze_frame(
             padded, start, n_ch, tilt_db, detectors, tns_hang, ms_flags
         )
 
         envs = [_step_factors(exp_indices[ch], tns_orders[ch]) for ch in range(n_ch)]
-        all_quants, all_scaled_abs = _envelope_quantize(Xs, envs, gain)
-
-        noise_factors = [
-            _estimate_noise_factor(all_scaled_abs[ch], active) for ch in range(n_ch)
-        ]
+        all_quants = _envelope_quantize(Xs, envs, gain)
 
         frame_bits, payload = encode_frame(
             gain,
@@ -278,7 +240,6 @@ def encode(channels, gain):
             tns_q_ks,
             exp_indices,
             all_quants,
-            noise_factors,
             ms_flags if use_ms else None,
         )
         payloads.append(payload)
@@ -298,22 +259,13 @@ def decode(payloads, n_channels, n_samples):
     use_ms = n_channels == 2
     for fi, payload in enumerate(payloads):
         start = fi * N
-        gain, tns_orders, tns_ks, exp_indices, all_quants, noise_factors, ms_flags = (
-            decode_frame(payload, n_channels, use_ms)
+        gain, tns_orders, tns_ks, exp_indices, all_quants, ms_flags = decode_frame(
+            payload, n_channels, use_ms
         )
-
-        # Calculate the skip bins from ms mask
-        skip_bins = None
-        if use_ms:
-            skip_bins = np.zeros(active, dtype=bool)
-            for b in range(N_BANDS):
-                if ms_flags[b]:
-                    skip_bins[BAND_EDGES[b] : BAND_EDGES[b + 1]] = True
 
         # dequant + nf + TNS synthesis per channel
         specs = []
         for ch in range(n_channels):
-            env_flat = _band_step_factors(exp_indices[ch])
             env_dq = _step_factors(exp_indices[ch], tns_orders[ch])
 
             q_flat = np.zeros(active, dtype=np.int32)
@@ -322,16 +274,15 @@ def decode(payloads, n_channels, n_samples):
                 q_flat[s:e] = all_quants[ch][b]
 
             # Seed varies per frame and channel so the fill noise evolves
-            seed = (0x9E3779B9 ^ (fi * 0x9E37) ^ (ch * 0x51ED)) & 0xFFFFFFFF
+            seed = (NF_SEED_BIAS ^ (fi * 0x9E37) ^ (ch * 0x51ED)) & 0xFFFFFFFF
             X_hat = _dequant_and_fill(
                 q_flat,
                 gain,
-                noise_factors[ch],
                 env_dq,
-                env_flat,
+                exp_indices[ch],
                 seed,
                 active,
-                skip_bins if ch == 1 else None, # Skip NF on S channel
+                ms_flags if ch == 1 else None,  # Skip NF on flagged S bands
             )
 
             if tns_orders[ch] > 0:
@@ -366,7 +317,6 @@ def encode_rc(channels, bitrate):
     N = FRAME_LEN
     n_ch = len(channels)
     padded, n_frames, _ = _pad_channels(channels)
-    active = BAND_EDGES[-1]
     tilt_db = tilt_for_bitrate(bitrate)
 
     target_bpf = int(bitrate * N / FS)
@@ -374,7 +324,8 @@ def encode_rc(channels, bitrate):
 
     prev_gc = quantize_gain(16.0)
     ema_gc = float(prev_gc)
-    prev_side_bits = 150
+
+    prev_overhead_bits = 64
     res_bits = 0
     detectors = [TransientDetector() for _ in range(n_ch)]
     tns_hang = [0] * n_ch
@@ -385,7 +336,7 @@ def encode_rc(channels, bitrate):
 
     for fi in range(n_frames):
         start = fi * N
-        Xs, tns_orders, tns_q_ks, exp_indices = _analyze_frame(
+        Xs, tns_orders, tns_q_ks, exp_indices, eligible = _analyze_frame(
             padded, start, n_ch, tilt_db, detectors, tns_hang, ms_flags
         )
 
@@ -394,15 +345,21 @@ def encode_rc(channels, bitrate):
 
         # Rate control: slew-limited 2-probe gain search
         quiet_frame = False
-        borrow = max(-target_bpf, min(target_bpf, res_bits)) // 2
+        borrow = max(-target_bpf, min(target_bpf, res_bits))
+        # Attacks get a larger share of the budget, reservoir absorbs it later
+        boost = target_bpf // RC_TRANSIENT_BOOST if any(eligible) else 0
         effective_target = max(
-            target_bpf // 4, min(target_bpf * 3, target_bpf + borrow)
+            target_bpf // 4,
+            # int() to truncate toward zero on a negative reservoir, like the C
+            min(target_bpf * 3, target_bpf + int(borrow / 2) + boost),
         )
 
         gc0 = min(prev_gc, GAIN_RC_MAX)
         b0 = (
-            _probe_bits(Xs, envs_flat, dequantize_gain(gc0), n_ch, ms_flags)
-            + prev_side_bits
+            _probe_bits(
+                Xs, envs_flat, dequantize_gain(gc0), n_ch, exp_indices, ms_flags
+            )
+            + prev_overhead_bits
         )
 
         if abs(b0 - effective_target) <= tol or b0 <= 0:
@@ -417,8 +374,10 @@ def encode_rc(channels, bitrate):
 
             gc1 = max(0, min(GAIN_RC_MAX, gc0 + delta))
             b1 = (
-                _probe_bits(Xs, envs_flat, dequantize_gain(gc1), n_ch, ms_flags)
-                + prev_side_bits
+                _probe_bits(
+                    Xs, envs_flat, dequantize_gain(gc1), n_ch, exp_indices, ms_flags
+                )
+                + prev_overhead_bits
             )
 
             if (
@@ -437,11 +396,7 @@ def encode_rc(channels, bitrate):
 
         gain = dequantize_gain(chosen_code)
         envs = [_step_factors(exp_indices[ch], tns_orders[ch]) for ch in range(n_ch)]
-        all_quants, all_scaled_abs = _envelope_quantize(Xs, envs, gain)
-
-        noise_factors = [
-            _estimate_noise_factor(all_scaled_abs[ch], active) for ch in range(n_ch)
-        ]
+        all_quants = _envelope_quantize(Xs, envs, gain)
 
         frame_bits, payload = encode_frame(
             gain,
@@ -449,22 +404,21 @@ def encode_rc(channels, bitrate):
             tns_q_ks,
             exp_indices,
             all_quants,
-            noise_factors,
             ms_flags if use_ms else None,
         )
         payloads.append(payload)
         total_bits += frame_bits
 
+        # Quiet frames bank reservoir credit, but leave the gain EMA frozen
+        res_bits += target_bpf - frame_bits
+        res_bits = max(-(2 * target_bpf), min(2 * target_bpf, res_bits))
         if not quiet_frame:
-            res_bits += target_bpf - frame_bits
-            res_bits = max(-(2 * target_bpf), min(2 * target_bpf, res_bits))
             ema_gc += (chosen_code - ema_gc) / 16.0
         prev_gc = chosen_code
-        prev_side_bits = (
-            count_side_bits(
-                n_ch, tns_orders, tns_q_ks, exp_indices, ms_flags if use_ms else None
-            )
-            + 32
+        # +24: rANS state flush, the envelope is estimated per candidate frame
+        prev_overhead_bits = (
+            count_side_bits(n_ch, tns_orders, tns_q_ks, ms_flags if use_ms else None)
+            + 24
         )
 
     return payloads, total_bits, n_frames

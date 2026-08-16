@@ -8,6 +8,7 @@ import numpy as np
 
 from .constants import (
     BAND_EDGES,
+    DB_PER_EXP_INDEX,
     EXP_INDEX_BIAS,
     EXP_INDEX_MAX,
     EXP_INDEX_MIN,
@@ -30,9 +31,16 @@ def tilt_for_bitrate(bitrate):
     return max(15, tilt)
 
 
-def tilt_step_q7(tilt_db):
-    """Per-fine-band tilt increment in EXP_Q7 (128 per exponent index unit)"""
-    return (int(tilt_db) * 118612 + 32768) >> 16
+def tilt_step(tilt_db):
+    """Per-fine-band tilt increment, in exponent-index units.
+
+    The tilt is spread evenly over the active fine bands, at DB_PER_EXP_INDEX
+    per exponent index. The C reference keeps the same step in EXP_Q7.
+    """
+    return tilt_db / (N_ACTIVE_FINE * DB_PER_EXP_INDEX)
+
+
+_LOG_FLOOR = -400.0  # 2*log2 of an empty band: drives the exponent to the floor
 
 
 def compute_exponents(X, tilt_db=FINE_TILT_DB, transient=False):
@@ -61,7 +69,7 @@ def compute_exponents(X, tilt_db=FINE_TILT_DB, transient=False):
             psd[fb] = sm
 
     # Tilt increment per fine band, in exponent-index units
-    tilt_per_fb = tilt_step_q7(tilt_db) / 128.0
+    tilt_per_fb = tilt_step(tilt_db)
 
     if not transient:
         # Hat-basis: each fine band's tilted log-PSD is split between its two
@@ -74,7 +82,8 @@ def compute_exponents(X, tilt_db=FINE_TILT_DB, transient=False):
         k = 0
         exp = np.zeros(N_BANDS, dtype=np.int32)
         for fb in range(N_ACTIVE_FINE):
-            lg = (2.0 * math.log2(psd[fb]) if psd[fb] > 0.0 else 0.0) + tilt_acc
+            # psd==0 must go to the FLOOR, not lg=0 to match python
+            lg = (2.0 * math.log2(psd[fb]) if psd[fb] > 0.0 else _LOG_FLOOR) + tilt_acc
             tilt_acc += tilt_per_fb
             x = (edges[fb] + edges[fb + 1]) >> 1  # fine-band center bin
             if x <= centers[0]:
@@ -108,7 +117,7 @@ def compute_exponents(X, tilt_db=FINE_TILT_DB, transient=False):
     tilt_acc = 0.0
     for fb in range(N_ACTIVE_FINE):
         b = FB_COARSE[fb]
-        log_idx = 2.0 * math.log2(psd[fb]) if psd[fb] > 0.0 else 0.0
+        log_idx = 2.0 * math.log2(psd[fb]) if psd[fb] > 0.0 else _LOG_FLOOR
         log_sum[b] += log_idx + tilt_acc
         cnt[b] += 1
         tilt_acc += tilt_per_fb

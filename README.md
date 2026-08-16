@@ -6,7 +6,7 @@
 
 A low-complexity MDCT audio codec targeting 96 kbps+ stereo at 48 kHz, designed to run comfortably on embedded targets like the ESP32 while staying competitive with established codecs in audio quality.
 
-All building blocks are public domain or based on expired patents. The codec supports 48 kHz sample rate only, with PCM16 or PCM24 input, at a fixed frame size of 512 samples (~10.67 ms). 
+The codec supports 48 kHz sample rate only, with PCM16 or PCM24 input, at a fixed frame size of 512 samples (~10.67 ms).
 
 See [HQLC_DESIGN.md](HQLC_DESIGN.md) for a detailed write-up of the codec internals and design rationale. This readme only covers the build instructions & some benchmarks.
 

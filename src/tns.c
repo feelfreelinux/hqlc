@@ -6,12 +6,20 @@
 #include "pcm.h"
 
 // TNS parameters
-#define TNS_MAX_K_Q30    Q30(0.92)
-#define TNS_K_THRESH_Q30 Q30(0.1)
-#define TNS_K_CLAMP_Q30  Q30(0.999)
+#define TNS_START_BIN   20 // ~940 Hz
+#define TNS_Q30_ONE     FXP_Q30(1.0)
+#define TNS_MAX_K_Q30   FXP_Q30(0.92)
+#define TNS_K_CLAMP_Q30 FXP_Q30(0.999)
 
-// Gaussian lag window w[k] = exp(-0.5 * (2*pi*0.03*k)^2), Q30
-// Smooths the envelope shape a bit, fitting more attack shape itself
+// Transient detector tuning
+#define TNS_DETECT_RATIO 8
+#define TNS_DETECT_FLOOR (1u << 20)
+
+// Gaussian lag window w[k] = exp(-0.5 * (2*pi*f0*k)^2), Q30
+// Smooths the envelope shape a bit, fitting more attack shape
+//
+// Hangover frames use a softer window, so post-attack frames don't smear quantization noise
+// all over the spectrum
 static const int32_t tns_lag_win_q30[TNS_MAX_ORDER] = {
     1054834932,
     1000088432,
@@ -19,8 +27,15 @@ static const int32_t tns_lag_win_q30[TNS_MAX_ORDER] = {
     808079344,
 };
 
+static const int32_t tns_lag_win_soft_q30[TNS_MAX_ORDER] = {
+    1022040948,
+    881401074,
+    688677203,
+    487522531,
+};
+
 // Dequant LUT, k = tanh(q * 0.25), Q30, index = q + 7
-const int32_t tns_k_dq_q30[15] = {
+static const int32_t tns_k_dq_q30[15] = {
     -1010794288, // q=-7
     -971895537,  // q=-6
     -910837623,  // q=-5
@@ -50,7 +65,7 @@ static const int32_t tns_quant_boundary_q30[7] = {
     993582944,
 };
 
-int tns_quant_k(int32_t k_q30) {
+static int tns_quant_k(int32_t k_q30) {
   int sign = 1;
   int32_t abs_k = k_q30;
   if (k_q30 < 0) {
@@ -153,10 +168,14 @@ static void tns_autocorrelation(const int32_t *spec, int n, int64_t *r) {
  *
  * @param r_raw     Autocorrelation values (int64, max_order+1 elements)
  * @param max_order Maximum filter order to solve for
+ * @param hangover  Frame is eligible only through the hangover, not its own attack
  * @param k_out     Output reflection coefficients in Q30
  * @return Actual filter order (0 if prediction gain is insufficient)
  */
-static int tns_levinson_durbin(const int64_t *r_raw, int max_order, int32_t *k_out) {
+static int tns_levinson_durbin(const int64_t *r_raw,
+                               int max_order,
+                               bool hangover,
+                               int32_t *k_out) {
   if (r_raw[0] <= 0) {
     return 0;
   }
@@ -174,9 +193,11 @@ static int tns_levinson_durbin(const int64_t *r_raw, int max_order, int32_t *k_o
     return 0;
   }
 
+  // Softer window on hangover frames
+  const int32_t *lag_win = hangover ? tns_lag_win_soft_q30 : tns_lag_win_q30;
   for (int k = 1; k <= max_order; k++) {
     // Apply lag window to the autocorrelation values
-    r[k] = (int32_t)(((int64_t)r[k] * tns_lag_win_q30[k - 1]) >> 30);
+    r[k] = fxp_scale_q30(r[k], lag_win[k - 1]);
   }
 
   int32_t error = r[0];
@@ -188,7 +209,7 @@ static int tns_levinson_durbin(const int64_t *r_raw, int max_order, int32_t *k_o
     // acc = r[i+1] + sum(a[j] * r[i-j])
     int64_t acc = (int64_t)r[i + 1];
     for (int j = 0; j < i; j++) {
-      acc += ((int64_t)a[j] * r[i - j]) >> 30;
+      acc += fxp_mul_rshift_i64(a[j], r[i - j], 30);
     }
 
     // ki = -acc / error, in Q30
@@ -196,14 +217,9 @@ static int tns_levinson_durbin(const int64_t *r_raw, int max_order, int32_t *k_o
 
     ki = fxp_clamp_i32(ki, -TNS_K_CLAMP_Q30, TNS_K_CLAMP_Q30);
 
-    // Early stop if |ki| < threshold
-    if (ki > -TNS_K_THRESH_Q30 && ki < TNS_K_THRESH_Q30) {
-      break;
-    }
-
     // Update error: error *= (1 - ki^2)
-    int32_t ki_sq = (int32_t)(((int64_t)ki * ki) >> 30);
-    error = (int32_t)(((int64_t)error * ((1 << 30) - ki_sq)) >> 30);
+    int32_t ki_sq = fxp_mul_q30(ki, ki);
+    error = fxp_scale_q30(error, TNS_Q30_ONE - ki_sq);
     if (error <= 0) {
       break;
     }
@@ -214,7 +230,7 @@ static int tns_levinson_durbin(const int64_t *r_raw, int max_order, int32_t *k_o
     int32_t a_new[TNS_MAX_ORDER];
     bool overflowed = false;
     for (int j = 0; j < i; j++) {
-      int64_t sum = (int64_t)a[j] + (((int64_t)ki * a[i - 1 - j]) >> 30);
+      int64_t sum = (int64_t)a[j] + fxp_mul_q30(ki, a[i - 1 - j]);
       if (sum > INT32_MAX || sum < INT32_MIN) {
         overflowed = true;
         break;
@@ -232,20 +248,26 @@ static int tns_levinson_durbin(const int64_t *r_raw, int max_order, int32_t *k_o
     memcpy(a, a_new, (size_t)(i + 1) * sizeof(int32_t));
   }
 
-  // Require prediction gain >= 1.5 (i.e. 2*r[0] >= 3*error).
-  if (order == 0 || 2 * (int64_t)r[0] < 3 * (int64_t)error) {
+  // Matches >= 1.5 on hangover, 1.2 else
+  int64_t gate_num = hangover ? 2 : 5;
+  int64_t gate_den = hangover ? 3 : 6;
+  if (order == 0 || gate_num * (int64_t)r[0] < gate_den * (int64_t)error) {
     return 0;
   }
 
   return order;
 }
 
-void tns_analyze(const int32_t *spec_q31, tns_info *out) {
+int32_t tns_dequant_k(int q) {
+  return tns_k_dq_q30[q + TNS_LAR_HALF];
+}
+
+void tns_analyze(const int32_t *spec_q31, bool hangover, tns_info *out) {
   int64_t r[TNS_MAX_ORDER + 1];
   tns_autocorrelation(spec_q31 + TNS_START_BIN, HQLC_FRAME_SAMPLES - TNS_START_BIN, r);
 
   int32_t k_raw[TNS_MAX_ORDER];
-  int order = tns_levinson_durbin(r, TNS_MAX_ORDER, k_raw);
+  int order = tns_levinson_durbin(r, TNS_MAX_ORDER, hangover, k_raw);
   if (order == 0) {
     return;
   }
@@ -273,7 +295,7 @@ void tns_analyze(const int32_t *spec_q31, tns_info *out) {
   }
 }
 
-void tns_lattice_fir(
+static void tns_lattice_fir(
     int32_t *spec_q31, const int32_t *k_q30, int order, int input_rshift, int *out_hr) {
   if (order <= 0) {
     return;
@@ -290,9 +312,9 @@ void tns_lattice_fir(
 
     for (int i = 0; i < order; i++) {
       int32_t b_old = b_state[i];
-      int32_t f_next = (int32_t)((int64_t)f + ((int64_t)k_q30[i] * b_old >> 30));
+      int32_t f_next = (int32_t)((int64_t)f + fxp_scale_q30(b_old, k_q30[i]));
       b_state[i] = b_prev;
-      b_prev = (int32_t)(((int64_t)k_q30[i] * f >> 30) + b_old);
+      b_prev = (int32_t)((int64_t)fxp_scale_q30(f, k_q30[i]) + b_old);
       f = f_next;
     }
 
@@ -308,11 +330,11 @@ void tns_lattice_fir(
   }
 
   if (out_hr) {
-    *out_hr = fxp_headroom_u32(or_acc);
+    *out_hr = fxp_signed_headroom_u32(or_acc);
   }
 }
 
-void tns_lattice_iir(
+static void tns_lattice_iir(
     int32_t *spec_q31, const int32_t *k_q30, int order, int input_rshift, int *out_hr) {
   if (order <= 0) {
     return;
@@ -326,12 +348,12 @@ void tns_lattice_iir(
   for (int n = TNS_START_BIN; n < HQLC_FRAME_SAMPLES; n++) {
     int32_t f = spec_q31[n] >> input_rshift;
 
-    f = (int32_t)((int64_t)f - ((int64_t)k_q30[order - 1] * b_state[order - 1] >> 30));
+    f = (int32_t)((int64_t)f - fxp_scale_q30(b_state[order - 1], k_q30[order - 1]));
 
     for (int i = order - 2; i >= 0; i--) {
       int32_t b_old = b_state[i];
-      f = (int32_t)((int64_t)f - ((int64_t)k_q30[i] * b_old >> 30));
-      b_state[i + 1] = (int32_t)(((int64_t)k_q30[i] * f >> 30) + b_old);
+      f = (int32_t)((int64_t)f - fxp_scale_q30(b_old, k_q30[i]));
+      b_state[i + 1] = (int32_t)((int64_t)fxp_scale_q30(f, k_q30[i]) + b_old);
     }
 
     spec_q31[n] = f;
@@ -347,30 +369,30 @@ void tns_lattice_iir(
   }
 
   if (out_hr) {
-    *out_hr = fxp_headroom_u32(or_acc);
+    *out_hr = fxp_signed_headroom_u32(or_acc);
   }
 }
 
 /**
  * @brief Estimate pre-shift needed to prevent lattice overflow.
  */
-static int tns_preshift(const int32_t *k_q30, int order, bool iir) {
-  int64_t gain_q30 = 1 << 30;
+static int tns_required_headroom(const int32_t *k_q30, int order, bool iir) {
+  int64_t gain_q30 = TNS_Q30_ONE;
   int bits = 0;
 
   for (int i = 0; i < order; i++) {
     int32_t ak = k_q30[i] < 0 ? -k_q30[i] : k_q30[i];
     if (iir) {
-      int32_t denom = (1 << 30) - ak;
+      int32_t denom = TNS_Q30_ONE - ak;
       if (denom <= 0) {
         return 15; // near-unit pole
       }
       gain_q30 = (gain_q30 << 30) / denom;
     } else {
-      gain_q30 = (gain_q30 * (((int64_t)1 << 30) + ak)) >> 30;
+      gain_q30 = (gain_q30 * ((int64_t)TNS_Q30_ONE + ak)) >> 30;
     }
     // Renormalize to [2^30, 2^31) so the Q30 math never overflows
-    while (gain_q30 >= ((int64_t)1 << 31)) {
+    while (gain_q30 >= 2 * (int64_t)TNS_Q30_ONE) {
       gain_q30 >>= 1;
       bits++;
     }
@@ -379,38 +401,29 @@ static int tns_preshift(const int32_t *k_q30, int order, bool iir) {
     }
   }
 
-  return bits + (gain_q30 > (1 << 30) ? 1 : 0) + 1;
+  return bits + (gain_q30 > TNS_Q30_ONE ? 1 : 0) + 1;
 }
 
-// Renormalize spectrum after filtering, reclaiming unused headroom
-static void tns_renormalize(int32_t *spec_q31, int hr) {
-  if (hr > 0) {
-    for (int i = 0; i < HQLC_FRAME_SAMPLES; i++) {
-      spec_q31[i] = (int32_t)((uint32_t)spec_q31[i] << hr);
-    }
-  }
-}
-
-int tns_fir_safe(int32_t *spec_q31, const int32_t *k_q30, int order) {
+void tns_apply_analysis_filter(bfp_i32 *spectrum, const int32_t *k_q30, int order) {
   if (order <= 0) {
-    return 0;
+    return;
   }
 
-  int preshift = tns_preshift(k_q30, order, false);
-  int hr;
-  tns_lattice_fir(spec_q31, k_q30, order, preshift, &hr);
-  tns_renormalize(spec_q31, hr);
-  return preshift - hr;
+  int required_headroom = tns_required_headroom(k_q30, order, false);
+  bfp_i32_ensure_headroom(spectrum, required_headroom);
+  int output_headroom;
+  tns_lattice_fir(spectrum->data, k_q30, order, 0, &output_headroom);
+  bfp_i32_renormalize(spectrum, (uint8_t)output_headroom);
 }
 
-int tns_iir_safe(int32_t *spec_q31, const int32_t *k_q30, int order) {
+void tns_apply_synthesis_filter(bfp_i32 *spectrum, const int32_t *k_q30, int order) {
   if (order <= 0) {
-    return 0;
+    return;
   }
 
-  int preshift = tns_preshift(k_q30, order, true);
-  int hr;
-  tns_lattice_iir(spec_q31, k_q30, order, preshift, &hr);
-  tns_renormalize(spec_q31, hr);
-  return preshift - hr;
+  int required_headroom = tns_required_headroom(k_q30, order, true);
+  bfp_i32_ensure_headroom(spectrum, required_headroom);
+  int output_headroom;
+  tns_lattice_iir(spectrum->data, k_q30, order, 0, &output_headroom);
+  bfp_i32_renormalize(spectrum, (uint8_t)output_headroom);
 }

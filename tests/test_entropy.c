@@ -4,6 +4,7 @@
 #include <string.h>
 
 #include "entropy.h"
+#include "entropy_tables.h"
 #include "hqlc.h"
 #include "psy.h"
 
@@ -111,11 +112,11 @@ void test_rans_highlevel_roundtrip(void) {
   quant[s10 + 3] = 100; // ESC + EG(0) overflow=85
 
   uint8_t out[4096];
-  size_t len = rans_encode_coeffs(quant, 1, gain_code, NULL, out, sizeof(out));
+  size_t len = rans_encode_payload(quant, 1, gain_code, NULL, NULL, out, sizeof(out));
   TEST_ASSERT_GREATER_THAN(0, len);
 
   int16_t decoded[HQLC_FRAME_SAMPLES];
-  rans_decode_coeffs(out, len, decoded, 1, gain_code, NULL);
+  rans_decode_payload(out, len, decoded, 1, gain_code, NULL, NULL);
 
   for (int b = 0; b < PSY_N_BANDS; b++) {
     int s = psy_band_edges[b];
@@ -135,25 +136,59 @@ void test_rans_corrupt_input_safe(void) {
   }
 
   uint8_t buf[4096];
-  size_t len = rans_encode_coeffs(quant, 1, gain_code, NULL, buf, sizeof(buf));
+  size_t len = rans_encode_payload(quant, 1, gain_code, NULL, NULL, buf, sizeof(buf));
   TEST_ASSERT_GREATER_THAN(4, len);
 
   int16_t decoded[HQLC_FRAME_SAMPLES];
 
   // Hard truncation: the decoder runs out of bytes and must report corruption.
-  TEST_ASSERT_FALSE(rans_decode_coeffs(buf, 3, decoded, 1, gain_code, NULL));
+  TEST_ASSERT_FALSE(rans_decode_payload(buf, 3, decoded, 1, gain_code, NULL, NULL));
 
   // Pure garbage at full length: must return without overreading or hanging.
   uint8_t junk[64];
   memset(junk, 0xA5, sizeof(junk));
-  (void)rans_decode_coeffs(junk, sizeof(junk), decoded, 1, gain_code, NULL);
+  (void)rans_decode_payload(junk, sizeof(junk), decoded, 1, gain_code, NULL, NULL);
+}
+
+void test_rans_exponent_roundtrip(void) {
+  // Exponents ride the coefficient stream: covers escapes (values far from
+  // the table centers) and M/S-flagged bands; values stay in [MIN, MAX].
+  int gain_code = 40;
+  int16_t quant[2 * HQLC_FRAME_SAMPLES];
+  for (int i = 0; i < 2 * HQLC_FRAME_SAMPLES; i++) {
+    quant[i] = (int16_t)((i % 5) - 2);
+  }
+  int32_t exp_in[2 * PSY_N_BANDS], exp_out[2 * PSY_N_BANDS];
+  bool ms[PSY_N_BANDS];
+  for (int b = 0; b < PSY_N_BANDS; b++) {
+    exp_in[b] = 20 + ((b * 7) % 30) - ((b == 5) ? 18 : 0); // incl. escape
+    exp_in[PSY_N_BANDS + b] = exp_in[b] + ((b % 3) - 1) * (b == 9 ? 14 : 2);
+    ms[b] = (b % 4) == 0;
+  }
+  uint8_t out[8192];
+  size_t len = rans_encode_payload(quant, 2, gain_code, ms, exp_in, out, sizeof(out));
+  TEST_ASSERT_GREATER_THAN(0, len);
+
+  int16_t decoded[2 * HQLC_FRAME_SAMPLES];
+  TEST_ASSERT_TRUE(
+      rans_decode_payload(out, len, decoded, 2, gain_code, ms, exp_out));
+  for (int i = 0; i < 2 * PSY_N_BANDS; i++) {
+    TEST_ASSERT_EQUAL_INT32(exp_in[i], exp_out[i]);
+  }
+  int active = psy_band_edges[PSY_N_BANDS];
+  for (int ch = 0; ch < 2; ch++) {
+    for (int i = 0; i < active; i++) {
+      TEST_ASSERT_EQUAL_INT16(quant[ch * HQLC_FRAME_SAMPLES + i],
+                              decoded[ch * HQLC_FRAME_SAMPLES + i]);
+    }
+  }
 }
 
 void test_rans_freq_tables_normalized(void) {
   // Every (alpha x activity) table must be monotone with cf[0] = 0 and
   // cf[MAX_SYM] = RANS_M, or the rANS renormalization is not exact and
   // decode desyncs.
-  for (int t = 0; t < RANS_NTABLES; t++) {
+  for (int t = 0; t < RANS_COEF_NTABLES; t++) {
     TEST_ASSERT_EQUAL_UINT32(0, rans_cf[t][0]);
     for (int s = 0; s < RANS_MAX_SYM; s++) {
       TEST_ASSERT_TRUE(rans_cf[t][s] <= rans_cf[t][s + 1]);
@@ -170,6 +205,7 @@ int main(void) {
   RUN_TEST(test_binary_rle_roundtrip);
   RUN_TEST(test_rans_highlevel_roundtrip);
   RUN_TEST(test_rans_corrupt_input_safe);
+  RUN_TEST(test_rans_exponent_roundtrip);
   RUN_TEST(test_rans_freq_tables_normalized);
   return UNITY_END();
 }

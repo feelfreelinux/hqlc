@@ -17,7 +17,7 @@ So, the MDCT transform-based codecs are quite heavy and complex. Subband codecs 
 
 ```mermaid
 flowchart LR
-    PCM["PCM\n48 kHz"] --> MDCT["MDCT"] --> TNS["TNS"] --> ENV["Envelope\nanalysis"] --> RC["Rate\ncontrol"] --> QUANT["Quantize\n+ NF estimate"] --> RANS["rANS"] --> BIT["Bitstream"]
+    PCM["PCM\n48 kHz"] --> MDCT["MDCT"] --> TNS["TNS"] --> ENV["Envelope\nanalysis"] --> RC["Rate\ncontrol"] --> QUANT["Quantize\n"] --> RANS["rANS"] --> BIT["Bitstream"]
 ```
 
 ## MDCT, splitting PCM into frequency bins
@@ -121,13 +121,13 @@ This offset controls where within the quantization bin we place the reconstructe
 
 The deadzone quantizer intentionally turns small coefficients into zero. That's a good decision for our rate, but decoding long zero runs as literal digital silence tends to sound wrong. Our ears don't really like holes in the spectrum, between the tonal peaks. A standard approach is to fill the holes with noise, shaped to the right amplitude.
 
-The mechanism is pretty simple. During decoding, HQLC looks for runs of more than four consecutive zeros. Once such a run is found, it is filled with synthetic noise. There is no masking model or tonality detector here, as the quantizer already made the perceptual decision by rounding those coefficients to zero. Noise fill only repairs the texture of these holes.
+The tricky part is where we get this amplitude from. Most of AAC-ish codecs just transmit information about it, while Opus can infer the amplitude quite well due to how its quantizer (PVQ) works. Methods for noise-fill have been, and still are quite heavily patented, so in HQLC I've decided to do something a bit different.
 
-The fill level is transmitted as a 3-bit noise factor per channel, similar to LC3. During quantization, the encoder reuses the pre-deadzone magnitudes `|X| / step` and averages them over exactly the bins the decoder would fill. That estimates how full the deadzone was before the coefficients rounded to zero. This is used to scale the noise amplitude.
+The quantizer zeroes everything below the `0.65 * step` threshold. That threshold is known from the decoder side too, as thats how we dequantize. So a zero-bin implies that whatever was there, was below the that threshold. While that threshold itself cant be used as an amplitude estimate, the information of how many bins have been zero'ed in the entire band leaks a more-or-less layout of the band itself. After all, we know how many of the bins survived.
 
-The noise itself is deterministic pseudorandom sign noise from a tiny LCG. The seed depends on the frame index and channel, so we don't get a static metallic hiss across frames.
+As the bins follow Laplacian distribution, we can exploit it to make a guess of how the rest of the band looked like. To model it, we need one parameter - the rough scale of the coefficients in the given band. This is being estimated from the zero count itself - if more bins have been zeroed, then most likely the smaller the coefficients have been. When tied into the distribution, we roughly estimate the level of the lost bins, and use that as the NF amplitude, without transmitting any side info. The noise itself is generated through a simple xorshift seeded per frame and channel.
 
-Note: even on non-transient frames where coded coefficients use the interpolated exponent envelope, noise fill uses the flat per-band step. The interpolated version did not seem to buy anything perceptually, and the flat version keeps the fill rule simple and tied directly to the transmitted exponents.
+The entire NF logic only triggers on bands where over 50% of the bins are zeroed. Below that, there's enough spectral content that the holes are not that noticable, and filling it with synthetic noise would likely just degrade it.
 
 ### Quick note about psychoacoustics
 
@@ -216,18 +216,8 @@ HQLC's reservoir is simple. It tracks the running surplus/deficit (`res_bits += 
 
 Another part of the RC is a simple EMA (exponential moving average) of the gain code, with alpha = 1/16. This tracks the long-term average gain. The rate controller uses it to limit how fast the gain can drop after a transient. Without this, the RC would oscillate a lot, causing audible glitches. There's also a small check for whether a frame is mostly silent, which triggers a coast / reuse of the previous gain value, to prevent the quantizer noise blowing up on quiet frames.
 
+Transient frames get a 25% budget boost, which is later compensated on steady frames.
+
 ## Patent status
-
-To the best of my knowledge, every building block in HQLC is either public domain or based on long-expired patents:
-
-- **MDCT / DCT-IV via FFT** - standard signal processing, public domain.
-- **KBD window** - published by Kaiser and Bessel, no patent restrictions.
-- **Band exponents / DPCM coding** - basic quantization and differential coding techniques, public domain.
-- **TNS** - the original Fraunhofer patents from the mid-90s have expired. The underlying techniques (Levinson-Durbin, lattice filters, LAR quantization) are textbook DSP.
-- **Noise fill / spectral masking** - standard psychoacoustic concepts, not patentable in themselves.
-- **Deadzone quantization** - standard quantization theory, public domain.
-- **Rice coding** - public domain.
-- **rANS** - explicitly placed in the public domain by Jarek Duda.
-- **Rate control / bit reservoir** - basic rate control strategies are not patentable; specific implementations in other codecs may be, but HQLC's approach is straightforward and original.
 
 This codec is designed to be fully patent-free and royalty-free. That said, I'm not a lawyer - if you're shipping a product, do your own due diligence.

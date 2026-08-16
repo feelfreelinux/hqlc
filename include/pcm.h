@@ -4,6 +4,7 @@
 
 #include <stdint.h>
 
+#include "fxp.h"
 #include "hqlc.h"
 
 #ifdef __cplusplus
@@ -67,37 +68,15 @@ static inline void
 pcm_store_q31(uint8_t *base, hqlc_pcm_format fmt, int idx, int32_t val_q31) {
   if (fmt == HQLC_PCM16) {
     int16_t *p = (int16_t *)base;
-    int32_t pcm16 = (val_q31 >> 16) + ((val_q31 >> 15) & 1);
-    if (pcm16 > 32767) {
-      pcm16 = 32767;
-    }
-    if (pcm16 < -32768) {
-      pcm16 = -32768;
-    }
-    p[idx] = (int16_t)pcm16;
+    int32_t pcm16 = fxp_shr_rnd_i32(val_q31, 16);
+    p[idx] = (int16_t)fxp_clamp_i32(pcm16, INT16_MIN, INT16_MAX);
   } else {
-    int32_t v = (val_q31 >> 8) + ((val_q31 >> 7) & 1);
+    int32_t v = fxp_shr_rnd_i32(val_q31, 8);
     uint8_t *p = base + 3 * idx;
     p[0] = (uint8_t)(v & 0xFF);
     p[1] = (uint8_t)((v >> 8) & 0xFF);
     p[2] = (uint8_t)((v >> 16) & 0xFF);
   }
-}
-
-/**
- * @brief Clamp a 32-bit integer to the signed 16-bit range.
- *
- * @param x Value to clamp.
- * @return `x` clamped to INT16_MIN..INT16_MAX.
- */
-static inline int16_t pcm_clamp_i16(int32_t x) {
-  if (x > 32767) {
-    return 32767;
-  }
-  if (x < -32768) {
-    return -32768;
-  }
-  return (int16_t)x;
 }
 
 #ifdef __cplusplus

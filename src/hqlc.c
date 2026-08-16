@@ -1,8 +1,10 @@
 #include "hqlc.h"
 
+#include <math.h>
 #include <string.h>
 
 #include "entropy.h"
+#include "entropy_tables.h"
 #include "fxp.h"
 #include "mdct.h"
 #include "ms.h"
@@ -15,6 +17,20 @@
 #ifdef HQLC_BENCH
 hqlc_bench_ctx *hqlc_bench = NULL;
 #endif
+
+// Boost for transient frames, letting it use more bits
+// 1/4 = 25% boost in the rate controller
+#define RC_TRANSIENT_BOOST 4
+
+#define GAIN_CODE_MAX ((1 << QUANT_GAIN_BITS) - 1)
+
+// The public fixed-mode gain is converted once at the encoder boundary. The
+// codec pipeline and bitstream use gain codes exclusively.
+static int gain_code_from_float(float gain) {
+  float code = log2f(gain) * QUANT_GAIN_Q;
+  int rounded = (int)(code >= 0.0f ? code + 0.5f : code - 0.5f);
+  return fxp_clamp_i32(rounded + QUANT_GAIN_BIAS, 0, GAIN_CODE_MAX);
+}
 
 // Interpolated quantizer steps on tonal frames, flat on TNS (transient)
 // frames. The TNS flag is transmitted, so both sides gate identically.
@@ -31,8 +47,6 @@ typedef struct {
   int32_t exp_indices[HQLC_MAX_CHANNELS * PSY_N_BANDS];
   // Quantized coefficients
   int16_t quant[HQLC_MAX_CHANNELS * HQLC_FRAME_SAMPLES];
-  // 3-bit noise factor per channel
-  int noise_factors[HQLC_MAX_CHANNELS];
 
   // Per-stage temporaries (only one active at a time)
   union {
@@ -52,14 +66,10 @@ typedef struct {
   // Exponent indices for each band
   int32_t exp_indices[HQLC_MAX_CHANNELS * PSY_N_BANDS];
 
-  // 3-bit noise factor per channel
-  int noise_factors[HQLC_MAX_CHANNELS];
-
   // Per-stage temporaries
   union {
     struct {
       int32_t spec_q31[HQLC_MAX_CHANNELS * HQLC_FRAME_SAMPLES];
-      int loss_bits[HQLC_MAX_CHANNELS];
       int64_t mdct_work[MDCT_SCRATCH_BYTES / sizeof(int64_t)];
     } synthesis;
   } stage;
@@ -77,7 +87,7 @@ struct hqlc_encoder {
   // RC state (MODE_RC only)
   int prev_gain_code;
   int32_t ema_gain_q8; // EMA of gain_code in Q8 fixed-point
-  int prev_side_bits;
+  int prev_overhead_bits;
   int32_t res_bits;
   int tilt_step_q7; // per-fine-band tilt increment in EXP_Q7
 
@@ -128,17 +138,19 @@ hqlc_error hqlc_encoder_init(hqlc_encoder *enc, const hqlc_encoder_config *cfg) 
       return HQLC_ERR_INVALID_ARG;
     }
     enc->bitrate = cfg->bitrate;
-    enc->prev_gain_code = quant_gain_encode(16.0f);
-    enc->ema_gain_q8 = enc->prev_gain_code << 8;
-    enc->prev_side_bits = 150; // ~19 bytes, typical side info for first probe
+    enc->prev_gain_code = QUANT_GAIN_BIAS + 4 * QUANT_GAIN_Q;
+    enc->ema_gain_q8 = fxp_rescale_i32(enc->prev_gain_code, 0, 8);
+    // Conservative typical fixed side info + rANS flush overhead. The exact
+    // measured overhead replaces this after the first encoded frame.
+    enc->prev_overhead_bits = 64;
     enc->res_bits = 0;
     enc->tilt_step_q7 = psy_tilt_step_q7(psy_tilt_for_bitrate(cfg->bitrate));
     break;
   case HQLC_MODE_FIXED:
-    if (cfg->gain <= 0.0f) {
+    if (!(cfg->gain > 0.0f)) {
       return HQLC_ERR_INVALID_ARG;
     }
-    enc->gain_code = quant_gain_encode(cfg->gain);
+    enc->gain_code = gain_code_from_float(cfg->gain);
     enc->tilt_step_q7 = psy_tilt_step_q7(psy_tilt_for_bitrate(96000));
     break;
   default:
@@ -152,15 +164,15 @@ hqlc_error hqlc_encoder_init(hqlc_encoder *enc, const hqlc_encoder_config *cfg) 
 }
 
 // Cost (Q8 bits) of the EG(0) escape for magnitudes past the rANS alphabet:
-// (nbits+1) unary + nbits binary, matching rans_encode_coeffs
+// (nbits+1) unary + nbits binary, matching rans_encode_payload
 static inline int32_t eg0_overflow_cost_q8(int q) {
-  return (2 * rans_eg0_nbits(q - (RANS_MAX_SYM - 1)) + 1) * 256;
+  int bit_count = 2 * rans_eg0_nbits(q - (RANS_MAX_SYM - 1)) + 1;
+  return fxp_rescale_i32(bit_count, 0, 8);
 }
 
 // Estimate the rANS payload cost (bits) at a candidate gain_code without quantizing. Uses
 // flat per-band steps, as the interp quantizer does not affect the cost too much.
-static int probe_frame_bits(const int32_t *spec_q31,
-                            const int *loss_bits,
+static int probe_frame_bits(const bfp_i32 *spectra,
                             const int32_t *exp_indices,
                             int gain_code,
                             int n_ch,
@@ -168,9 +180,8 @@ static int probe_frame_bits(const int32_t *spec_q31,
   int32_t total_q8 = 0;
 
   for (int ch = 0; ch < n_ch; ch++) {
-    const int32_t *ch_spec = &spec_q31[ch * HQLC_FRAME_SAMPLES];
+    const int32_t *ch_spec = spectra[ch].data;
     const int32_t *ch_exp = &exp_indices[ch * PSY_N_BANDS];
-    int lb = loss_bits[ch];
 
     HQLC_BENCH_BEGIN(HQLC_BENCH_ENC_RC_QUANT);
     int prev_nz = 0, prev_w = 1;
@@ -188,9 +199,8 @@ static int probe_frame_bits(const int32_t *spec_q31,
       int e = psy_band_edges[b + 1];
       int w = e - s;
 
-      int neg_E = gain_code + QUANT_EXP_OFFSET - 2 * (int)ch_exp[b];
-      int32_t inv_step_m = quant_pow2_eighth_q30[neg_E & 7] >> 2;
-      int total_shift = QUANT_TOTAL_Q - lb - (neg_E >> 3);
+      quant_scale scale =
+          quant_forward_scale((int)ch_exp[b], gain_code, spectra[ch].exp2);
 
       int abin = abins[b];
       if (ch == 1 && ms_flags && ms_flags[b]) {
@@ -205,33 +215,36 @@ static int probe_frame_bits(const int32_t *spec_q31,
 
       int nz = 0;
       HQLC_BENCH_BEGIN(HQLC_BENCH_ENC_PROBE_BAND);
-      if (total_shift >= 64) {
+      if (scale.product_rshift >= 64) {
         // everything quantizes to zero
-      } else if (total_shift >= 32) {
-        int small_shift = total_shift - 32;
+      } else if (scale.product_rshift >= 32) {
+        int small_shift = scale.product_rshift - 32;
         for (int i = s; i < e; i++) {
           int32_t abs_spec = fxp_abs_i32(ch_spec[i]);
-          int32_t hi = (int32_t)((int64_t)abs_spec * inv_step_m >> 32);
+          int32_t hi = fxp_mul_rshift_i32(abs_spec, scale.multiplier_q28, 32);
           int32_t q = ((hi >> small_shift) + QUANT_DZ_BIAS_Q8) >> 8;
           if (q > 0) {
             if (q < RANS_MAX_SYM - 1) {
-              total_q8 += cost[q] + 256; // symbol + 1 sign bit
+              total_q8 += cost[q] + FXP_Q8(1.0); // symbol + 1 sign bit
             } else {
-              total_q8 += cost[RANS_MAX_SYM - 1] + 256 + eg0_overflow_cost_q8(q);
+              total_q8 +=
+                  cost[RANS_MAX_SYM - 1] + FXP_Q8(1.0) + eg0_overflow_cost_q8(q);
             }
             nz++;
           }
         }
-      } else if (total_shift > 0) {
+      } else if (scale.product_rshift > 0) {
         for (int i = s; i < e; i++) {
           int32_t abs_spec = fxp_abs_i32(ch_spec[i]);
-          int32_t scaled_q8 = (int32_t)((int64_t)abs_spec * inv_step_m >> total_shift);
+          int32_t scaled_q8 = (int32_t)((int64_t)abs_spec * scale.multiplier_q28 >>
+                                        scale.product_rshift);
           int32_t q = (scaled_q8 + QUANT_DZ_BIAS_Q8) >> 8;
           if (q > 0) {
             if (q < RANS_MAX_SYM - 1) {
-              total_q8 += cost[q] + 256; // symbol + 1 sign bit
+              total_q8 += cost[q] + FXP_Q8(1.0); // symbol + 1 sign bit
             } else {
-              total_q8 += cost[RANS_MAX_SYM - 1] + 256 + eg0_overflow_cost_q8(q);
+              total_q8 +=
+                  cost[RANS_MAX_SYM - 1] + FXP_Q8(1.0) + eg0_overflow_cost_q8(q);
             }
             nz++;
           }
@@ -241,7 +254,7 @@ static int probe_frame_bits(const int32_t *spec_q31,
         // fine, so a flat ESC cost is close enough
         for (int i = s; i < e; i++) {
           if (ch_spec[i] != 0) {
-            total_q8 += cost[RANS_MAX_SYM - 1] + 256;
+            total_q8 += cost[RANS_MAX_SYM - 1] + FXP_Q8(1.0);
             nz++;
           }
         }
@@ -255,7 +268,11 @@ static int probe_frame_bits(const int32_t *spec_q31,
     HQLC_BENCH_END(HQLC_BENCH_ENC_RC_QUANT);
   }
 
-  return (total_q8 + 128) >> 8;
+  // Exponents share the rANS payload with coefficients; estimate their cost
+  // for this frame rather than carrying the previous frame's estimate.
+  total_q8 += rans_exp_payload_cost_q8(exp_indices, n_ch, ms_flags);
+
+  return fxp_rescale_i32(total_q8, 8, 0);
 }
 
 // Estimate how many gain-code steps to adjust, based on the ratio of
@@ -291,11 +308,11 @@ static int compute_slew_limit(hqlc_encoder *enc) {
 // to find the gain code closest to the target bitrate. In fixed mode,
 // just returns the configured gain code.
 static int select_gain(hqlc_encoder *enc,
-                       const int32_t *spec_q31,
-                       const int *loss_bits,
+                       const bfp_i32 *spectra,
                        const int32_t *exp_indices,
                        int n_ch,
                        const bool *ms_flags,
+                       bool transient,
                        bool *quiet_frame_out,
                        int *target_bpf_out) {
   *quiet_frame_out = false;
@@ -312,16 +329,18 @@ static int select_gain(hqlc_encoder *enc,
     tol = 8;
   }
 
+  // Attacks get a larger share of the budget, resevoir absorbs it later
   int borrow = fxp_clamp_i32(enc->res_bits, -target_bpf, target_bpf);
-  int effective_target = target_bpf + borrow / 2;
+  int boost = transient ? target_bpf / RC_TRANSIENT_BOOST : 0;
+  int effective_target = target_bpf + borrow / 2 + boost;
   effective_target = fxp_clamp_i32(effective_target, target_bpf / 4, target_bpf * 3);
 
   int gc0 = enc->prev_gain_code;
   if (gc0 > QUANT_GAIN_RC_MAX) {
     gc0 = QUANT_GAIN_RC_MAX;
   }
-  int b0 = probe_frame_bits(spec_q31, loss_bits, exp_indices, gc0, n_ch, ms_flags) +
-           enc->prev_side_bits;
+  int b0 = probe_frame_bits(spectra, exp_indices, gc0, n_ch, ms_flags) +
+           enc->prev_overhead_bits;
 
   int err0 = b0 - effective_target;
   if (err0 < 0) {
@@ -339,8 +358,8 @@ static int select_gain(hqlc_encoder *enc,
   }
 
   int gc1 = fxp_clamp_i32(gc0 + delta, 0, QUANT_GAIN_RC_MAX);
-  int b1 = probe_frame_bits(spec_q31, loss_bits, exp_indices, gc1, n_ch, ms_flags) +
-           enc->prev_side_bits;
+  int b1 = probe_frame_bits(spectra, exp_indices, gc1, n_ch, ms_flags) +
+           enc->prev_overhead_bits;
 
   if (gc1 > gc0 && b0 < effective_target && (b1 - b0) < tol * (gc1 - gc0) / 2) {
     *quiet_frame_out = true;
@@ -376,22 +395,27 @@ hqlc_error hqlc_encode_frame(hqlc_encoder *enc,
 
   // Scratch layout
   hqlc_enc_scratch *s = (hqlc_enc_scratch *)scratch;
-  int32_t *spec_q31 = s->spec_q31;
   int32_t *exp_indices = s->exp_indices;
   int16_t *quant = s->quant;
 
-  int loss_bits[HQLC_MAX_CHANNELS];
+  bfp_i32 spectra[HQLC_MAX_CHANNELS];
+  for (int ch = 0; ch < n_ch; ch++) {
+    spectra[ch] = bfp_i32_view(
+        &s->spec_q31[ch * HQLC_FRAME_SAMPLES], HQLC_FRAME_SAMPLES, 0);
+  }
   tns_info tns[HQLC_MAX_CHANNELS];
   memset(tns, 0, sizeof(tns));
 
   bool tns_eligible[HQLC_MAX_CHANNELS] = {false, false};
+  bool tns_attack[HQLC_MAX_CHANNELS] = {false, false};
 
   for (int ch = 0; ch < n_ch; ch++) {
-    int32_t *ch_spec = &spec_q31[ch * HQLC_FRAME_SAMPLES];
+    int32_t *ch_spec = spectra[ch].data;
 
     // Perform TNS detection on raw spectrum before MDCT
     bool tr = tns_detect_transient(&enc->tns_det[ch], pcm, fmt, n_ch, ch);
     tns_eligible[ch] = tr || enc->tns_hang[ch] > 0;
+    tns_attack[ch] = tr;
 
     // Update the 1 frame hangover
     enc->tns_hang[ch] = tr ? 1 : (enc->tns_hang[ch] > 0 ? enc->tns_hang[ch] - 1 : 0);
@@ -403,11 +427,9 @@ hqlc_error hqlc_encode_frame(hqlc_encoder *enc,
                                   fmt,
                                   n_ch,
                                   ch,
-                                  ch_spec,
-                                  HQLC_FRAME_SAMPLES,
+                                  &spectra[ch],
                                   s->stage.analysis.mdct_work,
-                                  MDCT_SCRATCH_BYTES,
-                                  &loss_bits[ch]);
+                                  MDCT_SCRATCH_BYTES);
     HQLC_BENCH_END(HQLC_BENCH_ENC_MDCT);
     if (err != HQLC_OK) {
       return err;
@@ -425,31 +447,27 @@ hqlc_error hqlc_encode_frame(hqlc_encoder *enc,
       memset(enc->ms_flags, 0, sizeof(enc->ms_flags));
     } else {
       // Swaps L/R channels in place with M/S for eligible bands
-      ms_encode(&spec_q31[0],
-                &spec_q31[HQLC_FRAME_SAMPLES],
-                &loss_bits[0],
-                &loss_bits[1],
-                enc->ms_flags);
+      ms_encode(&spectra[0], &spectra[1], enc->ms_flags);
     }
   }
 
   // Perform TNS on eligible frames
   for (int ch = 0; ch < n_ch; ch++) {
-    int32_t *ch_spec = &spec_q31[ch * HQLC_FRAME_SAMPLES];
+    int32_t *ch_spec = spectra[ch].data;
     int32_t *ch_exp = &exp_indices[ch * PSY_N_BANDS];
 
     HQLC_BENCH_BEGIN(HQLC_BENCH_ENC_TNS);
     if (tns_eligible[ch]) {
-      tns_analyze(ch_spec, &tns[ch]);
+      tns_analyze(ch_spec, !tns_attack[ch], &tns[ch]);
       if (tns[ch].order > 0) {
-        loss_bits[ch] += tns_fir_safe(ch_spec, tns[ch].k_q30, tns[ch].order);
+        tns_apply_analysis_filter(&spectra[ch], tns[ch].k_q30, tns[ch].order);
       }
     }
     HQLC_BENCH_END(HQLC_BENCH_ENC_TNS);
 
     HQLC_BENCH_BEGIN(HQLC_BENCH_ENC_PSY);
     psy_fine_band_exponents(
-        ch_spec, loss_bits[ch], enc->tilt_step_q7, tns_eligible[ch] ? 1 : 0, ch_exp);
+        &spectra[ch], enc->tilt_step_q7, tns_eligible[ch], ch_exp);
     HQLC_BENCH_END(HQLC_BENCH_ENC_PSY);
   }
 
@@ -467,24 +485,23 @@ hqlc_error hqlc_encode_frame(hqlc_encoder *enc,
 
   HQLC_BENCH_BEGIN(HQLC_BENCH_ENC_SELECT_GAIN);
   gain_code = select_gain(enc,
-                          spec_q31,
-                          loss_bits,
+                          spectra,
                           exp_indices,
                           n_ch,
                           enc->ms_flags,
+                          tns_eligible[0] || (n_ch > 1 && tns_eligible[1]),
                           &quiet_frame,
                           &target_bpf);
   HQLC_BENCH_END(HQLC_BENCH_ENC_SELECT_GAIN);
 
-  // Quantize + NF estimate per channel
+  // Quantize per channel
   HQLC_BENCH_BEGIN(HQLC_BENCH_ENC_QUANT_FWD);
   for (int ch = 0; ch < n_ch; ch++) {
-    s->noise_factors[ch] = quant_forward_nf(&spec_q31[ch * HQLC_FRAME_SAMPLES],
-                                            loss_bits[ch],
-                                            &exp_indices[ch * PSY_N_BANDS],
-                                            gain_code,
-                                            env_interp_active(tns[ch].order),
-                                            &quant[ch * HQLC_FRAME_SAMPLES]);
+    quant_forward(&spectra[ch],
+                  &exp_indices[ch * PSY_N_BANDS],
+                  gain_code,
+                  env_interp_active(tns[ch].order),
+                  &quant[ch * HQLC_FRAME_SAMPLES]);
   }
   HQLC_BENCH_END(HQLC_BENCH_ENC_QUANT_FWD);
 
@@ -515,52 +532,19 @@ hqlc_error hqlc_encode_frame(hqlc_encoder *enc,
     }
   }
 
-  // Ch0 exponents, DPCM + Rice
-  {
-    int32_t deltas[PSY_N_BANDS];
-    int32_t prev = 0;
-    for (int b = 0; b < PSY_N_BANDS; b++) {
-      deltas[b] = exp_indices[b] - prev;
-      prev = exp_indices[b];
-    }
-    int k = find_best_rice_k(deltas, PSY_N_BANDS);
-    bw_write(&bw, (uint32_t)k, 3);
-    for (int b = 0; b < PSY_N_BANDS; b++) {
-      bw_write_rice(&bw, zigzag_enc(deltas[b]), k);
-    }
-  }
-
-  // ch1+ does a second-order DPCM of the delta from ch0 to ch1
-  for (int ch = 1; ch < n_ch; ch++) {
-    int32_t dd[PSY_N_BANDS];
-    int32_t prev_d = 0;
-    for (int b = 0; b < PSY_N_BANDS; b++) {
-      int32_t d = exp_indices[ch * PSY_N_BANDS + b] - exp_indices[b];
-      dd[b] = d - prev_d;
-      prev_d = d;
-    }
-    int k = find_best_rice_k(dd, PSY_N_BANDS);
-    bw_write(&bw, (uint32_t)k, 3);
-    for (int b = 0; b < PSY_N_BANDS; b++) {
-      bw_write_rice(&bw, zigzag_enc(dd[b]), k);
-    }
-  }
-
-  // Noise factors (3 bits per channel)
-  for (int ch = 0; ch < n_ch; ch++) {
-    bw_write(&bw, (uint32_t)s->noise_factors[ch], 3);
-  }
+  // Exponents are rANS-coded inside the coefficient stream
 
   bw_flush(&bw);
   size_t side_bytes = bw_bytes(&bw);
   HQLC_BENCH_END(HQLC_BENCH_ENC_SIDE_INFO);
 
-  // rANS encode coefficients
+  // rANS encode coefficients (+ exponents in the same stream)
   HQLC_BENCH_BEGIN(HQLC_BENCH_ENC_RANS_ENC);
-  size_t rans_len = rans_encode_coeffs(quant,
+  size_t rans_len = rans_encode_payload(quant,
                                        n_ch,
                                        gain_code,
                                        (n_ch == 2) ? enc->ms_flags : NULL,
+                                       exp_indices,
                                        rans_tmp,
                                        HQLC_MAX_FRAME_BYTES);
   HQLC_BENCH_END(HQLC_BENCH_ENC_RANS_ENC);
@@ -583,10 +567,12 @@ hqlc_error hqlc_encode_frame(hqlc_encoder *enc,
     // Don't update gain EMA for quiet frames
     if (!quiet_frame) {
       // Gain EMA, alpha = 1/16
-      enc->ema_gain_q8 += ((gain_code << 8) - enc->ema_gain_q8) >> 4;
+      int32_t gain_code_q8 = fxp_rescale_i32(gain_code, 0, 8);
+      enc->ema_gain_q8 += (gain_code_q8 - enc->ema_gain_q8) >> 4;
     }
     enc->prev_gain_code = gain_code;
-    enc->prev_side_bits = (int)(side_bytes * 8) + 24; // +24: rANS state flush overhead
+    // +24: rANS state flush; exponent cost is estimated per candidate frame
+    enc->prev_overhead_bits = (int)(side_bytes * 8) + 24;
   }
 
   return HQLC_OK;
@@ -677,34 +663,7 @@ hqlc_error hqlc_decode_frame(hqlc_decoder *dec,
     }
   }
 
-  // DPCM ch0 exponents
-  {
-    int k = (int)br_read(&br, 3);
-    int32_t prev = 0;
-    for (int b = 0; b < PSY_N_BANDS; b++) {
-      uint32_t u = br_read_rice(&br, k);
-      exp_indices[b] =
-          fxp_clamp_i32(prev + zigzag_dec(u), PSY_EXP_INDEX_MIN, PSY_EXP_INDEX_MAX);
-      prev = exp_indices[b];
-    }
-  }
-
-  // Ch1+ exponents, DPCM on the deltas from ch0
-  for (int ch = 1; ch < n_ch; ch++) {
-    int k = (int)br_read(&br, 3);
-    int32_t prev_d = 0;
-    for (int b = 0; b < PSY_N_BANDS; b++) {
-      int32_t d = prev_d + zigzag_dec(br_read_rice(&br, k));
-      prev_d = d;
-      exp_indices[ch * PSY_N_BANDS + b] =
-          fxp_clamp_i32(exp_indices[b] + d, PSY_EXP_INDEX_MIN, PSY_EXP_INDEX_MAX);
-    }
-  }
-
-  // Noise factors (3 bits per channel)
-  for (int ch = 0; ch < n_ch; ch++) {
-    s->noise_factors[ch] = (int)br_read(&br, 3);
-  }
+  // Exponents are decoded from the rANS stream
 
   // Byte-align to find rANS stream start
   size_t bits_used = br_bits(&br);
@@ -720,23 +679,29 @@ hqlc_error hqlc_decode_frame(hqlc_decoder *dec,
 
   memset(quant_buf, 0, (size_t)n_ch * HQLC_FRAME_SAMPLES * sizeof(int16_t));
 
-  if (rans_len > 0 && !rans_decode_coeffs(rans_data,
-                                          rans_len,
-                                          quant_buf,
-                                          n_ch,
-                                          gain_code,
-                                          (n_ch == 2) ? ms_flags : NULL)) {
+  if (rans_len == 0 || !rans_decode_payload(rans_data,
+                                           rans_len,
+                                           quant_buf,
+                                           n_ch,
+                                           gain_code,
+                                           (n_ch == 2) ? ms_flags : NULL,
+                                           exp_indices)) {
     return HQLC_ERR_BITSTREAM_CORRUPT;
   }
   HQLC_BENCH_END(HQLC_BENCH_DEC_ENTROPY);
 
-  int *loss_bits = s->stage.synthesis.loss_bits;
+  bfp_i32 spectra[HQLC_MAX_CHANNELS];
+  for (int ch = 0; ch < n_ch; ch++) {
+    spectra[ch] = bfp_i32_view(&s->stage.synthesis.spec_q31[ch * HQLC_FRAME_SAMPLES],
+                               HQLC_FRAME_SAMPLES,
+                               0);
+  }
 
   // Performs dequant + NF + TNS synthesis per channel
   for (int ch = 0; ch < n_ch; ch++) {
     int32_t *ch_exp = &exp_indices[ch * PSY_N_BANDS];
     int16_t *ch_quant = &quant_buf[ch * HQLC_FRAME_SAMPLES];
-    int32_t *spec_q31 = &s->stage.synthesis.spec_q31[ch * HQLC_FRAME_SAMPLES];
+    bfp_i32 *spectrum = &spectra[ch];
 
     // Inverse quantize, interpolate mode on non TNS frames
     HQLC_BENCH_BEGIN(HQLC_BENCH_DEC_DEQUANT);
@@ -744,51 +709,43 @@ hqlc_error hqlc_decode_frame(hqlc_decoder *dec,
                   ch_exp,
                   gain_code,
                   env_interp_active(tns[ch].order),
-                  spec_q31,
-                  &loss_bits[ch]);
+                  spectrum);
     HQLC_BENCH_END(HQLC_BENCH_DEC_DEQUANT);
 
-    // Noise fill, seed varied per frame and channel so the noise differs accross frames.
+    // Noise fill, seeded per frame and channel so the texture differs across frames.
     HQLC_BENCH_BEGIN(HQLC_BENCH_DEC_NF);
     uint32_t nf_seed =
         NF_SEED_BIAS ^ (dec->frame_count * 0x9E37u) ^ ((uint32_t)ch * 0x51EDu);
 
     // skip S bands (only ch 1 of M/S)
     const bool *skip = ch == 1 ? ms_flags : NULL;
-    nf_run_length_fill(ch_quant,
-                       ch_exp,
-                       gain_code,
-                       s->noise_factors[ch],
-                       nf_seed,
-                       skip,
-                       spec_q31,
-                       &loss_bits[ch]);
+    noise_fill(ch_quant,
+               ch_exp,
+               gain_code,
+               env_interp_active(tns[ch].order),
+               nf_seed,
+               skip,
+               spectrum);
     HQLC_BENCH_END(HQLC_BENCH_DEC_NF);
 
     // TNS synthesis / inverse filter
     HQLC_BENCH_BEGIN(HQLC_BENCH_DEC_TNS);
     if (tns[ch].order > 0) {
-      loss_bits[ch] += tns_iir_safe(spec_q31, tns[ch].k_q30, tns[ch].order);
+      tns_apply_synthesis_filter(spectrum, tns[ch].k_q30, tns[ch].order);
     }
     HQLC_BENCH_END(HQLC_BENCH_DEC_TNS);
   }
 
   // Decode back to L/R for flagged bands
   if (n_ch == 2) {
-    ms_decode(&s->stage.synthesis.spec_q31[0],
-              &s->stage.synthesis.spec_q31[HQLC_FRAME_SAMPLES],
-              &loss_bits[0],
-              &loss_bits[1],
-              ms_flags);
+    ms_decode(&spectra[0], &spectra[1], ms_flags);
   }
 
   // do the inverse mdct, OLA, write the PCM output
   for (int ch = 0; ch < n_ch; ch++) {
-    int32_t *spec_q31 = &s->stage.synthesis.spec_q31[ch * HQLC_FRAME_SAMPLES];
+    bfp_i32 *spectrum = &spectra[ch];
     HQLC_BENCH_BEGIN(HQLC_BENCH_DEC_IMDCT_OLA);
-    hqlc_error err = mdct_inverse_ola(spec_q31,
-                                      HQLC_FRAME_SAMPLES,
-                                      loss_bits[ch],
+    hqlc_error err = mdct_inverse_ola(spectrum,
                                       &dec->ola[ch],
                                       pcm_out,
                                       fmt,

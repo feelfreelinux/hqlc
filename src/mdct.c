@@ -7,6 +7,9 @@
 #include "mdct_tables.h"
 #include "pcm.h"
 
+#define MDCT_DCT_BITS       10
+#define MDCT_MATH_GAIN_BITS 8
+
 /**
  * @brief Return one sample from the mirrored 1024-point KBD window
  */
@@ -17,29 +20,21 @@ static inline int32_t mdct_win_q31(int i) {
 /**
  * @brief Q31 multiply with one extra guard bit
  *
- * Uses >> 32 to give one extra bit of headroom, needed in the add/substract steps that
- * follow it. Its tracked later in the bfp, so the lost scale is accounted for.
+ * Uses >> 32 to give one extra bit of headroom, needed in the add/subtract steps that
+ * follow it. It's tracked later in the BFP exponent, so the lost scale is accounted for.
  */
 static inline int32_t mul_q31_guard(int32_t a, int32_t b) {
-  return (int32_t)((int64_t)a * b >> 32);
+  return fxp_mul_rshift_i32(a, b, 32);
 }
 
 /**
  * @brief Branchless mag for OR-based headroom measurement.
  *
- * This is not a saturating abs for full int32, but its good enough for the OR accumulator
+ * This is not a saturating abs for full int32, but it's good enough for the OR accumulator
  * to find highest occupied magnitude bit
  */
 static inline uint32_t mag_or_i32(int32_t v) {
   return (uint32_t)(v ^ (v >> 31));
-}
-
-/**
- * @brief Convert a Q31 PCM sample to clamped signed 16-bit PCM.
- */
-static inline int16_t pcm_q31_to_i16(int32_t sample_q31) {
-  int32_t pcm16 = (sample_q31 >> 16) + ((sample_q31 >> 15) & 1);
-  return pcm_clamp_i16(pcm16);
 }
 
 /**
@@ -247,15 +242,13 @@ hqlc_error mdct_forward(const uint8_t *prev_pcm,
                         hqlc_pcm_format fmt,
                         int stride,
                         int channel_idx,
-                        int32_t *spec_q31,
-                        size_t spec_q31_len,
+                        bfp_i32 *spectrum,
                         void *scratch,
-                        size_t scratch_len,
-                        int *loss_bits_out) {
-  if (!prev_pcm || !curr_pcm || !spec_q31 || !scratch || !loss_bits_out) {
+                        size_t scratch_len) {
+  if (!prev_pcm || !curr_pcm || !spectrum || !spectrum->data || !scratch) {
     return HQLC_ERR_INVALID_ARG;
   }
-  if (spec_q31_len < (size_t)MDCT_N) {
+  if (spectrum->length < (size_t)MDCT_N) {
     return HQLC_ERR_BUFFER_TOO_SMALL;
   }
   if (scratch_len < (size_t)MDCT_SCRATCH_BYTES) {
@@ -277,7 +270,7 @@ hqlc_error mdct_forward(const uint8_t *prev_pcm,
 
   const int N = MDCT_N;
   const int half_n = N / 2;
-  int32_t *folded = spec_q31;
+  int32_t *folded = spectrum->data;
 
   HQLC_BENCH_BEGIN(HQLC_BENCH_MDCT_FOLD);
   uint32_t fold_mag = 0;
@@ -348,30 +341,21 @@ hqlc_error mdct_forward(const uint8_t *prev_pcm,
     }
   }
 
-  int headroom = fxp_headroom_u32(fold_mag);
-  int fold_gain;
-  if (fold_mag == 0) {
-    fold_gain = 30;
-  } else {
-    if (headroom > 0) {
-      for (int i = 0; i < N; i++) {
-        folded[i] = (int32_t)((uint32_t)folded[i] << headroom);
-      }
-    }
-    fold_gain = headroom - 1;
-  }
+  // Guard-bit multiplication leaves the folded mantissas in Q30, represented
+  // as Q31 BFP with exp2 = 1. Reclaim the headroom measured during folding.
+  bfp_i32 folded_block = bfp_i32_view(folded, N, 1);
+  int fold_headroom = fxp_signed_headroom_u32(fold_mag);
+  bfp_i32_renormalize(&folded_block, (uint8_t)fold_headroom);
   HQLC_BENCH_END(HQLC_BENCH_MDCT_FOLD);
 
   int32_t *fft_work = (int32_t *)scratch;
   dct_iv(folded, fft_work);
 
-  *loss_bits_out = -fold_gain + MDCT_DCT_BITS;
+  spectrum->exp2 = folded_block.exp2 + MDCT_DCT_BITS;
   return HQLC_OK;
 }
 
-hqlc_error mdct_inverse_ola(const int32_t *spec_q31,
-                            size_t spec_q31_len,
-                            int loss_bits_in,
+hqlc_error mdct_inverse_ola(const bfp_i32 *spectrum,
                             mdct_ola_state *ola,
                             uint8_t *pcm_out,
                             hqlc_pcm_format fmt,
@@ -379,10 +363,10 @@ hqlc_error mdct_inverse_ola(const int32_t *spec_q31,
                             int channel_idx,
                             void *scratch,
                             size_t scratch_len) {
-  if (!spec_q31 || !ola || !pcm_out || !scratch) {
+  if (!spectrum || !spectrum->data || !ola || !pcm_out || !scratch) {
     return HQLC_ERR_INVALID_ARG;
   }
-  if (spec_q31_len < (size_t)MDCT_N) {
+  if (spectrum->length < (size_t)MDCT_N) {
     return HQLC_ERR_BUFFER_TOO_SMALL;
   }
   if (scratch_len < (size_t)MDCT_SCRATCH_BYTES) {
@@ -400,92 +384,53 @@ hqlc_error mdct_inverse_ola(const int32_t *spec_q31,
 
   int32_t *time = (int32_t *)scratch;
   int32_t *fft_work = &time[N];
-  memcpy(time, spec_q31, (size_t)N * sizeof(int32_t));
+  memcpy(time, spectrum->data, (size_t)N * sizeof(int32_t));
 
   dct_iv(time, fft_work);
 
-  int curr_exp = loss_bits_in + MDCT_DCT_BITS - MDCT_MATH_GAIN_BITS;
+  bfp_i32 current =
+      bfp_i32_view(time, N, spectrum->exp2 + MDCT_DCT_BITS - MDCT_MATH_GAIN_BITS);
   if (!ola->has_overlap) {
-    ola->loss_bits = curr_exp;
+    ola->exp2 = current.exp2;
     ola->has_overlap = true;
   }
 
-  int prev_exp = ola->loss_bits;
-  int common_exp = (prev_exp > curr_exp) ? prev_exp : curr_exp;
-  int prev_shift = (common_exp - prev_exp) + 1;
-  int curr_shift = (common_exp - curr_exp) + 1;
-  int pcm_exp = common_exp + 2;
+  bfp_i32 previous = bfp_i32_view(ola->overlap, half_n, ola->exp2);
+  bfp_alignment alignment = bfp_i32_alignment(&previous, &current, 1);
+  int pcm_exp = alignment.common_exp2 + 1;
 
   const int32_t *win = kbd_window_half_q31;
   const int32_t *prev_time = ola->overlap;
 
-  if (fmt == HQLC_PCM16) {
-    int16_t *out = (int16_t *)pcm_out;
-    for (int n = 0; n < half_n; n++) {
-      int32_t first_pcm = ola_mix_q31(prev_time[half_n - 1 - n],
-                                      win[N - 1 - n],
-                                      -1,
-                                      prev_shift,
-                                      time[half_n + n],
-                                      win[n],
-                                      1,
-                                      curr_shift,
-                                      pcm_exp);
-      out[n * stride + channel_idx] = pcm_q31_to_i16(first_pcm);
+  for (int n = 0; n < half_n; n++) {
+    int32_t first_pcm = ola_mix_q31(prev_time[half_n - 1 - n],
+                                    win[N - 1 - n],
+                                    -1,
+                                    (int)alignment.a_rshift,
+                                    time[half_n + n],
+                                    win[n],
+                                    1,
+                                    (int)alignment.b_rshift,
+                                    pcm_exp);
+    pcm_store_q31(pcm_out, fmt, n * stride + channel_idx, first_pcm);
 
-      int32_t second_pcm = ola_mix_q31(prev_time[n],
-                                       win[half_n - 1 - n],
-                                       -1,
-                                       prev_shift,
-                                       time[N - 1 - n],
-                                       win[half_n + n],
-                                       -1,
-                                       curr_shift,
-                                       pcm_exp);
-      out[(half_n + n) * stride + channel_idx] = pcm_q31_to_i16(second_pcm);
-    }
-  } else {
-    for (int n = 0; n < half_n; n++) {
-      int32_t first_pcm = ola_mix_q31(prev_time[half_n - 1 - n],
-                                      win[N - 1 - n],
-                                      -1,
-                                      prev_shift,
-                                      time[half_n + n],
-                                      win[n],
-                                      1,
-                                      curr_shift,
-                                      pcm_exp);
-      pcm_store_q31(pcm_out, fmt, n * stride + channel_idx, first_pcm);
-
-      int32_t second_pcm = ola_mix_q31(prev_time[n],
-                                       win[half_n - 1 - n],
-                                       -1,
-                                       prev_shift,
-                                       time[N - 1 - n],
-                                       win[half_n + n],
-                                       -1,
-                                       curr_shift,
-                                       pcm_exp);
-      pcm_store_q31(pcm_out, fmt, (half_n + n) * stride + channel_idx, second_pcm);
-    }
+    int32_t second_pcm = ola_mix_q31(prev_time[n],
+                                     win[half_n - 1 - n],
+                                     -1,
+                                     (int)alignment.a_rshift,
+                                     time[N - 1 - n],
+                                     win[half_n + n],
+                                     -1,
+                                     (int)alignment.b_rshift,
+                                     pcm_exp);
+    pcm_store_q31(pcm_out, fmt, (half_n + n) * stride + channel_idx, second_pcm);
   }
 
-  uint32_t overlap_mag = 0;
-  for (int i = 0; i < half_n; i++) {
-    overlap_mag |= mag_or_i32(time[i]);
-  }
-
-  int overlap_headroom = fxp_headroom_u32(overlap_mag);
-  if (overlap_headroom > 0) {
-    for (int i = 0; i < half_n; i++) {
-      ola->overlap[i] = (int32_t)((uint32_t)time[i] << overlap_headroom);
-    }
-  } else {
-    for (int i = 0; i < half_n; i++) {
-      ola->overlap[i] = time[i];
-    }
-  }
-  ola->loss_bits = curr_exp - overlap_headroom;
+  bfp_i32 next_overlap = bfp_i32_view(time, half_n, current.exp2);
+  int overlap_headroom = bfp_i32_headroom(&next_overlap);
+  bfp_i32_renormalize(&next_overlap, (uint8_t)overlap_headroom);
+  memcpy(ola->overlap, next_overlap.data, (size_t)half_n * sizeof(*ola->overlap));
+  ola->exp2 = next_overlap.exp2;
 
   return HQLC_OK;
 }

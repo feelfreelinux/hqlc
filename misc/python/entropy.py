@@ -12,14 +12,16 @@ Table selection is alpha x activity, in order to capture per-band and per-gain v
   - Activity: quantized non-zero fraction of the previous band (0-3)
   - Both are available to the decoder for free, no cross-frame state
 
-Side information (exponents, TNS, noise factor) uses Rice or fixed-width fields
+The exponent envelope shares the same rANS stream, with its own models (see below).
+
+Side information (TNS, gain, M/S flags) uses fixed-width or RLE fields
 """
 
 import math
 
 import numpy as np
 
-from .constants import BAND_EDGES
+from .constants import BAND_EDGES, N_BANDS
 
 # rANS constants
 RANS_M = 1024
@@ -287,7 +289,12 @@ _RANS_FREQ = [
     [25, 38, 38, 37, 36, 35, 34, 33, 32, 31, 30, 29, 29, 27, 26, 544],  # a=11 act=3
 ]
 _RANS_CF = [None] * _RANS_NTABLES
-_RANS_COST_Q8 = [None] * _RANS_NTABLES
+_RANS_COST_BITS = [None] * _RANS_NTABLES
+
+
+def eg0_nbits(overflow):
+    """Body bit count of an EG(0) escape, matching C rans_eg0_nbits."""
+    return (overflow + 1).bit_length() - 1
 
 
 def _cumfreq(freq):
@@ -301,9 +308,7 @@ def _cumfreq(freq):
 # Pre-build CFs and cost tables
 for _bk in range(_RANS_NTABLES):
     _RANS_CF[_bk] = _cumfreq(_RANS_FREQ[_bk])
-    _RANS_COST_Q8[_bk] = [
-        int(round(-math.log2(max(f, 1) / RANS_M) * 256.0)) for f in _RANS_FREQ[_bk]
-    ]
+    _RANS_COST_BITS[_bk] = [-math.log2(max(f, 1) / RANS_M) for f in _RANS_FREQ[_bk]]
 
 
 def _alpha_bin(band, gain):
@@ -353,27 +358,118 @@ def rans_table_idx(band, gain, activity, alpha_shift=0):
 
 
 def get_rans_tables(table_idx):
-    """Return (freq, cf, cost_q8) for a rANS probability table index."""
+    """Return (freq, cf, cost_bits) for a rANS probability table index."""
     return (
         _RANS_FREQ[table_idx],
         _RANS_CF[table_idx],
-        _RANS_COST_Q8[table_idx],
+        _RANS_COST_BITS[table_idx],
     )
 
 
-def coeff_cost_q8(cost_q8, value):
-    """Cost in Q8 bits for one signed quantized coefficient."""
+def coeff_cost(cost_bits, value):
+    """Cost in bits for one signed quantized coefficient."""
     mag = abs(value)
     if mag < RANS_MAX_SYM - 1:
-        c = int(cost_q8[mag])
+        c = cost_bits[mag]
     else:
-        c = int(cost_q8[RANS_MAX_SYM - 1])
-        overflow = mag - (RANS_MAX_SYM - 1)
-        nbits = (overflow + 1).bit_length() - 1
-        c += (2 * nbits + 1) * 256  # EG(0) prefix + suffix
+        c = cost_bits[RANS_MAX_SYM - 1]
+        c += 2 * eg0_nbits(mag - (RANS_MAX_SYM - 1)) + 1  # EG(0) prefix + suffix
     if value != 0:
-        c += 256  # sign bit
+        c += 1  # sign bit
     return c
+
+
+# Exponent envelope rANS tables
+RANS_EXP_NSLOTS = 13
+EXP_MODEL_DPCM = 0
+EXP_MODEL_CROSS_CH = 1
+EXP_MODEL_CROSS_CH_MS = 2
+
+# Trained together with the coefficient tables, mirrors src/entropy_tables.c
+_RANS_EXP_NGROUPS = 4
+_RANS_EXP_GROUP = [0, 1, 1, 1, 1, 1, 2, 2, 2, 2, 2, 2, 2, 3, 3, 3, 3, 3, 3, 3]
+_RANS_EXP_CENTER = [59, 0, -1, -1, 0, 0, -1, 0, -2, -2, -2, -2]
+_RANS_EXP_FREQ = [
+    [67, 121, 104, 87, 85, 55, 54, 51, 49, 43, 42, 36, 230],  # DPCM g=0
+    [129, 243, 204, 153, 103, 67, 44, 26, 18, 12, 7, 4, 14],  # DPCM g=1
+    [198, 339, 226, 123, 66, 34, 18, 10, 5, 2, 1, 1, 1],  # DPCM g=2
+    [179, 306, 194, 108, 57, 33, 25, 24, 23, 22, 18, 13, 22],  # DPCM g=3
+    [135, 237, 202, 147, 109, 74, 53, 27, 20, 10, 4, 3, 3],  # cross-ch g=0
+    [162, 275, 217, 152, 94, 57, 34, 16, 8, 5, 2, 1, 1],  # cross-ch g=1
+    [210, 352, 237, 123, 58, 24, 10, 4, 2, 1, 1, 1, 1],  # cross-ch g=2
+    [247, 365, 203, 101, 50, 26, 13, 7, 4, 3, 2, 1, 2],  # cross-ch g=3
+    [382, 106, 98, 87, 71, 65, 56, 42, 30, 24, 16, 12, 35],  # cross-ch M/S g=0
+    [662, 90, 61, 42, 33, 26, 23, 18, 16, 13, 10, 7, 23],  # cross-ch M/S g=1
+    [594, 107, 69, 47, 34, 28, 22, 19, 17, 13, 11, 9, 54],  # cross-ch M/S g=2
+    [453, 87, 74, 63, 55, 51, 46, 35, 26, 20, 15, 13, 86],  # cross-ch M/S g=3
+]
+_RANS_EXP_CF = [_cumfreq(f) for f in _RANS_EXP_FREQ]
+
+# Q8 costs, rounded exactly like the C table
+_RANS_EXP_COST_Q8 = [
+    [int(round(-math.log2(f / RANS_M) * 256)) for f in row] for row in _RANS_EXP_FREQ
+]
+
+
+def rans_exp_table_idx(model, band):
+    """Exponent table index: one model per band position group."""
+    return model * _RANS_EXP_NGROUPS + _RANS_EXP_GROUP[band]
+
+
+def get_rans_exp_tables(table_idx):
+    """Return (freq, cf, center) for an exponent table index."""
+    return (
+        _RANS_EXP_FREQ[table_idx],
+        _RANS_EXP_CF[table_idx],
+        _RANS_EXP_CENTER[table_idx],
+    )
+
+
+def exp_cost_q8(table_idx, value):
+    """Cost in Q8 bits of one centered exponent value."""
+    mag = abs(value - _RANS_EXP_CENTER[table_idx])
+    cost_q8 = 256 if mag != 0 else 0  # sign
+    if mag < RANS_EXP_NSLOTS - 1:
+        return cost_q8 + _RANS_EXP_COST_Q8[table_idx][mag]
+    nbits = eg0_nbits(mag - (RANS_EXP_NSLOTS - 1))
+    escape_q8 = (2 * nbits + 1) * 256
+    return cost_q8 + _RANS_EXP_COST_Q8[table_idx][RANS_EXP_NSLOTS - 1] + escape_q8
+
+
+def exp_channel_cost_q8(exp_indices, ch, ms_flags=None):
+    """Cost (Q8 bits) of a ch1+ envelope, and whether DPCM beat cross-channel.
+
+    Includes the 1-bit model flag. Returns (cost_q8, use_dpcm).
+    """
+    e0, e1 = exp_indices[0], exp_indices[ch]
+    delta_q8, dpcm_q8, prev = 0, 0, 0
+    for b in range(N_BANDS):
+        model = (
+            EXP_MODEL_CROSS_CH_MS
+            if (ms_flags is not None and ms_flags[b])
+            else EXP_MODEL_CROSS_CH
+        )
+        delta_q8 += exp_cost_q8(rans_exp_table_idx(model, b), int(e1[b]) - int(e0[b]))
+        # The DPCM model is the same regardless of M/S
+        dpcm_q8 += exp_cost_q8(rans_exp_table_idx(EXP_MODEL_DPCM, b), int(e1[b]) - prev)
+        prev = int(e1[b])
+
+    use_dpcm = dpcm_q8 < delta_q8
+    return 256 + (dpcm_q8 if use_dpcm else delta_q8), use_dpcm
+
+
+def exp_payload_bits(exp_indices, n_ch, ms_flags=None):
+    """Envelope cost in bits, shared by the rate control probe and the encoder."""
+    total_q8 = 0
+    for ch in range(1, n_ch):
+        total_q8 += exp_channel_cost_q8(exp_indices, ch, ms_flags)[0]
+
+    prev = 0
+    for b in range(N_BANDS):
+        v = int(exp_indices[0][b])
+        total_q8 += exp_cost_q8(rans_exp_table_idx(EXP_MODEL_DPCM, b), v - prev)
+        prev = v
+    return total_q8 / 256.0
 
 
 # Rice helpers

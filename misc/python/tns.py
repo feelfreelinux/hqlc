@@ -12,14 +12,20 @@ from .constants import FRAME_LEN
 
 TNS_MAX_ORDER = 4
 TNS_MAX_K = 0.92
-TNS_PRED_GAIN_THR = 1.5
 TNS_K_BITS = 4
 TNS_LAR_MAX = 3.5
 TNS_START_BIN = 20  # ~940 Hz
 
+# Hangover frames use a softer window, and a stricter gate
+TNS_LAG_WIN_B = 0.03
+TNS_LAG_WIN_B_HANGOVER = 0.05
 
-# Adapted from the C impl, hence the shifts
-TNS_DETECT_FLOOR = (1 << 20) / float(1 << 30)
+TNS_PRED_GAIN_THR = 1.2
+TNS_PRED_GAIN_THR_HANGOVER = 1.5
+
+
+# Sub-block energy below this is treated as silence (the C impl carries it in Q30)
+TNS_DETECT_FLOOR = 2.0**-10
 
 TNS_DETECT_SUBBLOCKS = 8
 TNS_DETECT_RATIO = 8
@@ -72,7 +78,7 @@ def _autocorrelation(x, max_order):
     return r
 
 
-def _levinson_durbin(r, max_order, k_threshold=0.1):
+def _levinson_durbin(r, max_order):
     """Does the levinson-durbin recursion to compute (reflection_coeffs, order, prediction_gain)"""
     if r[0] < 1e-30:
         return np.zeros(0, dtype=np.float64), 0, 1.0
@@ -84,15 +90,22 @@ def _levinson_durbin(r, max_order, k_threshold=0.1):
         for j in range(i):
             acc += a[j] * r[i - j]
         ki = np.clip(-acc / error, -0.999, 0.999)
-        if abs(ki) < k_threshold:
-            break
         error *= 1.0 - ki * ki
         if error < 1e-30:
             break
         k_out.append(ki)
         new_a = np.zeros(max_order, dtype=np.float64)
+        overflowed = False
         for j in range(i):
-            new_a[j] = a[j] + ki * a[i - 1 - j]
+            v = a[j] + ki * a[i - 1 - j]
+            # The C keeps a[] as int32 Q30, so |a| >= 2.0 overflows and it bails
+            # Matching logic here
+            if abs(v) >= 2.0:
+                overflowed = True
+                break
+            new_a[j] = v
+        if overflowed:
+            break
         new_a[i] = ki
         a = new_a
     order = len(k_out)
@@ -161,7 +174,7 @@ def lattice_iir(y, k):
     return x
 
 
-def analyze(X):
+def analyze(X, hangover=False):
     """TNS analysis on the HF spectrum (bins >= TNS_START_BIN).
 
     Needs to be transient-gated at the caller (detector + hangover)
@@ -169,12 +182,14 @@ def analyze(X):
     Returns (order, k_dequantized, q_indices, side_bits).
     """
     r = _autocorrelation(X[TNS_START_BIN:], TNS_MAX_ORDER)
-    # Gaussian lag window (b = 0.03), mirrors the c codec
+    # Gaussian lag window, mirrors the c codec
+    b = TNS_LAG_WIN_B_HANGOVER if hangover else TNS_LAG_WIN_B
     lag = np.arange(1, TNS_MAX_ORDER + 1)
-    r[1:] = r[1:] * np.exp(-0.5 * (2.0 * np.pi * 0.03 * lag) ** 2)
+    r[1:] = r[1:] * np.exp(-0.5 * (2.0 * np.pi * b * lag) ** 2)
     k_raw, order, pred_gain = _levinson_durbin(r, TNS_MAX_ORDER)
 
-    if order == 0 or pred_gain < TNS_PRED_GAIN_THR:
+    thr = TNS_PRED_GAIN_THR_HANGOVER if hangover else TNS_PRED_GAIN_THR
+    if order == 0 or pred_gain < thr:
         return 0, np.zeros(0), np.zeros(0, dtype=np.int32), 1
 
     k_raw = np.clip(k_raw, -TNS_MAX_K, TNS_MAX_K)

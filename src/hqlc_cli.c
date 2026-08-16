@@ -39,17 +39,17 @@ static const char *g_train_path = NULL;
 //
 // Header (16 bytes):
 //   [0..3]   magic "HQLC"
-//   [4]      version (1)
+//   [4]      version (5)
 //   [5]      channels (1 or 2)
-//   [6..7]   reserved
+//   [6..7]   zero padding in the last audio frame (LE16, 0..511)
 //   [8..11]  sample_rate (LE32)
-//   [12..15] n_frames (LE32)
+//   [12..15] (LE32), including the trailing flush frame
 //
 // Per frame:
 //   [0..1]   payload_len (LE16)
 //   [2..]    payload
 
-#define HQLC_FILE_VERSION 3
+#define HQLC_FILE_VERSION  5
 #define HQLC_FILE_HDR_SIZE 16
 
 /* Helpers */
@@ -177,7 +177,9 @@ read_wav(const char *path, int *out_ch, int32_t *out_n_frames, int16_t **out_dat
 
   *out_ch = (int)wav.channels;
   *out_n_frames = (int32_t)wav.totalPCMFrameCount;
-  *out_data = (int16_t *)malloc((size_t)*out_n_frames * *out_ch * sizeof(int16_t));
+  int n_alloc = *out_n_frames / HQLC_FRAME_SAMPLES + 2;
+  *out_data =
+      (int16_t *)calloc((size_t)n_alloc * HQLC_FRAME_SAMPLES * *out_ch, sizeof(int16_t));
   if (!*out_data) {
     drwav_uninit(&wav);
     free(mem);
@@ -236,12 +238,15 @@ do_encode(const char *in, const char *out, hqlc_mode mode, uint32_t bitrate, flo
     return 1;
   }
 
-  int n_frames = total_pcm / HQLC_FRAME_SAMPLES;
+  // Round up: a partial trailing frame is zero-padded rather than dropped
+  int n_frames = (total_pcm + HQLC_FRAME_SAMPLES - 1) / HQLC_FRAME_SAMPLES;
   if (n_frames < 1) {
-    fprintf(stderr, "error: file too short (need >= %d samples)\n", HQLC_FRAME_SAMPLES);
+    fprintf(stderr, "error: empty input\n");
     free(pcm);
     return 1;
   }
+  int pad = n_frames * HQLC_FRAME_SAMPLES - total_pcm;
+  int n_enc = n_frames + 1;
 
   hqlc_encoder *enc = (hqlc_encoder *)calloc(1, hqlc_encoder_size());
   hqlc_encoder_config cfg = {
@@ -289,14 +294,15 @@ do_encode(const char *in, const char *out, hqlc_mode mode, uint32_t bitrate, flo
   memcpy(hdr, "HQLC", 4);
   hdr[4] = HQLC_FILE_VERSION;
   hdr[5] = (uint8_t)ch;
+  put_le16(hdr + 6, (uint16_t)pad);
   put_le32(hdr + 8, HQLC_SAMPLE_RATE);
-  put_le32(hdr + 12, (uint32_t)n_frames);
+  put_le32(hdr + 12, (uint32_t)n_enc);
   fwrite(hdr, 1, HQLC_FILE_HDR_SIZE, fout);
 
   // Encode frame by frame, streaming to output
   uint8_t compressed[HQLC_MAX_FRAME_BYTES];
   size_t total_bytes = 0;
-  for (int f = 0; f < n_frames; f++) {
+  for (int f = 0; f < n_enc; f++) {
     const uint8_t *fp = (const uint8_t *)&pcm[f * HQLC_FRAME_SAMPLES * ch];
     size_t comp_len = 0;
     hqlc_error err = hqlc_encode_frame(
@@ -326,9 +332,11 @@ do_encode(const char *in, const char *out, hqlc_mode mode, uint32_t bitrate, flo
   if (g_train_path) {
     FILE *th = fopen(g_train_path, "w");
     if (th) {
-      for (int t = 0; t < RANS_NTABLES; t++) {
+      for (int t = 0; t < RANS_COEF_NTABLES; t++) {
         for (int sym = 0; sym < RANS_MAX_SYM; sym++) {
-          fprintf(th, "%llu%c", (unsigned long long)rans_train_hist[t][sym],
+          fprintf(th,
+                  "%llu%c",
+                  (unsigned long long)rans_train_hist[t][sym],
                   sym == RANS_MAX_SYM - 1 ? '\n' : ' ');
         }
       }
@@ -339,11 +347,11 @@ do_encode(const char *in, const char *out, hqlc_mode mode, uint32_t bitrate, flo
   }
 #endif
 
-  float duration = (float)(n_frames * HQLC_FRAME_SAMPLES) / HQLC_SAMPLE_RATE;
+  float duration = (float)total_pcm / HQLC_SAMPLE_RATE;
   float avg_bps = (float)(total_bytes * 8) / duration;
   float raw_bps = (float)(HQLC_SAMPLE_RATE * ch * 16);
   fprintf(stderr, "%s -> %s\n", in, out);
-  fprintf(stderr, "  %d frames, %.2fs, %dch\n", n_frames, duration, ch);
+  fprintf(stderr, "  %d frames, %.2fs, %dch\n", n_enc, duration, ch);
   fprintf(stderr, "  avg bitrate: %.0f bps (%.1f:1)\n", avg_bps, raw_bps / avg_bps);
 
   free(pcm);
@@ -374,6 +382,7 @@ static int do_decode(const char *in, const char *out) {
   }
 
   int ch = file_data[5];
+  uint32_t pad = get_le16(file_data + 6);
   uint32_t sample_rate = get_le32(file_data + 8);
   uint32_t n_frames = get_le32(file_data + 12);
 
@@ -387,8 +396,9 @@ static int do_decode(const char *in, const char *out) {
     free(file_data);
     return 1;
   }
-  if (n_frames < 1) {
-    fprintf(stderr, "error: empty .hqlc file\n");
+  // n_frames counts the trailing flush frame, so audio needs at least two
+  if (n_frames < 2 || pad >= HQLC_FRAME_SAMPLES) {
+    fprintf(stderr, "error: empty or malformed .hqlc file\n");
     free(file_data);
     return 1;
   }
@@ -441,11 +451,13 @@ static int do_decode(const char *in, const char *out) {
     pos += frame_len;
   }
 
-  // Trim 1-frame decoder latency
+  // Trim the 1-frame decoder latency at the head and the encoder's zero
+  // padding at the tail; the flush frame carries the last real audio frame
   uint32_t out_frames = n_frames - 1;
+  int32_t out_pcm = (int32_t)(out_frames * HQLC_FRAME_SAMPLES - pad);
   int16_t *trimmed = &pcm_out[HQLC_FRAME_SAMPLES * ch];
 
-  if (write_wav(out, trimmed, (int32_t)(out_frames * HQLC_FRAME_SAMPLES), ch) != 0) {
+  if (write_wav(out, trimmed, out_pcm, ch) != 0) {
     fprintf(stderr, "error: cannot write '%s'\n", out);
     free(file_data);
     free(dec);
@@ -454,7 +466,7 @@ static int do_decode(const char *in, const char *out) {
     return 1;
   }
 
-  float duration = (float)(out_frames * HQLC_FRAME_SAMPLES) / HQLC_SAMPLE_RATE;
+  float duration = (float)out_pcm / HQLC_SAMPLE_RATE;
   float avg_bps = duration > 0 ? (float)(total_bytes * 8) / duration : 0;
   fprintf(stderr, "%s -> %s\n", in, out);
   fprintf(stderr, "  %u frames, %.2fs, %dch\n", n_frames, duration, ch);
@@ -485,19 +497,19 @@ static int do_roundtrip(
     return 1;
   }
 
-  int n_frames = total_pcm / HQLC_FRAME_SAMPLES;
-  if (n_frames < 2) {
-    fprintf(
-        stderr, "error: file too short (need >= %d samples)\n", HQLC_FRAME_SAMPLES * 2);
+  // Round up: a partial trailing frame is zero-padded rather than dropped
+  int n_frames = (total_pcm + HQLC_FRAME_SAMPLES - 1) / HQLC_FRAME_SAMPLES;
+  if (n_frames < 1) {
+    fprintf(stderr, "error: empty input\n");
     goto cleanup;
   }
+  int n_enc = n_frames + 1;
 
   enc = (hqlc_encoder *)calloc(1, hqlc_encoder_size());
   dec = (hqlc_decoder *)calloc(1, hqlc_decoder_size());
   enc_scratch = calloc(1, hqlc_encoder_scratch_size());
   dec_scratch = calloc(1, hqlc_decoder_scratch_size());
-  pcm_out =
-      (int16_t *)calloc((size_t)n_frames * HQLC_FRAME_SAMPLES * ch, sizeof(int16_t));
+  pcm_out = (int16_t *)calloc((size_t)n_enc * HQLC_FRAME_SAMPLES * ch, sizeof(int16_t));
 
   hqlc_encoder_config cfg = {
       .channels = (uint8_t)ch,
@@ -521,7 +533,7 @@ static int do_roundtrip(
 
   uint8_t compressed[HQLC_MAX_FRAME_BYTES];
   size_t total_bytes = 0;
-  for (int f = 0; f < n_frames; f++) {
+  for (int f = 0; f < n_enc; f++) {
     const uint8_t *fp = (const uint8_t *)&pcm[f * HQLC_FRAME_SAMPLES * ch];
     size_t comp_len = 0;
 
@@ -541,20 +553,20 @@ static int do_roundtrip(
     }
   }
 
-  // Trim 1-frame latency: decoded[1..n_frames) ~= orig[0..n_frames-1)
-  int out_frames = n_frames - 1;
+  // Trim 1-frame latency: decoded[1..n_enc) ~= orig[0..n_frames), and the
+  // flush frame brings the last real frame out, so this is the whole input
   int16_t *trimmed = &pcm_out[HQLC_FRAME_SAMPLES * ch];
 
-  if (write_wav(out, trimmed, out_frames * HQLC_FRAME_SAMPLES, ch) != 0) {
+  if (write_wav(out, trimmed, total_pcm, ch) != 0) {
     fprintf(stderr, "error: cannot write '%s'\n", out);
     goto cleanup;
   }
 
-  float duration = (float)(out_frames * HQLC_FRAME_SAMPLES) / HQLC_SAMPLE_RATE;
+  float duration = (float)total_pcm / HQLC_SAMPLE_RATE;
   float avg_bps = (float)(total_bytes * 8) / duration;
   float raw_bps = (float)(HQLC_SAMPLE_RATE * ch * 16);
   fprintf(stderr, "%s -> %s\n", in, out);
-  fprintf(stderr, "  %d frames, %.2fs, %dch\n", n_frames, duration, ch);
+  fprintf(stderr, "  %d frames, %.2fs, %dch\n", n_enc, duration, ch);
   fprintf(stderr, "  mode: %s", mode == HQLC_MODE_RC ? "RC" : "fixed");
   if (mode == HQLC_MODE_RC) {
     fprintf(stderr, " (target %u bps)", bitrate);
