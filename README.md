@@ -71,7 +71,7 @@ All codecs at 96 kbps stereo 48 kHz, scored with ViSQOL and Zimtohrli. Both are 
 
 | Codec | ViSQOL | (min–max) | Zim | (min–max) |
 |-------|--------|-----------|-----|-----------|
-| HQLC | 4.613 | 4.367–4.725 | 4.732 | 4.578–4.881 |
+| HQLC | 4.649 | 4.533–4.725 | 4.807 | 4.739–4.893 |
 | LC3 | 4.522 | 4.051–4.705 | 4.751 | 4.638–4.867 |
 | Opus | 4.506 | 4.111–4.711 | 4.850 | 4.755–4.930 |
 | AAC | 4.439 | 4.082–4.726 | 4.804 | 4.612–4.946 |
@@ -81,13 +81,13 @@ All codecs at 96 kbps stereo 48 kHz, scored with ViSQOL and Zimtohrli. Both are 
 
 | Codec | ViSQOL | (min–max) | Zim | (min–max) |
 |-------|--------|-----------|-----|-----------|
-| HQLC | 4.650 | 4.221–4.732 | 4.847 | 4.379–4.999 |
+| HQLC | 4.658 | 4.207–4.732 | 4.882 | 4.751–4.999 |
 | Opus | 4.570 | 4.061–4.732 | 4.895 | 4.642–5.000 |
 | LC3 | 4.516 | 3.972–4.732 | 4.778 | 2.893–4.995 |
 | AAC | 4.410 | 3.637–4.732 | 4.882 | 4.688–5.000 |
 | MP3 | 4.210 | 3.082–4.732 | 4.690 | 4.032–5.000 |
 
-Both ViSQOL and Zim are just rough proxies for audio quality, and shouldn't be interpreted as HQLC being better than those codecs.
+Both ViSQOL and Zim are just rough proxies for audio quality, and shouldn't be interpreted as HQLC being better than those codecs. All scored on v0.1.1 release.
 
 ## Test clips
 
