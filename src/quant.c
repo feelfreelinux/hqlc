@@ -316,10 +316,14 @@ void noise_fill_refinement_mask(const bfp_i32 *spectrum,
     }
     int s = psy_band_edges[b];
     int e = psy_band_edges[b + 1];
+    if (e - s > PSY_MAX_BAND_BINS) {
+      // should not happen
+      continue;
+    }
 
     int nz = 0;
     // True NF fill leven per-bin
-    int32_t true_nf_factor_q8[64];
+    int32_t true_nf_factor_q8[PSY_MAX_BAND_BINS];
     for (int i = s; i < e; i++) {
       if (quant[i] != 0) {
         continue;

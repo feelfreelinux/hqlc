@@ -19,6 +19,9 @@ extern "C" {
 // Only bins up to 427 are active (cutoff ~20 kHz at 48 kHz sample rate)
 #define PSY_ACTIVE_BINS 427
 
+// Bins in the widest coarse band (the top one, 360..427)
+#define PSY_MAX_BAND_BINS 67
+
 // exp index is a 6-bit log-scale energy descriptor per band, ~1.5 dB/step
 #define PSY_EXP_INDEX_MIN 0
 #define PSY_EXP_INDEX_MAX 63

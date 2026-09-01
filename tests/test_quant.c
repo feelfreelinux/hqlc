@@ -37,10 +37,18 @@ void test_inverse_quantizer_canonicalizes_an_empty_bfp_spectrum(void) {
   TEST_ASSERT_EQUAL_INT(0, spectrum.exp2);
 }
 
+void test_no_band_is_wider_than_the_declared_maximum(void) {
+  for (int b = 0; b < PSY_N_BANDS; b++) {
+    int width = psy_band_edges[b + 1] - psy_band_edges[b];
+    TEST_ASSERT_LESS_OR_EQUAL_INT(PSY_MAX_BAND_BINS, width);
+  }
+}
+
 int main(void) {
   UNITY_BEGIN();
   RUN_TEST(test_forward_scale_decomposes_positive_inverse_step);
   RUN_TEST(test_forward_scale_decomposes_negative_inverse_step);
   RUN_TEST(test_inverse_quantizer_canonicalizes_an_empty_bfp_spectrum);
+  RUN_TEST(test_no_band_is_wider_than_the_declared_maximum);
   return UNITY_END();
 }
