@@ -12,7 +12,7 @@ See [HQLC_DESIGN.md](HQLC_DESIGN.md) for a detailed write-up of the codec intern
 
 ## Building
 
-The repository contains a fixed-point C implementation, unit tests, and a Python reference.
+You can build the C encoder / decoder CLI via CMake:
 
 ```
 mkdir build && cd build
@@ -32,11 +32,13 @@ The public API is in [`include/hqlc.h`](include/hqlc.h) and should be self-expla
 
 ## Python reference
 
-A pure Python/NumPy reference implementation lives in `misc/python/`. It can be run directly from the repo root:
+There’s a Python/NumPy implementation in `misc/python`. It can be run directly from the repo root:
 
 ```
 python -m misc.python input.wav output.wav -b 96000
 ```
+
+Take care that it might be out of sync with the C version, and is not optimized.
 
 ## Benchmarks
 

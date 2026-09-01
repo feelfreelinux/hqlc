@@ -30,7 +30,7 @@ void test_inverse_quantizer_canonicalizes_an_empty_bfp_spectrum(void) {
   memset(spectrum_data, 0x55, sizeof(spectrum_data));
   bfp_i32 spectrum = bfp_i32_view(spectrum_data, HQLC_FRAME_SAMPLES, 99);
 
-  quant_inverse(quant, exp_indices, 27, false, &spectrum);
+  quant_inverse(quant, exp_indices, 27, &spectrum);
 
   int32_t zero[HQLC_FRAME_SAMPLES] = {0};
   TEST_ASSERT_EQUAL_MEMORY(zero, spectrum_data, sizeof(zero));

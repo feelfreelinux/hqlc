@@ -32,12 +32,6 @@ static int gain_code_from_float(float gain) {
   return fxp_clamp_i32(rounded + QUANT_GAIN_BIAS, 0, GAIN_CODE_MAX);
 }
 
-// Interpolated quantizer steps on tonal frames, flat on TNS (transient)
-// frames. The TNS flag is transmitted, so both sides gate identically.
-static inline bool env_interp_active(int tns_order) {
-  return tns_order == 0;
-}
-
 // Encoder scratch, allocated by the caller
 typedef struct {
   // Spectral coefficients (Q31)
@@ -466,8 +460,7 @@ hqlc_error hqlc_encode_frame(hqlc_encoder *enc,
     HQLC_BENCH_END(HQLC_BENCH_ENC_TNS);
 
     HQLC_BENCH_BEGIN(HQLC_BENCH_ENC_PSY);
-    psy_fine_band_exponents(
-        &spectra[ch], enc->tilt_step_q7, tns_eligible[ch], ch_exp);
+    psy_fine_band_exponents(&spectra[ch], enc->tilt_step_q7, ch_exp);
     HQLC_BENCH_END(HQLC_BENCH_ENC_PSY);
   }
 
@@ -500,10 +493,19 @@ hqlc_error hqlc_encode_frame(hqlc_encoder *enc,
     quant_forward(&spectra[ch],
                   &exp_indices[ch * PSY_N_BANDS],
                   gain_code,
-                  env_interp_active(tns[ch].order),
                   &quant[ch * HQLC_FRAME_SAMPLES]);
   }
   HQLC_BENCH_END(HQLC_BENCH_ENC_QUANT_FWD);
+
+  // NF refinement mask: tonal gaps the decoder must not noise fill
+  bool nf_mask[HQLC_MAX_CHANNELS][PSY_N_BANDS];
+  for (int ch = 0; ch < n_ch; ch++) {
+    noise_fill_refinement_mask(&spectra[ch],
+                               &quant[ch * HQLC_FRAME_SAMPLES],
+                               &exp_indices[ch * PSY_N_BANDS],
+                               gain_code,
+                               nf_mask[ch]);
+  }
 
   // Write side information bitstream
   HQLC_BENCH_BEGIN(HQLC_BENCH_ENC_SIDE_INFO);
@@ -530,6 +532,12 @@ hqlc_error hqlc_encode_frame(hqlc_encoder *enc,
         bw_write(&bw, (uint32_t)(tns[ch].q_lar[i] + TNS_LAR_HALF), TNS_K_BITS);
       }
     }
+  }
+
+  // NF refinement mask, RLE coded per channel over the NF bands
+  for (int ch = 0; ch < n_ch; ch++) {
+    bw_write_binary_rle(
+        &bw, &nf_mask[ch][NF_FIRST_BAND], PSY_N_BANDS - NF_FIRST_BAND, 0);
   }
 
   // Exponents are rANS-coded inside the coefficient stream
@@ -663,6 +671,14 @@ hqlc_error hqlc_decode_frame(hqlc_decoder *dec,
     }
   }
 
+  // NF refinement mask
+  bool nf_mask[HQLC_MAX_CHANNELS][PSY_N_BANDS];
+  memset(nf_mask, 0, sizeof(nf_mask));
+  for (int ch = 0; ch < n_ch; ch++) {
+    br_read_binary_rle(
+        &br, &nf_mask[ch][NF_FIRST_BAND], PSY_N_BANDS - NF_FIRST_BAND, 0);
+  }
+
   // Exponents are decoded from the rANS stream
 
   // Byte-align to find rANS stream start
@@ -703,13 +719,8 @@ hqlc_error hqlc_decode_frame(hqlc_decoder *dec,
     int16_t *ch_quant = &quant_buf[ch * HQLC_FRAME_SAMPLES];
     bfp_i32 *spectrum = &spectra[ch];
 
-    // Inverse quantize, interpolate mode on non TNS frames
     HQLC_BENCH_BEGIN(HQLC_BENCH_DEC_DEQUANT);
-    quant_inverse(ch_quant,
-                  ch_exp,
-                  gain_code,
-                  env_interp_active(tns[ch].order),
-                  spectrum);
+    quant_inverse(ch_quant, ch_exp, gain_code, spectrum);
     HQLC_BENCH_END(HQLC_BENCH_DEC_DEQUANT);
 
     // Noise fill, seeded per frame and channel so the texture differs across frames.
@@ -717,15 +728,12 @@ hqlc_error hqlc_decode_frame(hqlc_decoder *dec,
     uint32_t nf_seed =
         NF_SEED_BIAS ^ (dec->frame_count * 0x9E37u) ^ ((uint32_t)ch * 0x51EDu);
 
-    // skip S bands (only ch 1 of M/S)
-    const bool *skip = ch == 1 ? ms_flags : NULL;
-    noise_fill(ch_quant,
-               ch_exp,
-               gain_code,
-               env_interp_active(tns[ch].order),
-               nf_seed,
-               skip,
-               spectrum);
+    // Skip flagged S bands (ch 1 of M/S) and refinement-masked bands
+    bool skip[PSY_N_BANDS];
+    for (int b = 0; b < PSY_N_BANDS; b++) {
+      skip[b] = nf_mask[ch][b] || (ch == 1 && ms_flags[b]);
+    }
+    noise_fill(ch_quant, ch_exp, gain_code, nf_seed, skip, spectrum);
     HQLC_BENCH_END(HQLC_BENCH_DEC_NF);
 
     // TNS synthesis / inverse filter
