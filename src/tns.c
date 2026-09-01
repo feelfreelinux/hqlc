@@ -4,6 +4,7 @@
 
 #include "fxp.h"
 #include "pcm.h"
+#include "psy.h"
 
 // TNS parameters
 #define TNS_START_BIN   20 // ~940 Hz
@@ -15,11 +16,20 @@
 #define TNS_DETECT_RATIO 8
 #define TNS_DETECT_FLOOR (1u << 20)
 
+// Normalised bins are scaled to roughly 2^14
+#define TNS_NORM_Q 14
+
+// First fine band index above the TNS_START_BIN
+#define TNS_ENV_FIRST_FB 19
+
+// Span of bands where the TNS works on
+#define TNS_ENV_BANDS (PSY_N_ACTIVE_FINE - TNS_ENV_FIRST_FB)
+
 // Gaussian lag window w[k] = exp(-0.5 * (2*pi*f0*k)^2), Q30
 // Smooths the envelope shape a bit, fitting more attack shape
 //
-// Hangover frames use a softer window, so post-attack frames don't smear quantization noise
-// all over the spectrum
+// Hangover frames use a softer window, so post-attack frames don't smear quantization
+// noise all over the spectrum
 static const int32_t tns_lag_win_q30[TNS_MAX_ORDER] = {
     1054834932,
     1000088432,
@@ -142,23 +152,78 @@ bool tns_detect_transient(tns_detect_state *st,
   return fire;
 }
 
-// Autocorrelation of MDCT spectrum, pre-shifted to prevent overflow
-static void tns_autocorrelation(const int32_t *spec, int n, int64_t *r) {
+// Fast square root helper
+static uint32_t tns_isqrt(uint64_t v) {
+  if (v == 0) {
+    return 0;
+  }
+  // Power-of-two seed just above sqrt(v), newton then needs at most 5 passes
+  uint64_t x = 1ull << ((64 - __builtin_clzll(v) + 1) >> 1);
+  uint64_t y = (x + v / x) >> 1;
+  while (y < x) {
+    x = y;
+    y = (x + v / x) >> 1;
+  }
+  return (uint32_t)x;
+}
+
+/**
+ * @brief Autocorrelation of the spectrum flattened by its fine-band envelope.
+ *
+ * Only the coefficient derivation works on this flattened spectrum
+ */
+static void tns_autocorrelation(const int32_t *spec_q31, int64_t *r) {
   for (int k = 0; k <= TNS_MAX_ORDER; k++) {
     r[k] = 0;
   }
 
-  int main_end = n - TNS_MAX_ORDER;
-  for (int i = 0; i < main_end; i++) {
-    int32_t si = spec[i] >> 9;
-    for (int k = 0; k <= TNS_MAX_ORDER; k++) {
-      r[k] += (int64_t)si * spec[i + k];
-    }
+  uint64_t psd_q46[PSY_N_ACTIVE_FINE];
+  psy_fine_band_psd(spec_q31, psd_q46);
+  psy_fine_band_psd_smooth(psd_q46);
+
+  // Per-band envelope amplitude (Q23, the mantissa >>8 domain)
+  // Only calculated for 28 values, hence it should be cheap enough
+  int32_t rms_q23[TNS_ENV_BANDS];
+
+  // band center for interpolation
+  int16_t band_center[TNS_ENV_BANDS];
+  for (int b = 0; b < TNS_ENV_BANDS; b++) {
+    rms_q23[b] = (int32_t)tns_isqrt(psd_q46[TNS_ENV_FIRST_FB + b]);
+    band_center[b] = (int16_t)((psy_fine_band_edges[TNS_ENV_FIRST_FB + b] +
+                                psy_fine_band_edges[TNS_ENV_FIRST_FB + b + 1]) /
+                               2);
   }
-  for (int i = main_end; i < n; i++) {
-    int32_t si = spec[i] >> 9;
-    for (int k = 0; k <= TNS_MAX_ORDER && i + k < n; k++) {
-      r[k] += (int64_t)si * spec[i + k];
+
+  // Normalised history, newest last
+  int32_t hist[TNS_MAX_ORDER + 1] = {0};
+  int b = 0;
+
+  for (int i = TNS_START_BIN; i < PSY_ACTIVE_BINS; i++) {
+    while (b + 1 < TNS_ENV_BANDS && i >= band_center[b + 1]) {
+      b++;
+    }
+    // Linear interpolation between band centers, flat outside the outer ones
+    int64_t env_q23 = rms_q23[b];
+    if (b + 1 < TNS_ENV_BANDS && i > band_center[b]) {
+      env_q23 += ((int64_t)(rms_q23[b + 1] - rms_q23[b]) * (i - band_center[b])) /
+                 (band_center[b + 1] - band_center[b]);
+    }
+
+    int32_t norm_q14 = 0;
+    if (env_q23 > 0) {
+      // We shift the q31 into q23, so the env_q23 cancels it out, leaving the
+      // normalization ratio in q14
+      norm_q14 = (int32_t)((((int64_t)(spec_q31[i] >> 8)) << TNS_NORM_Q) / env_q23);
+    }
+
+    for (int k = TNS_MAX_ORDER; k > 0; k--) {
+      hist[k] = hist[k - 1];
+    }
+    hist[0] = norm_q14;
+
+    int lags = i - TNS_START_BIN < TNS_MAX_ORDER ? i - TNS_START_BIN : TNS_MAX_ORDER;
+    for (int k = 0; k <= lags; k++) {
+      r[k] += (int64_t)norm_q14 * hist[k];
     }
   }
 }
@@ -172,10 +237,8 @@ static void tns_autocorrelation(const int32_t *spec, int n, int64_t *r) {
  * @param k_out     Output reflection coefficients in Q30
  * @return Actual filter order (0 if prediction gain is insufficient)
  */
-static int tns_levinson_durbin(const int64_t *r_raw,
-                               int max_order,
-                               bool hangover,
-                               int32_t *k_out) {
+static int
+tns_levinson_durbin(const int64_t *r_raw, int max_order, bool hangover, int32_t *k_out) {
   if (r_raw[0] <= 0) {
     return 0;
   }
@@ -248,10 +311,8 @@ static int tns_levinson_durbin(const int64_t *r_raw,
     memcpy(a, a_new, (size_t)(i + 1) * sizeof(int32_t));
   }
 
-  // Matches >= 1.5 on hangover, 1.2 else
-  int64_t gate_num = hangover ? 2 : 5;
-  int64_t gate_den = hangover ? 3 : 6;
-  if (order == 0 || gate_num * (int64_t)r[0] < gate_den * (int64_t)error) {
+  // Prediction gain gate, fire at >= 1.2
+  if (order == 0 || 5 * (int64_t)r[0] < 6 * (int64_t)error) {
     return 0;
   }
 
@@ -264,7 +325,7 @@ int32_t tns_dequant_k(int q) {
 
 void tns_analyze(const int32_t *spec_q31, bool hangover, tns_info *out) {
   int64_t r[TNS_MAX_ORDER + 1];
-  tns_autocorrelation(spec_q31 + TNS_START_BIN, HQLC_FRAME_SAMPLES - TNS_START_BIN, r);
+  tns_autocorrelation(spec_q31, r);
 
   int32_t k_raw[TNS_MAX_ORDER];
   int order = tns_levinson_durbin(r, TNS_MAX_ORDER, hangover, k_raw);
@@ -305,8 +366,8 @@ static void tns_lattice_fir(
   memset(b_state, 0, sizeof(b_state));
   uint32_t or_acc = 0;
 
-  // Process only HF bins (TNS_START_BIN onward), leave LF untouched
-  for (int n = TNS_START_BIN; n < HQLC_FRAME_SAMPLES; n++) {
+  // Process only coded HF bins (TNS_START_BIN..PSY_ACTIVE_BINS), leave LF untouched
+  for (int n = TNS_START_BIN; n < PSY_ACTIVE_BINS; n++) {
     int32_t f = spec_q31[n] >> input_rshift;
     int32_t b_prev = f;
 
@@ -344,8 +405,8 @@ static void tns_lattice_iir(
   memset(b_state, 0, sizeof(b_state));
   uint32_t or_acc = 0;
 
-  // Process only HF bins (TNS_START_BIN onward), leave LF untouched
-  for (int n = TNS_START_BIN; n < HQLC_FRAME_SAMPLES; n++) {
+  // Process only coded HF bins (TNS_START_BIN..PSY_ACTIVE_BINS), leave LF untouched
+  for (int n = TNS_START_BIN; n < PSY_ACTIVE_BINS; n++) {
     int32_t f = spec_q31[n] >> input_rshift;
 
     f = (int32_t)((int64_t)f - fxp_scale_q30(b_state[order - 1], k_q30[order - 1]));

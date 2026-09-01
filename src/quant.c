@@ -15,6 +15,10 @@
 // Min drop for the NF cliff fill rule to trigger
 #define NF_CLIFF_MIN_DROP 4
 
+// A zeroed bin counts as overfilled when the estimator overshoots its energy by this
+// ratio (equals to 6dB)
+#define NF_FLAG_BIN_RATIO 2
+
 // Quantizer scale: step = 2^(E/8), E = 2*exp - gain_code - 59
 #define QUANT_EXP_OFFSET 59
 
@@ -23,7 +27,7 @@
 
 // Deadzone threshold and MMSE reconstruction centroid for a Laplacian source
 #define QUANT_DZ_THRESH_Q8 (FXP_Q8(0.65) + 1)
-#define QUANT_CENTROID_Q8   FXP_Q8(0.15)
+#define QUANT_CENTROID_Q8  FXP_Q8(0.15)
 
 // Quantizer step: step = 2^(E/8) with E = 2*exp - gain_code - QUANT_EXP_OFFSET,
 // decomposed as pow2_eighth[E % 8] * 2^(E / 8)
@@ -61,7 +65,7 @@ static const uint8_t nf_laplace_rms_q8[32] = {
     63, 64, 65, 66, 67, 68, 68, 68, 69, 68, 68, 67, 66, 63, 59, 50,
 };
 
-// Per-bin exponents: linear ramp between band centers (tonal frames)
+// Per-bin exponents, linear ramp between band centers
 static void bin_exp_interp(const int32_t *exp_indices, int32_t *bin_exp) {
   int prev = (psy_band_edges[0] + psy_band_edges[1] + 2) >> 1;
 
@@ -112,15 +116,6 @@ static void bin_exp_cliff(const int32_t *exp_indices, int32_t *bin_exp) {
   }
 }
 
-// Per-bin exponents: held flat across each band (TNS frames)
-static void bin_exp_flat(const int32_t *exp_indices, int32_t *bin_exp) {
-  for (int b = 0; b < PSY_N_BANDS; b++) {
-    for (int i = psy_band_edges[b]; i < psy_band_edges[b + 1]; i++) {
-      bin_exp[i] = exp_indices[b];
-    }
-  }
-}
-
 // Deadzone, round, and restore sign.
 static inline void quant_bin(int16_t *out, int32_t scaled_q8, int32_t sign) {
   int32_t dz_mask = ~((scaled_q8 - QUANT_DZ_THRESH_Q8) >> 31);
@@ -131,7 +126,6 @@ static inline void quant_bin(int16_t *out, int32_t scaled_q8, int32_t sign) {
 void quant_forward(const bfp_i32 *spectrum,
                    const int32_t *exp_indices,
                    int gain_code,
-                   bool interp,
                    int16_t *quant_out) {
   const int32_t *spec_q31 = spectrum->data;
   for (int i = PSY_ACTIVE_BINS; i < HQLC_FRAME_SAMPLES; i++) {
@@ -141,11 +135,7 @@ void quant_forward(const bfp_i32 *spectrum,
   HQLC_BENCH_BEGIN(HQLC_BENCH_ENC_QLOOP);
 
   int32_t bin_exp[PSY_ACTIVE_BINS];
-  if (interp) {
-    bin_exp_interp(exp_indices, bin_exp);
-  } else {
-    bin_exp_flat(exp_indices, bin_exp);
-  }
+  bin_exp_interp(exp_indices, bin_exp);
 
   int i = 0;
   while (i < PSY_ACTIVE_BINS) {
@@ -179,8 +169,8 @@ void quant_forward(const bfp_i32 *spectrum,
         int32_t x = spec_q31[i];
         int32_t sign = x >> 31;
         int32_t abs_spec = fxp_abs_i32(x);
-        int32_t scaled_q8 = (int32_t)((int64_t)abs_spec * scale.multiplier_q28 >>
-                                      scale.product_rshift);
+        int32_t scaled_q8 =
+            (int32_t)((int64_t)abs_spec * scale.multiplier_q28 >> scale.product_rshift);
 
         quant_bin(&quant_out[i], scaled_q8, sign);
       }
@@ -190,8 +180,8 @@ void quant_forward(const bfp_i32 *spectrum,
         int32_t x = spec_q31[i];
         int32_t sign = x >> 31;
         int32_t abs_spec = fxp_abs_i32(x);
-        int32_t scaled_q8 = fxp_sat_i64_to_i32(
-            (int64_t)abs_spec * scale.multiplier_q28 << (-scale.product_rshift));
+        int32_t scaled_q8 = fxp_sat_i64_to_i32((int64_t)abs_spec * scale.multiplier_q28
+                                               << (-scale.product_rshift));
 
         quant_bin(&quant_out[i], scaled_q8, sign);
       }
@@ -204,7 +194,6 @@ void quant_forward(const bfp_i32 *spectrum,
 void quant_inverse(const int16_t *quant_in,
                    const int32_t *exp_indices,
                    int gain_code,
-                   bool interp,
                    bfp_i32 *spectrum) {
   int32_t *spec_q31 = spectrum->data;
   int max_exp = exp_indices[0];
@@ -217,11 +206,7 @@ void quant_inverse(const int16_t *quant_in,
 
   // Interpolated exponents never exceed the band max, so max_oct holds
   int32_t bin_exp[PSY_ACTIVE_BINS];
-  if (interp) {
-    bin_exp_interp(exp_indices, bin_exp);
-  } else {
-    bin_exp_flat(exp_indices, bin_exp);
-  }
+  bin_exp_interp(exp_indices, bin_exp);
 
   // Find the max dequantized magnitude (for BFP headroom)
   uint64_t max_val = 0;
@@ -274,20 +259,110 @@ void quant_inverse(const int16_t *quant_in,
   spectrum->exp2 = max_oct - headroom + 27;
 }
 
+/**
+ * @brief Estimate the noise fill level for one band, occupancy-derived
+ *
+ * @param nz Number of zeros in given band
+ * @param bincount amount of bins a band spans
+ */
+static uint32_t nf_band_factor_q8(int nz, int bincount) {
+  int32_t z_q15 = (nz << 15) / bincount;
+  if (z_q15 >= FXP_Q15(1.0)) {
+    // All-zero bands get the last entry of the level table
+    z_q15 = FXP_Q15(1.0) - 1;
+  }
+  int32_t excess_q15 = (z_q15 << 1) - FXP_Q15(1.0);
+  if (excess_q15 <= 0) {
+    // Only apply NF if more than 50% of the bins are zero
+    return 0;
+  }
+
+  // Return the NF estimation based on the lookup table
+  return (uint32_t)fxp_mul_rshift_rnd_i32(nf_laplace_rms_q8[z_q15 >> 10], excess_q15, 15);
+}
+
+// Per-bin |X| in quantizer step units (Q8). quant_forward hoists this ladder
+// out of its hot loop per bin_exp run; this is the cold per-bin form
+static int32_t quant_abs_scaled_q8(int32_t abs_spec, quant_scale scale) {
+  if (scale.product_rshift >= 64) {
+    return 0;
+  }
+  if (scale.product_rshift >= 32) {
+    int32_t hi = fxp_mul_rshift_i32(abs_spec, scale.multiplier_q28, 32);
+    return hi >> (scale.product_rshift - 32);
+  }
+  if (scale.product_rshift > 0) {
+    return (int32_t)((int64_t)abs_spec * scale.multiplier_q28 >> scale.product_rshift);
+  }
+  return fxp_sat_i64_to_i32((int64_t)abs_spec * scale.multiplier_q28
+                            << (-scale.product_rshift));
+}
+
+void noise_fill_refinement_mask(const bfp_i32 *spectrum,
+                                const int16_t *quant,
+                                const int32_t *exp_indices,
+                                int gain_code,
+                                bool *mask) {
+  const int32_t *spec_q31 = spectrum->data;
+  // Same per-bin exponents the decoder fill will use
+  int32_t bin_exp[PSY_ACTIVE_BINS];
+  bin_exp_interp(exp_indices, bin_exp);
+  bin_exp_cliff(exp_indices, bin_exp);
+
+  for (int b = 0; b < PSY_N_BANDS; b++) {
+    mask[b] = false;
+    if (psy_band_edges[b] < NF_START_BIN) {
+      continue;
+    }
+    int s = psy_band_edges[b];
+    int e = psy_band_edges[b + 1];
+
+    int nz = 0;
+    // True NF fill leven per-bin
+    int32_t true_nf_factor_q8[64];
+    for (int i = s; i < e; i++) {
+      if (quant[i] != 0) {
+        continue;
+      }
+
+      // Apply quantizers scaling on the spectrum
+      quant_scale scale = quant_forward_scale((int)bin_exp[i], gain_code, spectrum->exp2);
+      true_nf_factor_q8[nz++] = quant_abs_scaled_q8(fxp_abs_i32(spec_q31[i]), scale);
+    }
+    if (nz == 0) {
+      continue;
+    }
+
+    // Estimate the NF factor same way as decoder does
+    uint32_t factor_q8 = nf_band_factor_q8(nz, e - s);
+    if (factor_q8 == 0) {
+      continue;
+    }
+
+    int bins_overshoot = 0;
+
+    // Count the amount of bins that have overshooted the energy by factor of
+    // NF_FLAG_BIN_RATIO
+    for (int i = 0; i < nz; i++) {
+      if ((int32_t)factor_q8 > NF_FLAG_BIN_RATIO * true_nf_factor_q8[i]) {
+        bins_overshoot++;
+      }
+    }
+
+    // We skip the band when move than half the bins overshooted
+    mask[b] = 2 * bins_overshoot > nz;
+  }
+}
+
 void noise_fill(const int16_t *quant,
                 const int32_t *exp_indices,
                 int gain_code,
-                bool interp,
                 uint32_t seed,
                 const bool *skip_bands,
                 bfp_i32 *spectrum) {
   int32_t *spec_q31 = spectrum->data;
   int32_t bin_exp[PSY_ACTIVE_BINS];
-  if (interp) {
-    bin_exp_interp(exp_indices, bin_exp);
-  } else {
-    bin_exp_flat(exp_indices, bin_exp);
-  }
+  bin_exp_interp(exp_indices, bin_exp);
   bin_exp_cliff(exp_indices, bin_exp);
 
   // We derive the level from the zero occupancy in each band's quantized bins
@@ -314,25 +389,8 @@ void noise_fill(const int16_t *quant,
     if (nz == 0) {
       continue;
     }
-    int n = e - s;
-    // zero fraction for the band
-    int32_t z_q15 = (nz << 15) / n;
-
-    if (z_q15 >= FXP_Q15(1.0)) {
-      // All zeros bands get the last entry from the nf probabilities
-      z_q15 = FXP_Q15(1.0) - 1;
-    }
-    int zi = z_q15 >> 10;
-
-    // Only the excess of zeros over nonzeros counts as evidence of a missing
-    // noise floor. Every zero bin is filled at that excess
-    int32_t excess_q15 = (z_q15 << 1) - FXP_Q15(1.0);
-    if (excess_q15 <= 0) {
-      // less than 50% is zeros - skip NF, enough spectral information is present
-      continue;
-    }
-    factor_q8[b] = (uint8_t)fxp_mul_rshift_rnd_i32(
-        nf_laplace_rms_q8[zi], excess_q15, 15);
+    // Every zero bin is filled at the band's occupancy-derived level
+    factor_q8[b] = (uint8_t)nf_band_factor_q8(nz, e - s);
     if (factor_q8[b] == 0) {
       continue;
     }
