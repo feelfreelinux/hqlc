@@ -4,6 +4,11 @@ project(hqlc C)
 
 set(CMAKE_EXPORT_COMPILE_COMMANDS ON)
 
+# Default to Release
+if (NOT CMAKE_BUILD_TYPE AND NOT CMAKE_CONFIGURATION_TYPES)
+    set(CMAKE_BUILD_TYPE Release CACHE STRING "Build type" FORCE)
+endif()
+
 add_library(hqlc STATIC
     src/hqlc.c
     src/mdct.c

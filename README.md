@@ -16,7 +16,7 @@ You can build the C encoder / decoder CLI via CMake:
 
 ```
 mkdir build && cd build
-cmake .. -DHQLC_TOOLS=ON -GNinja && ninja
+cmake .. -DHQLC_TOOLS=ON -DCMAKE_BUILD_TYPE=Release -GNinja && ninja
 ```
 
 This produces `hqlc`, the CLI tool:
