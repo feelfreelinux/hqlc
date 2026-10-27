@@ -398,6 +398,8 @@ void rans_train_reset(void);
  * @param gain_code Quantizer gain code
  * @param ms_flags Per-band M/S flags (null or zero for dual mono)
  * @param exp_indices Pointer to the exponent envelope, needs to be of size PSY_N_BANDS
+ * @param nf_flags Per-channel noise-fill kill mask [n_ch][PSY_N_BANDS], or null.
+ *                 Bands below NF_FIRST_BAND are not coded. Needs exp_indices.
  * @param out Output buffer.
  * @param out_cap Output buffer capacity in bytes.
  * @return Number of encoded bytes written.
@@ -407,6 +409,7 @@ size_t rans_encode_payload(const int16_t *quant,
                            int gain_code,
                            const bool *ms_flags,
                            const int32_t *exp_indices,
+                           const bool *nf_flags,
                            uint8_t *out,
                            size_t out_cap);
 
@@ -420,6 +423,8 @@ size_t rans_encode_payload(const int16_t *quant,
  * @param gain_code Quantizer gain code.
  * @param ms_flags Per-band M/S flags (null or zero for dual mono)
  * @param exp_indices pointer to an array where exponents will be decoded too. Needs to be of size PSY_N_BANDS
+ * @param nf_flags Destination for the noise-fill kill mask [n_ch][PSY_N_BANDS],
+ *                 or null. Bands below NF_FIRST_BAND are cleared.
  * @return True on success, or false if the stream is corrupt or truncated.
  */
 bool rans_decode_payload(const uint8_t *data,
@@ -428,7 +433,8 @@ bool rans_decode_payload(const uint8_t *data,
                          int n_ch,
                          int gain_code,
                          const bool *ms_flags,
-                         int32_t *exp_indices);
+                         int32_t *exp_indices,
+                         bool *nf_flags);
 
 #ifdef __cplusplus
 }

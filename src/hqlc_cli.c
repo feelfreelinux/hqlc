@@ -42,7 +42,7 @@ static const char *g_train_path = NULL;
 //
 // Header (16 bytes):
 //   [0..3]   magic "HQLC"
-//   [4]      version (6)
+//   [4]      version (7)
 //   [5]      channels (1 or 2)
 //   [6..7]   zero padding in the last audio frame (LE16, 0..511)
 //   [8..11]  sample_rate (LE32)
@@ -52,7 +52,7 @@ static const char *g_train_path = NULL;
 //   [0..1]   payload_len (LE16)
 //   [2..]    payload
 
-#define HQLC_FILE_VERSION  6
+#define HQLC_FILE_VERSION  7
 #define HQLC_FILE_HDR_SIZE 16
 
 // Buffered frames per block, 32 x 512 x 2ch x 2B = 64 KB

@@ -95,7 +95,6 @@ struct hqlc_encoder {
 struct hqlc_decoder {
   uint8_t channels;
   uint32_t sample_rate;
-  uint32_t frame_count; // varies the noise fill seed per frame
   mdct_ola_state ola[HQLC_MAX_CHANNELS];
 };
 
@@ -221,8 +220,7 @@ static int probe_frame_bits(const bfp_i32 *spectra,
             if (q < RANS_MAX_SYM - 1) {
               total_q8 += cost[q] + FXP_Q8(1.0); // symbol + 1 sign bit
             } else {
-              total_q8 +=
-                  cost[RANS_MAX_SYM - 1] + FXP_Q8(1.0) + eg0_overflow_cost_q8(q);
+              total_q8 += cost[RANS_MAX_SYM - 1] + FXP_Q8(1.0) + eg0_overflow_cost_q8(q);
             }
             nz++;
           }
@@ -230,15 +228,14 @@ static int probe_frame_bits(const bfp_i32 *spectra,
       } else if (scale.product_rshift > 0) {
         for (int i = s; i < e; i++) {
           int32_t abs_spec = fxp_abs_i32(ch_spec[i]);
-          int32_t scaled_q8 = (int32_t)((int64_t)abs_spec * scale.multiplier_q28 >>
-                                        scale.product_rshift);
+          int32_t scaled_q8 =
+              (int32_t)((int64_t)abs_spec * scale.multiplier_q28 >> scale.product_rshift);
           int32_t q = (scaled_q8 + QUANT_DZ_BIAS_Q8) >> 8;
           if (q > 0) {
             if (q < RANS_MAX_SYM - 1) {
               total_q8 += cost[q] + FXP_Q8(1.0); // symbol + 1 sign bit
             } else {
-              total_q8 +=
-                  cost[RANS_MAX_SYM - 1] + FXP_Q8(1.0) + eg0_overflow_cost_q8(q);
+              total_q8 += cost[RANS_MAX_SYM - 1] + FXP_Q8(1.0) + eg0_overflow_cost_q8(q);
             }
             nz++;
           }
@@ -394,8 +391,8 @@ hqlc_error hqlc_encode_frame(hqlc_encoder *enc,
 
   bfp_i32 spectra[HQLC_MAX_CHANNELS];
   for (int ch = 0; ch < n_ch; ch++) {
-    spectra[ch] = bfp_i32_view(
-        &s->spec_q31[ch * HQLC_FRAME_SAMPLES], HQLC_FRAME_SAMPLES, 0);
+    spectra[ch] =
+        bfp_i32_view(&s->spec_q31[ch * HQLC_FRAME_SAMPLES], HQLC_FRAME_SAMPLES, 0);
   }
   tns_info tns[HQLC_MAX_CHANNELS];
   memset(tns, 0, sizeof(tns));
@@ -497,7 +494,7 @@ hqlc_error hqlc_encode_frame(hqlc_encoder *enc,
   }
   HQLC_BENCH_END(HQLC_BENCH_ENC_QUANT_FWD);
 
-  // NF refinement mask: tonal gaps the decoder must not noise fill
+  // NF kill mask marks the bands that NF is disabled for
   bool nf_mask[HQLC_MAX_CHANNELS][PSY_N_BANDS];
   for (int ch = 0; ch < n_ch; ch++) {
     noise_fill_refinement_mask(&spectra[ch],
@@ -505,6 +502,15 @@ hqlc_error hqlc_encode_frame(hqlc_encoder *enc,
                                &exp_indices[ch * PSY_N_BANDS],
                                gain_code,
                                nf_mask[ch]);
+  }
+  // S bands are never noise filled, so the mask just takes a previous value
+  // as this is the cheapest in the model
+  if (n_ch == 2) {
+    for (int b = NF_FIRST_BAND; b < PSY_N_BANDS; b++) {
+      if (enc->ms_flags[b]) {
+        nf_mask[1][b] = (b > NF_FIRST_BAND) ? nf_mask[1][b - 1] : false;
+      }
+    }
   }
 
   // Write side information bitstream
@@ -534,14 +540,7 @@ hqlc_error hqlc_encode_frame(hqlc_encoder *enc,
     }
   }
 
-  // NF refinement mask, RLE coded per channel over the NF bands
-  for (int ch = 0; ch < n_ch; ch++) {
-    bw_write_binary_rle(
-        &bw, &nf_mask[ch][NF_FIRST_BAND], PSY_N_BANDS - NF_FIRST_BAND, 0);
-  }
-
-  // Exponents are rANS-coded inside the coefficient stream
-
+  // Exponents and the NF kill mask mask are rANS-coded inside the coefficient stream
   bw_flush(&bw);
   size_t side_bytes = bw_bytes(&bw);
   HQLC_BENCH_END(HQLC_BENCH_ENC_SIDE_INFO);
@@ -549,15 +548,16 @@ hqlc_error hqlc_encode_frame(hqlc_encoder *enc,
   // rANS encode coefficients (+ exponents in the same stream)
   HQLC_BENCH_BEGIN(HQLC_BENCH_ENC_RANS_ENC);
   size_t rans_len = rans_encode_payload(quant,
-                                       n_ch,
-                                       gain_code,
-                                       (n_ch == 2) ? enc->ms_flags : NULL,
-                                       exp_indices,
-                                       rans_tmp,
-                                       HQLC_MAX_FRAME_BYTES);
+                                        n_ch,
+                                        gain_code,
+                                        (n_ch == 2) ? enc->ms_flags : NULL,
+                                        exp_indices,
+                                        &nf_mask[0][0],
+                                        rans_tmp,
+                                        HQLC_MAX_FRAME_BYTES);
   HQLC_BENCH_END(HQLC_BENCH_ENC_RANS_ENC);
 
-  // Assemble output: side info + rANS stream
+  // Assemble side info + rANS stream
   if (side_bytes + rans_len > out_cap) {
     return HQLC_ERR_BUFFER_TOO_SMALL;
   }
@@ -611,7 +611,6 @@ void hqlc_decoder_reset(hqlc_decoder *dec) {
   if (!dec) {
     return;
   }
-  dec->frame_count = 0;
   for (int ch = 0; ch < dec->channels; ch++) {
     mdct_ola_init(&dec->ola[ch]);
   }
@@ -671,15 +670,9 @@ hqlc_error hqlc_decode_frame(hqlc_decoder *dec,
     }
   }
 
-  // NF refinement mask
+  // NF kill mask and exponents are decoded from the rANS stream
   bool nf_mask[HQLC_MAX_CHANNELS][PSY_N_BANDS];
   memset(nf_mask, 0, sizeof(nf_mask));
-  for (int ch = 0; ch < n_ch; ch++) {
-    br_read_binary_rle(
-        &br, &nf_mask[ch][NF_FIRST_BAND], PSY_N_BANDS - NF_FIRST_BAND, 0);
-  }
-
-  // Exponents are decoded from the rANS stream
 
   // Byte-align to find rANS stream start
   size_t bits_used = br_bits(&br);
@@ -696,21 +689,21 @@ hqlc_error hqlc_decode_frame(hqlc_decoder *dec,
   memset(quant_buf, 0, (size_t)n_ch * HQLC_FRAME_SAMPLES * sizeof(int16_t));
 
   if (rans_len == 0 || !rans_decode_payload(rans_data,
-                                           rans_len,
-                                           quant_buf,
-                                           n_ch,
-                                           gain_code,
-                                           (n_ch == 2) ? ms_flags : NULL,
-                                           exp_indices)) {
+                                            rans_len,
+                                            quant_buf,
+                                            n_ch,
+                                            gain_code,
+                                            (n_ch == 2) ? ms_flags : NULL,
+                                            exp_indices,
+                                            &nf_mask[0][0])) {
     return HQLC_ERR_BITSTREAM_CORRUPT;
   }
   HQLC_BENCH_END(HQLC_BENCH_DEC_ENTROPY);
 
   bfp_i32 spectra[HQLC_MAX_CHANNELS];
   for (int ch = 0; ch < n_ch; ch++) {
-    spectra[ch] = bfp_i32_view(&s->stage.synthesis.spec_q31[ch * HQLC_FRAME_SAMPLES],
-                               HQLC_FRAME_SAMPLES,
-                               0);
+    spectra[ch] = bfp_i32_view(
+        &s->stage.synthesis.spec_q31[ch * HQLC_FRAME_SAMPLES], HQLC_FRAME_SAMPLES, 0);
   }
 
   // Performs dequant + NF + TNS synthesis per channel
@@ -723,12 +716,15 @@ hqlc_error hqlc_decode_frame(hqlc_decoder *dec,
     quant_inverse(ch_quant, ch_exp, gain_code, spectrum);
     HQLC_BENCH_END(HQLC_BENCH_DEC_DEQUANT);
 
-    // Noise fill, seeded per frame and channel so the texture differs across frames.
+    // Noise fill, seeded from envelope of the given frame
+    // so its stateless and unique across frames
     HQLC_BENCH_BEGIN(HQLC_BENCH_DEC_NF);
-    uint32_t nf_seed =
-        NF_SEED_BIAS ^ (dec->frame_count * 0x9E37u) ^ ((uint32_t)ch * 0x51EDu);
+    uint32_t nf_seed = NF_SEED_BIAS ^ ((uint32_t)ch * NF_SEED_CH);
+    for (int b = 0; b < PSY_N_BANDS; b++) {
+      nf_seed = nf_seed * NF_SEED_MUL + (uint32_t)ch_exp[b];
+    }
 
-    // Skip flagged S bands (ch 1 of M/S) and refinement-masked bands
+    // Skip flagged S bands (ch 1 of M/S) and nf kill masked bands
     bool skip[PSY_N_BANDS];
     for (int b = 0; b < PSY_N_BANDS; b++) {
       skip[b] = nf_mask[ch][b] || (ch == 1 && ms_flags[b]);
@@ -767,6 +763,5 @@ hqlc_error hqlc_decode_frame(hqlc_decoder *dec,
     HQLC_BENCH_END(HQLC_BENCH_DEC_IMDCT_OLA);
   }
 
-  dec->frame_count++;
   return HQLC_OK;
 }

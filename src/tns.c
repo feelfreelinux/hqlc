@@ -213,7 +213,7 @@ static void tns_autocorrelation(const int32_t *spec_q31, int64_t *r) {
     if (env_q23 > 0) {
       // We shift the q31 into q23, so the env_q23 cancels it out, leaving the
       // normalization ratio in q14
-      norm_q14 = (int32_t)((((int64_t)(spec_q31[i] >> 8)) << TNS_NORM_Q) / env_q23);
+      norm_q14 = (int32_t)(((int64_t)(spec_q31[i] >> 8) * (1 << TNS_NORM_Q)) / env_q23);
     }
 
     for (int k = TNS_MAX_ORDER; k > 0; k--) {

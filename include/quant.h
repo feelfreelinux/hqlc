@@ -11,16 +11,21 @@ extern "C" {
 #endif
 
 // Gain code: 7-bit, 8 codes per octave, bias at gain=1.0
-#define QUANT_GAIN_BITS     7
-#define QUANT_GAIN_Q        8
-#define QUANT_GAIN_BIAS     27
-#define QUANT_GAIN_RC_MAX   75 // GAIN_BIAS + GAIN_Q * 6
+#define QUANT_GAIN_BITS   7
+#define QUANT_GAIN_Q      8
+#define QUANT_GAIN_BIAS   27
+#define QUANT_GAIN_RC_MAX 75 // GAIN_BIAS + GAIN_Q * 6
 
 // Quantizer rounding bias = 1 - deadzone, shared with the rate probe
 #define QUANT_DZ_BIAS_Q8 FXP_Q8(0.35)
 
-// Noise fill seed
+// Noise fill seeds, bias ^ channel offset
 #define NF_SEED_BIAS 0x9E3779B9u
+#define NF_SEED_CH   0x51EDu
+
+// FNV prime for multiply by envelope index
+// See https://en.wikipedia.org/wiki/Fowler–Noll–Vo_hash_function
+#define NF_SEED_MUL  0x01000193u
 
 // First coarse band eligible for noise fill
 #define NF_FIRST_BAND 10
@@ -91,7 +96,8 @@ void noise_fill_refinement_mask(const bfp_i32 *spectrum,
  * @param exp_indices Per-band exponent indices.
  * @param gain_code Quantizer gain code.
  * @param seed Seed for the noise generator.
- * @param skip_bands Optional per-band skip mask (flagged M/S side bands and the nf refinement mask)
+ * @param skip_bands Optional per-band skip mask (flagged M/S side bands and the nf
+ * kill mask)
  * @param spectrum Dequantized Q31 BFP spectrum to update.
  */
 void noise_fill(const int16_t *quant,

@@ -123,6 +123,83 @@ static inline uint8_t rans_dec_sym(hqlc_rans_dec *dec, const uint16_t *cf) {
   return (uint8_t)s;
 }
 
+// Select context of the nf kill flags for a band
+// @param band actual exponent index
+// @param dexp difference from the last exponent (used for the drop calculation)
+// @param survivors surviving bins in the current band
+// @param flags_nearby
+static inline int nf_flag_ctx(int band, int32_t dexp, int survivors, int flags_nearby) {
+  // Envelope drop into the band, in 1.5 dB exponent steps
+  int step;
+
+  if (dexp <= -8) {
+    step = 0; // cliff, a lowpass or silence edge
+  } else if (dexp <= -4) {
+    step = 1; // mild drop
+  } else if (dexp <= -1) {
+    step = 2; // any drop
+  } else {
+    step = 3; // flat or rising
+  }
+
+  if (band == PSY_N_BANDS - 1) {
+    step += 4; // the top band has its own four classes
+  }
+  // survivors and flags_nearby are 0..4 each
+  return (step * 5 + survivors) * 5 + flags_nearby;
+}
+
+// Frequency of a set flag in RANS_M units, from the packed 4-bit table
+static inline uint16_t nf_flag_freq(int ctx) {
+  return rans_nf_flag_lut[(rans_nf_flag_q4[ctx >> 1] >> ((ctx & 1) * 4)) & 15];
+}
+
+// Nonzero coefficients in the band, up to four
+static inline int nf_band_survivors(const int16_t *ch_q, int band) {
+  int nonzero = 0;
+  for (int i = psy_band_edges[band]; i < psy_band_edges[band + 1] && nonzero < 4; i++) {
+    nonzero += (ch_q[i] != 0);
+  }
+  return nonzero;
+}
+
+// Returns the count of nf flag set nearby (n-2 both channels) max 4
+// This is used as the nf flag context is dependent on whether closeby bands have been
+// vetoed
+static inline int nf_flags_nearby(const bool *nf_flags, int n_ch, int ch, int band) {
+  const bool *own_flags = &nf_flags[ch * PSY_N_BANDS];
+  int sum = own_flags[band - 1] + own_flags[band - 2];
+  if (n_ch == 2) {
+    const bool *other = &nf_flags[(1 - ch) * PSY_N_BANDS];
+    sum += other[band - 1] + (ch == 1 ? other[band] : 0);
+  }
+  return sum;
+}
+
+// Binary symbol, freq_set = frequency of a 1 in RANS_M units
+static inline void rans_enc_bit(hqlc_rans_enc *enc, uint16_t freq_set, bool value) {
+  uint16_t freq_clear = (uint16_t)(RANS_M - freq_set);
+  uint16_t freq = value ? freq_set : freq_clear;
+  rans_enc_sym(enc, freq, 0xFFFFFFFFu / freq, value ? freq_clear : 0);
+}
+
+// Decode a single bit from state
+static inline bool rans_dec_bit(hqlc_rans_dec *dec, uint16_t freq_set) {
+  uint32_t state = dec->state;
+  uint32_t slot = state & (RANS_M - 1);
+  uint32_t freq_clear = RANS_M - freq_set;
+  bool bit = slot >= freq_clear;
+  uint32_t f = bit ? freq_set : freq_clear;
+  dec->state = f * (state >> RANS_M_BITS) + slot - (bit ? freq_clear : 0);
+  if (dec->state < RANS_L) {
+    dec->state = (dec->state << 8) | rans_dec_byte(dec);
+    if (dec->state < RANS_L) {
+      dec->state = (dec->state << 8) | rans_dec_byte(dec);
+    }
+  }
+  return bit;
+}
+
 static inline int rans_exp_table_index(rans_exp_model model, int band) {
   return (int)model * 4 + rans_exp_group[band];
 }
@@ -412,10 +489,31 @@ size_t rans_encode_payload(const int16_t *quant,
                            int gain_code,
                            const bool *ms_flags,
                            const int32_t *exp_indices,
+                           const bool *nf_flags,
                            uint8_t *out,
                            size_t out_cap) {
   hqlc_rans_enc enc;
   rans_enc_init(&enc, out, out_cap);
+
+  // Noise-fill flags go in first so decoder reads it last
+  // While the coefficients (and the bands survivors) are known
+  // This is needed for picking the right context
+  if (nf_flags) {
+    for (int b = PSY_N_BANDS - 1; b >= NF_FIRST_BAND; b--) {
+      for (int ch = n_ch - 1; ch >= 0; ch--) {
+        if (ch == 1 && ms_flags && ms_flags[b]) {
+          continue; // S band, never filled, not coded
+        }
+        const int32_t *ex = exp_indices ? &exp_indices[ch * PSY_N_BANDS] : NULL;
+        int survivors = nf_band_survivors(&quant[ch * HQLC_FRAME_SAMPLES], b);
+        int ctx = nf_flag_ctx(b,
+                              ex ? ex[b] - ex[b - 1] : 0,
+                              survivors,
+                              nf_flags_nearby(nf_flags, n_ch, ch, b));
+        rans_enc_bit(&enc, nf_flag_freq(ctx), nf_flags[ch * PSY_N_BANDS + b]);
+      }
+    }
+  }
 
   // rANS encodes in reverse order, the decoder reads forward
   for (int ch = n_ch - 1; ch >= 0; ch--) {
@@ -519,9 +617,13 @@ bool rans_decode_payload(const uint8_t *data,
                          int n_ch,
                          int gain_code,
                          const bool *ms_flags,
-                         int32_t *exp_indices) {
+                         int32_t *exp_indices,
+                         bool *nf_flags) {
   if (len == 0) {
     memset(quant_out, 0, (size_t)n_ch * HQLC_FRAME_SAMPLES * sizeof(int16_t));
+    if (nf_flags) {
+      memset(nf_flags, 0, (size_t)n_ch * PSY_N_BANDS * sizeof(bool));
+    }
     return true;
   }
 
@@ -607,6 +709,28 @@ bool rans_decode_payload(const uint8_t *data,
         } else {
           ch_q[i] = 0;
         }
+      }
+    }
+  }
+
+  // Noise-fill flags, contexts mirror the rans encode payload
+  if (nf_flags) {
+    memset(nf_flags, 0, (size_t)n_ch * PSY_N_BANDS * sizeof(bool));
+    for (int b = NF_FIRST_BAND; b < PSY_N_BANDS; b++) {
+      for (int ch = 0; ch < n_ch; ch++) {
+        bool *flags = &nf_flags[ch * PSY_N_BANDS];
+        if (ch == 1 && ms_flags && ms_flags[b]) {
+          flags[b] = (b > NF_FIRST_BAND) ? flags[b - 1]
+                                         : false; // S band, never filled, not coded
+          continue;
+        }
+        const int32_t *ex = exp_indices ? &exp_indices[ch * PSY_N_BANDS] : NULL;
+        int survivors = nf_band_survivors(&quant_out[ch * HQLC_FRAME_SAMPLES], b);
+        int ctx = nf_flag_ctx(b,
+                              ex ? ex[b] - ex[b - 1] : 0,
+                              survivors,
+                              nf_flags_nearby(nf_flags, n_ch, ch, b));
+        flags[b] = rans_dec_bit(&dec, nf_flag_freq(ctx));
       }
     }
   }
