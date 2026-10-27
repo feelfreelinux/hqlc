@@ -9,9 +9,12 @@ TNS per channel:
 
 rANS payload, one stream:
   Exponents first (the decoder needs them before anything else), then the
-  coefficients. Per channel the envelope is:
+  coefficients, then the NF kill mask. Per channel the envelope is:
     Ch0: DPCM from the previous band
     Ch1+: [model flag: 1b] then either DPCM or the delta from ch0
+  The kill mask is one binary symbol per band (from NF_FIRST_BAND) and channel,
+  context-coded on the decoded envelope and coefficients. Flagged S bands are
+  never filled, so they are skipped and repeat the previous band's flag.
 
 + padding 0-7 bits to byte-align before rANS payload
 """
@@ -37,17 +40,19 @@ from .entropy import (
     exp_channel_cost_q8,
     get_rans_exp_tables,
     get_rans_tables,
+    nf_flag_ctx,
+    nf_flag_tables,
     rans_exp_table_idx,
     rans_table_idx,
     read_binary_rle,
     write_binary_rle,
 )
 from .ms import MS_RANS_ALPHA_SHIFT
-from .quantizer import GAIN_BITS, dequantize_gain, quantize_gain
+from .quantizer import GAIN_BITS, NF_FIRST_BAND, dequantize_gain, quantize_gain
 from .tns import TNS_K_BITS, TNS_LAR_MAX
 
 
-def count_side_bits(n_ch, tns_orders, tns_q_ks, ms_flags=None):
+def count_side_bits(n_ch, tns_orders, ms_flags=None):
     """Count side information bits (gain + TNS + pad).
 
     The exponents are not here, they ride in the rANS payload (see
@@ -163,8 +168,49 @@ def _get_exponents(dec, n_channels, ms_flags=None):
     return exp_indices
 
 
-def encode_frame(gain, tns_orders, tns_q_ks, exp_indices, all_quants, ms_flags=None):
-    """Encode one frame, returns (total_bits, payload_bytes)"""
+def _nf_survivors(q_flat, band):
+    """Nonzero coefficients in the band, up to four."""
+    s, e = BAND_EDGES[band], BAND_EDGES[band + 1]
+    return min(4, int(np.count_nonzero(q_flat[s:e])))
+
+
+def _nf_flags_nearby(nf_kill, ch, band):
+    """Kill flags set in the two bands below (and the other channel's decoded ones)."""
+    n = int(nf_kill[ch][band - 1]) + int(nf_kill[ch][band - 2])
+    if len(nf_kill) == 2:
+        other = nf_kill[1 - ch]
+        n += int(other[band - 1]) + (int(other[band]) if ch == 1 else 0)
+    return n
+
+
+def _nf_kill_ctx(q_flats, exp_indices, nf_kill, ch, band):
+    """Context of one kill flag, the same on both sides."""
+    dexp = int(exp_indices[ch][band]) - int(exp_indices[ch][band - 1])
+    return nf_flag_ctx(
+        band, dexp, _nf_survivors(q_flats[ch], band), _nf_flags_nearby(nf_kill, ch, band)
+    )
+
+
+def _is_s_band(ch, band, ms_flags):
+    return ch == 1 and ms_flags is not None and ms_flags[band]
+
+
+def nf_kill_fill_s_bands(nf_kill, ms_flags):
+    """S bands are never filled, so they repeat the previous band's flag, cheapest value under the model."""
+    if ms_flags is None:
+        return
+    for b in range(NF_FIRST_BAND, N_BANDS):
+        if ms_flags[b]:
+            nf_kill[1][b] = nf_kill[1][b - 1] if b > NF_FIRST_BAND else False
+
+
+def encode_frame(
+    gain, tns_orders, tns_q_ks, exp_indices, all_quants, nf_kill, ms_flags=None
+):
+    """Encode one frame, returns (total_bits, payload_bytes)
+
+    nf_kill is the per-channel NF kill mask
+    """
     n_ch = len(tns_orders)
     side = BitWriter()
 
@@ -198,12 +244,14 @@ def encode_frame(gain, tns_orders, tns_q_ks, exp_indices, all_quants, ms_flags=N
     _put_exponents(rans_enc, exp_indices, n_ch, ms_flags)
 
     active = BAND_EDGES[-1]
+    q_flats = []
     for ch in range(n_ch):
         # Build flat quant array for activity computation
         q_flat = np.zeros(active, dtype=np.int32)
         for b in range(N_BANDS):
             s, e = BAND_EDGES[b], BAND_EDGES[b + 1]
             q_flat[s:e] = all_quants[ch][b]
+        q_flats.append(q_flat)
 
         for b in range(N_BANDS):
             q = all_quants[ch][b]
@@ -226,6 +274,15 @@ def encode_frame(gain, tns_orders, tns_q_ks, exp_indices, all_quants, ms_flags=N
                 if int(v) != 0:
                     rans_enc.put(0 if int(v) > 0 else 1, _SIGN_FREQ, _SIGN_CF)
 
+    # NF kill mask last, its contexts need the coefficients
+    for b in range(NF_FIRST_BAND, N_BANDS):
+        for ch in range(n_ch):
+            if _is_s_band(ch, b, ms_flags):
+                continue
+            ctx = _nf_kill_ctx(q_flats, exp_indices, nf_kill, ch, b)
+            freq, cf = nf_flag_tables(ctx)
+            rans_enc.put(int(bool(nf_kill[ch][b])), freq, cf)
+
     payload = side_bytes + rans_enc.finish()
     return len(payload) * 8, payload
 
@@ -234,7 +291,7 @@ def decode_frame(payload, n_channels, has_ms=False):
     """Decode one frame from payload bytes.
 
     ms_flags is None unless has_ms
-    Returns (gain, tns_orders, tns_ks, exp_indices, all_quants, ms_flags)
+    Returns (gain, tns_orders, tns_ks, exp_indices, all_quants, ms_flags, nf_kill)
     """
     br = BitReader(payload)
     gain_code = br.read(GAIN_BITS)
@@ -278,9 +335,11 @@ def decode_frame(payload, n_channels, has_ms=False):
 
     active = BAND_EDGES[-1]
     all_quants = [[] for _ in range(n_channels)]
+    q_flats = []
     for ch in range(n_channels):
         # Flat array for activity computation (populated as we decode)
         q_flat = np.zeros(active, dtype=np.int32)
+        q_flats.append(q_flat)
 
         for b in range(N_BANDS):
             bw_len = BAND_EDGES[b + 1] - BAND_EDGES[b]
@@ -308,6 +367,17 @@ def decode_frame(payload, n_channels, has_ms=False):
             q_flat[s:s + bw_len] = q
             all_quants[ch].append(q)
 
+    # NF kill mask, contexts mirror encode_frame
+    nf_kill = [np.zeros(N_BANDS, dtype=bool) for _ in range(n_channels)]
+    for b in range(NF_FIRST_BAND, N_BANDS):
+        for ch in range(n_channels):
+            if _is_s_band(ch, b, ms_flags):
+                nf_kill[ch][b] = nf_kill[ch][b - 1] if b > NF_FIRST_BAND else False
+                continue
+            ctx = _nf_kill_ctx(q_flats, exp_indices, nf_kill, ch, b)
+            freq, cf = nf_flag_tables(ctx)
+            nf_kill[ch][b] = bool(rans_dec.get(freq, cf))
+
     # Reconstruct reflection coefficients
     tns_ks = []
     for ch in range(n_channels):
@@ -317,4 +387,4 @@ def decode_frame(payload, n_channels, has_ms=False):
         else:
             tns_ks.append(np.zeros(0, dtype=np.float64))
 
-    return gain, tns_orders, tns_ks, exp_indices, all_quants, ms_flags
+    return gain, tns_orders, tns_ks, exp_indices, all_quants, ms_flags, nf_kill

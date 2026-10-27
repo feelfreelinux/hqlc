@@ -8,13 +8,17 @@ Only bins >= TNS_START_BIN (~940 Hz) are analysed and filtered.
 
 import numpy as np
 
-from .constants import FRAME_LEN
+from .constants import BAND_EDGES, FINE_BAND_EDGES, FRAME_LEN, N_ACTIVE_FINE
+from .psy import fine_band_psd
 
 TNS_MAX_ORDER = 4
 TNS_MAX_K = 0.92
 TNS_K_BITS = 4
 TNS_LAR_MAX = 3.5
 TNS_START_BIN = 20  # ~940 Hz
+
+# First fine band at TNS_START_BIN, the envelope used for flattening starts there
+TNS_ENV_FIRST_FB = 19
 
 # Hangover frames use a softer window, and a stricter gate
 TNS_LAG_WIN_B = 0.03
@@ -69,8 +73,24 @@ class TransientDetector:
         return fire
 
 
-def _autocorrelation(x, max_order):
-    """Autocorrelation r[k] = sum x[n]*x[n+k] for k = 0..max_order."""
+def _autocorrelation(X, max_order):
+    """Autocorrelation r[k] = sum x[n]*x[n+k] for k = 0..max_order of the TNS range
+    flattened by its fine-band envelope (C tns_autocorrelation).
+
+    Only the coefficient derivation works on this flattened spectrum
+    """
+    psd = fine_band_psd(X)
+    fbs = range(TNS_ENV_FIRST_FB, N_ACTIVE_FINE)
+    rms = [np.sqrt(psd[fb]) for fb in fbs]
+    centers = [(FINE_BAND_EDGES[fb] + FINE_BAND_EDGES[fb + 1]) // 2 for fb in fbs]
+
+    # Linear interpolation between band centers, flat outside the outer ones
+    bins = np.arange(TNS_START_BIN, BAND_EDGES[-1])
+    env = np.interp(bins, centers, rms)
+    x = np.zeros(len(bins))
+    nz = env > 0.0
+    x[nz] = X[bins[nz]] / env[nz]
+
     n = len(x)
     r = np.empty(max_order + 1, dtype=np.float64)
     for k in range(max_order + 1):
@@ -181,7 +201,7 @@ def analyze(X, hangover=False):
 
     Returns (order, k_dequantized, q_indices, side_bits).
     """
-    r = _autocorrelation(X[TNS_START_BIN:], TNS_MAX_ORDER)
+    r = _autocorrelation(X, TNS_MAX_ORDER)
     # Gaussian lag window, mirrors the c codec
     b = TNS_LAG_WIN_B_HANGOVER if hangover else TNS_LAG_WIN_B
     lag = np.arange(1, TNS_MAX_ORDER + 1)

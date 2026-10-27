@@ -19,7 +19,6 @@ from .constants import (
     CENTROID,
     DEAD_ZONE,
     EXP_INDEX_BIAS,
-    EXP_INDEX_MIN,
     N_BANDS,
 )
 
@@ -30,13 +29,11 @@ GAIN_BIAS = 27  # code 59 / gain 16 / 128 kbps-ish with rANS
 GAIN_MAX_CODE = (1 << GAIN_BITS) - 1  # 127
 GAIN_RC_MAX = GAIN_BIAS + GAIN_Q * 6  # cap: gain = 64 (6 octaves above unity)
 
+# Noise fill seed, see quant.h
 NF_SEED_BIAS = 0x9E3779B9
+NF_SEED_CH = 0x51ED
+NF_SEED_MUL = 0x01000193  # 32-bit FNV prime
 NF_START_BIN = 75  # ~3.5 kHz, below this the holes are left alone
-NF_OCCUPANCY_STEPS = 32  # resolution of the zero-fraction to level table
-
-# NF cliff rule, see quant.c in c
-NF_CLIFF_FIRST_BAND = 17
-NF_CLIFF_MIN_DROP = 4
 
 
 def quantize_gain(gain):
@@ -82,64 +79,65 @@ def dequantize(q, step):
     return x
 
 
-def _laplace_rms(z):
-    """Sub-deadzone RMS (in units of step) of a Laplacian with zero fraction z"""
-    L = -math.log(1.0 - z)
-    return (DEAD_ZONE / L) * math.sqrt(2.0 - (1.0 - z) * (L * L + 2.0 * L + 2.0))
+# Fill amplitude at full occupancy, in quantizer steps. The C reference stores
+# this rounded to Q8 (quant.c NF_LEVEL_Q8).
+NF_LEVEL = 0.22
+
+# First coarse band the NF kill mask is coded for (band 10 starts at NF_START_BIN)
+NF_FIRST_BAND = 10
+
+# A zero bin overshoots when the fill is more than this many times its true magnitude
+NF_KILL_BIN_RATIO = 2
 
 
-# Level per zero-occupancy bucket, sampled at the bucket centers.
-# The C reference stores this rounded to Q8 (quant.c nf_laplace_rms_q8).
-NF_LAPLACE_RMS = [
-    _laplace_rms((k + 0.5) / NF_OCCUPANCY_STEPS) for k in range(NF_OCCUPANCY_STEPS)
-]
+def _nf_band_factor(nz, width):
+    """Fill level of a band in quantizer steps, from its zero count.
 
-
-def _cliff_fill_step(exp_indices, b, gain):
-    """Fill step across a spectral cliff, or None when the band is not past one.
-    See quant.c in C for details
+    Only the excess of zeros over nonzeros counts as evidence of a missing noise floor,
+    so a band that is less than half zeros is not filled (returns 0)
     """
-    if b < NF_CLIFF_FIRST_BAND:
-        return None
-    drop = int(exp_indices[b - 1]) - int(exp_indices[b])
-    if drop <= NF_CLIFF_MIN_DROP:
-        return None
-    fill_exp = max(
-        EXP_INDEX_MIN,
-        int(exp_indices[b]) - 3 * (drop - NF_CLIFF_MIN_DROP) // 4,
-    )
-    return exp_to_step_factor(fill_exp) / gain
+    excess = 2.0 * nz / float(width) - 1.0
+    return NF_LEVEL * excess if excess > 0.0 else 0.0
 
 
-def noise_fill(X_hat, q, step, seed, exp_indices, gain, skip_bands=None):
+def nf_kill_mask(X, q, step):
+    """Encoder-side NF kill mask: bands where the decoder's fill would overshoot.
+
+    Mirrors the decoder level estimate, a band is killed when more than half of its
+    zero bins would be filled above NF_KILL_BIN_RATIO x their true magnitude.
+    """
+    mask = np.zeros(N_BANDS, dtype=bool)
+    for b in range(N_BANDS):
+        s, e = BAND_EDGES[b], BAND_EDGES[b + 1]
+        if s < NF_START_BIN:
+            continue
+        zeros = [i for i in range(s, e) if q[i] == 0]
+        factor = _nf_band_factor(len(zeros), e - s)
+        if factor == 0.0:
+            continue
+        overshoot = sum(1 for i in zeros if factor > NF_KILL_BIN_RATIO * abs(X[i]) / step[i])
+        mask[b] = 2 * overshoot > len(zeros)
+    return mask
+
+
+def noise_fill(X_hat, q, step, seed, skip_bands=None):
     """Replace zeroed bins above NF_START_BIN with pseudorandom noise, in place.
 
-    The fill level comes from each band's zero occupancy, scaled by the excess of zeros over nonzeros.
+    The fill level comes from each band's zero occupancy (see _nf_band_factor).
 
-    skip_bands (bool per band) leaves bands as exact zeros, used with M/S flags
+    skip_bands (bool per band) leaves bands as exact zeros, used for the M/S side
+    bands and the NF kill mask
     """
     for b in range(N_BANDS):
         s, e = BAND_EDGES[b], BAND_EDGES[b + 1]
         # NF_START_BIN sits on a band edge, so partial bands never occur
         if s < NF_START_BIN or (skip_bands is not None and skip_bands[b]):
             continue
-        cliff_step = _cliff_fill_step(exp_indices, b, gain)
 
         zeros = [i for i in range(s, e) if q[i] == 0]
-        if not zeros:
+        factor = _nf_band_factor(len(zeros), e - s)
+        if factor == 0.0:
             continue
-
-        # Only the excess of zeros over nonzeros counts as evidence of a missing
-        # noise floor. Every zero bin is filled at that excess
-        z = len(zeros) / float(e - s)
-        excess = 2.0 * z - 1.0
-        if excess <= 0.0:
-            # less than 50% is zeros - skip NF, enough spectral information is present
-            continue
-
-        # All-zero bands land in the last bucket
-        zi = min(int(z * NF_OCCUPANCY_STEPS), NF_OCCUPANCY_STEPS - 1)
-        factor = NF_LAPLACE_RMS[zi] * excess
 
         for i in zeros:
             # xorshift
@@ -148,6 +146,6 @@ def noise_fill(X_hat, q, step, seed, exp_indices, gain, skip_bands=None):
             seed ^= (seed << 5) & 0xFFFFFFFF
 
             sign = -1.0 if (seed & 0x80000000) else 1.0
-            X_hat[i] = sign * factor * (step[i] if cliff_step is None else cliff_step)
+            X_hat[i] = sign * factor * step[i]
 
     return seed

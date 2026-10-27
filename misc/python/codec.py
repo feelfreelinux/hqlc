@@ -18,6 +18,7 @@ from .bitstream import (
     count_side_bits,
     decode_frame,
     encode_frame,
+    nf_kill_fill_s_bands,
 )
 from .constants import (
     BAND_EDGES,
@@ -41,9 +42,12 @@ from .quantizer import (
     GAIN_Q,
     GAIN_RC_MAX,
     NF_SEED_BIAS,
+    NF_SEED_CH,
+    NF_SEED_MUL,
     dequantize,
     dequantize_gain,
     exp_to_step_factor,
+    nf_kill_mask,
     noise_fill,
     quantize,
     quantize_gain,
@@ -58,7 +62,6 @@ RC_TRANSIENT_BOOST = 4
 def _pad_channels(channels):
     """Pad channel arrays for MDCT overlap."""
     N = FRAME_LEN
-    n_ch = len(channels)
     ns = min(len(ch) for ch in channels)
     pad_end = (N - ns % N) % N + N
     padded = []
@@ -73,7 +76,7 @@ def _pad_channels(channels):
 def _band_step_factors(exp_indices):
     """Flat per-band step factor per bin
 
-    Used on TNS frames and for the RC probe.
+    Used for the RC probe.
     The caller can get the actual step factor by dividing this by the global gain.
     """
     active = BAND_EDGES[-1]
@@ -85,7 +88,10 @@ def _band_step_factors(exp_indices):
 
 
 def _interp_bin_exp(exp_indices):
-    """Per-bin exponent indices, linearly interpolated between band centers"""
+    """Per-bin exponent indices, linearly interpolated between band centers.
+
+    Integer Q15 ramp like the C bin_exp_interp, so both pick the same steps
+    """
     active = BAND_EDGES[-1]
     centers = [(BAND_EDGES[b] + BAND_EDGES[b + 1] + 2) >> 1 for b in range(N_BANDS)]
     bin_exp = np.zeros(active, dtype=np.int32)
@@ -93,46 +99,48 @@ def _interp_bin_exp(exp_indices):
     bin_exp[:prev] = exp_indices[0]
     for b in range(N_BANDS - 1):
         nxt = centers[b + 1]
-        v0 = float(exp_indices[b])
-        dv = float(exp_indices[b + 1]) - v0
-        dist = float(nxt - prev)
+        v0 = int(exp_indices[b])
+        delta_q15 = (int(exp_indices[b + 1]) - v0) * ((1 << 15) // (nxt - prev))
+        acc = (v0 << 15) + (delta_q15 >> 1)
         for i in range(prev, nxt):
-            bin_exp[i] = int(math.floor(v0 + dv * (i - prev + 0.5) / dist + 0.5))
+            bin_exp[i] = (acc + (1 << 14)) >> 15
+            acc += delta_q15
         prev = nxt
     bin_exp[prev:active] = exp_indices[N_BANDS - 1]
     return bin_exp
 
 
-def _step_factors(exp_indices, tns_order):
-    """Returns the per-bin step factors for given exponent indices.
-    For transient / TNS frames, the factors are flat per-band.
-    For steady frames, we use the interpolated bin exponents."""
-    if tns_order == 0:
-        return exp_to_step_factor(_interp_bin_exp(exp_indices).astype(np.float64))
-    return _band_step_factors(exp_indices)
+def _step_factors(exp_indices):
+    """Per-bin step factors from the interpolated bin exponents."""
+    return exp_to_step_factor(_interp_bin_exp(exp_indices).astype(np.float64))
 
 
-def _envelope_quantize(Xs, envs, gain):
-    """Deadzone-quantize each channel, split the symbols into bands."""
-    inv_gain = 1.0 / gain
-    all_quants = []
+def _quantize_frame(Xs, exp_indices, gain, ms_flags):
+    """Deadzone-quantize each channel and derive its NF kill mask.
+
+    Returns (all_quants, nf_kill), the symbols split into bands per channel
+    """
+    all_quants, nf_kill = [], []
     for ch in range(len(Xs)):
-        q = quantize(Xs[ch], envs[ch] * inv_gain)
+        step = _step_factors(exp_indices[ch]) / gain
+        q = quantize(Xs[ch], step)
         all_quants.append(
             [q[BAND_EDGES[b] : BAND_EDGES[b + 1]].copy() for b in range(N_BANDS)]
         )
-    return all_quants
+        nf_kill.append(nf_kill_mask(Xs[ch], q, step))
+    nf_kill_fill_s_bands(nf_kill, ms_flags)
+    return all_quants, nf_kill
 
 
-def _dequant_and_fill(q, gain, env_dq, exp_indices, seed, active, skip_bands=None):
+def _dequant_and_fill(q, gain, env_dq, seed, active, skip_bands):
     """Dequantize, then fill the quantized-away noise floor back in.
 
-    skip_bands (bool per band) skips NF in given bands, use for S channel in M/S
+    skip_bands (bool per band) skips NF in given bands
     """
     step = env_dq / gain
     X_hat = np.zeros(N_BINS)
     X_hat[:active] = dequantize(q, step)
-    noise_fill(X_hat, q, step, seed, exp_indices, gain, skip_bands)
+    noise_fill(X_hat, q, step, seed, skip_bands)
     return X_hat
 
 
@@ -201,7 +209,7 @@ def _analyze_frame(padded, start, n_ch, tilt_db, detectors, tns_hang, ms_flags=N
         tns_orders.append(order)
         tns_q_ks.append(q_k)
 
-    exp_indices = [compute_exponents(Xs[ch], tilt_db, eligible[ch]) for ch in range(n_ch)]
+    exp_indices = [compute_exponents(Xs[ch], tilt_db) for ch in range(n_ch)]
 
     # Coarsen the flagged side-channel exponents
     if ms_flags is not None:
@@ -231,8 +239,7 @@ def encode(channels, gain):
             padded, start, n_ch, tilt_db, detectors, tns_hang, ms_flags
         )
 
-        envs = [_step_factors(exp_indices[ch], tns_orders[ch]) for ch in range(n_ch)]
-        all_quants = _envelope_quantize(Xs, envs, gain)
+        all_quants, nf_kill = _quantize_frame(Xs, exp_indices, gain, ms_flags)
 
         frame_bits, payload = encode_frame(
             gain,
@@ -240,7 +247,8 @@ def encode(channels, gain):
             tns_q_ks,
             exp_indices,
             all_quants,
-            ms_flags if use_ms else None,
+            nf_kill,
+            ms_flags,
         )
         payloads.append(payload)
         total_bits += frame_bits
@@ -259,31 +267,27 @@ def decode(payloads, n_channels, n_samples):
     use_ms = n_channels == 2
     for fi, payload in enumerate(payloads):
         start = fi * N
-        gain, tns_orders, tns_ks, exp_indices, all_quants, ms_flags = decode_frame(
-            payload, n_channels, use_ms
+        gain, tns_orders, tns_ks, exp_indices, all_quants, ms_flags, nf_kill = (
+            decode_frame(payload, n_channels, use_ms)
         )
 
         # dequant + nf + TNS synthesis per channel
         specs = []
         for ch in range(n_channels):
-            env_dq = _step_factors(exp_indices[ch], tns_orders[ch])
+            env_dq = _step_factors(exp_indices[ch])
 
             q_flat = np.zeros(active, dtype=np.int32)
             for b in range(N_BANDS):
                 s, e = BAND_EDGES[b], BAND_EDGES[b + 1]
                 q_flat[s:e] = all_quants[ch][b]
 
-            # Seed varies per frame and channel so the fill noise evolves
-            seed = (NF_SEED_BIAS ^ (fi * 0x9E37) ^ (ch * 0x51ED)) & 0xFFFFFFFF
-            X_hat = _dequant_and_fill(
-                q_flat,
-                gain,
-                env_dq,
-                exp_indices[ch],
-                seed,
-                active,
-                ms_flags if ch == 1 else None,  # Skip NF on flagged S bands
-            )
+            # Seeded from the frame's own envelope so decoding stays stateless
+            seed = (NF_SEED_BIAS ^ (ch * NF_SEED_CH)) & 0xFFFFFFFF
+            for ei in exp_indices[ch]:
+                seed = (seed * NF_SEED_MUL + int(ei)) & 0xFFFFFFFF
+            # Skip NF on killed bands and flagged S bands
+            skip = (nf_kill[ch] | ms_flags) if ch == 1 else nf_kill[ch]
+            X_hat = _dequant_and_fill(q_flat, gain, env_dq, seed, active, skip)
 
             if tns_orders[ch] > 0:
                 X_hat = lattice_iir(X_hat, tns_ks[ch])
@@ -395,8 +399,7 @@ def encode_rc(channels, bitrate):
                 )
 
         gain = dequantize_gain(chosen_code)
-        envs = [_step_factors(exp_indices[ch], tns_orders[ch]) for ch in range(n_ch)]
-        all_quants = _envelope_quantize(Xs, envs, gain)
+        all_quants, nf_kill = _quantize_frame(Xs, exp_indices, gain, ms_flags)
 
         frame_bits, payload = encode_frame(
             gain,
@@ -404,7 +407,8 @@ def encode_rc(channels, bitrate):
             tns_q_ks,
             exp_indices,
             all_quants,
-            ms_flags if use_ms else None,
+            nf_kill,
+            ms_flags,
         )
         payloads.append(payload)
         total_bits += frame_bits
@@ -416,10 +420,7 @@ def encode_rc(channels, bitrate):
             ema_gc += (chosen_code - ema_gc) / 16.0
         prev_gc = chosen_code
         # +24: rANS state flush, the envelope is estimated per candidate frame
-        prev_overhead_bits = (
-            count_side_bits(n_ch, tns_orders, tns_q_ks, ms_flags if use_ms else None)
-            + 24
-        )
+        prev_overhead_bits = count_side_bits(n_ch, tns_orders, ms_flags) + 24
 
     return payloads, total_bits, n_frames
 
@@ -442,7 +443,6 @@ def _wav_read(path):
 def _wav_write(path, channels, sample_rate):
     """Write channels as 16-bit PCM WAV."""
     n_ch = len(channels)
-    n_frames = len(channels[0])
     interleaved = np.column_stack(channels)
     pcm = np.clip(interleaved * 32768.0, -32768, 32767).astype(np.int16)
 
