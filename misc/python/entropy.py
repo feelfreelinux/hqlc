@@ -22,6 +22,7 @@ import math
 import numpy as np
 
 from .constants import BAND_EDGES, N_BANDS
+from .quantizer import NF_ATT_GAIN_MAX
 
 # rANS constants
 RANS_M = 1024
@@ -474,7 +475,7 @@ def exp_payload_bits(exp_indices, n_ch, ms_flags=None):
 
 # NF kill mask rANS model, mirrors src/entropy_tables.c. P(flag = 1) in RANS_M
 # 2 values per byte
-NF_FLAG_NCTX = 200
+NF_FLAG_NCTX = 400
 _NF_FLAG_LUT = [
     8, 15, 29, 53, 97, 170, 282, 430,
     594, 742, 854, 927, 971, 995, 1009, 1016,
@@ -490,13 +491,24 @@ _NF_FLAG_Q4 = [
     0xb8, 0x9a, 0x2a, 0x78, 0x88, 0x62, 0xa8, 0x3b, 0x87, 0xdc,
     0x73, 0xd9, 0x3e, 0xa7, 0xcc, 0x70, 0xa8, 0x0b, 0x94, 0xff,
     0x60, 0xb7, 0x1b, 0xa7, 0xec, 0x82, 0xea, 0x0e, 0xa7, 0xec,
+    0x87, 0x99, 0x5b, 0x77, 0x98, 0x63, 0x76, 0x19, 0x55, 0x95,
+    0x20, 0x32, 0x56, 0x87, 0xba, 0x73, 0xa8, 0x2b, 0x76, 0xba,
+    0x51, 0x97, 0x0b, 0x53, 0x97, 0x63, 0xa8, 0x2b, 0x86, 0xcb,
+    0x61, 0xa8, 0x0c, 0x75, 0xba, 0x40, 0x96, 0x4a, 0x87, 0xdb,
+    0x73, 0xb9, 0x2d, 0x86, 0xda, 0x51, 0xa8, 0x0c, 0x63, 0xa8,
+    0xcd, 0xcb, 0xbf, 0x99, 0xeb, 0xfb, 0xff, 0xbf, 0x9c, 0x99,
+    0x85, 0x73, 0x88, 0xa9, 0xcb, 0x87, 0xb9, 0x7e, 0x99, 0xed,
+    0x96, 0xcb, 0x4d, 0xf8, 0xfb, 0x75, 0x98, 0x4b, 0x87, 0xba,
+    0x75, 0xb8, 0x5c, 0x87, 0xab, 0x75, 0xc8, 0x2c, 0x54, 0x98,
+    0x42, 0xa5, 0x3b, 0x65, 0xfc, 0x52, 0xa8, 0x1d, 0x75, 0xdb,
 ]
 
 
-def nf_flag_ctx(band, dexp, survivors, flags_nearby):
+def nf_flag_ctx(band, dexp, survivors, flags_nearby, gain_code):
     """Kill flag context: envelope drop into the band x survivors x nearby flags.
 
-    dexp is exp[band] - exp[band - 1], survivors and flags_nearby are 0..4 each
+    dexp is exp[band] - exp[band - 1], survivors and flags_nearby are 0..4 each,
+    low rates (gain_code below NF_ATT_GAIN_MAX) have their own half of the table
     """
     if dexp <= -8:
         step = 0  # cliff, a lowpass or silence edge
@@ -508,12 +520,27 @@ def nf_flag_ctx(band, dexp, survivors, flags_nearby):
         step = 3  # flat or rising
     if band == N_BANDS - 1:
         step += 4  # the top band has its own four classes
+    if gain_code < NF_ATT_GAIN_MAX:
+        step += 8
     return (step * 5 + survivors) * 5 + flags_nearby
 
 
 def nf_flag_tables(ctx):
     """Return (freq, cf) of the binary kill flag model for a context."""
     f1 = _NF_FLAG_LUT[(_NF_FLAG_Q4[ctx >> 1] >> ((ctx & 1) * 4)) & 15]
+    return [RANS_M - f1, f1], [0, RANS_M - f1, RANS_M]
+
+
+# Attenuation bit model P(attenuated fill | killed band) in RANS_M
+NF_ATT_NCTX = 9
+_NF_ATT_FREQ = [
+    946, 981, 552, 862, 932, 336, 271, 723, 116,
+]
+
+
+def nf_att_tables(ctx):
+    """Return (freq, cf) of the attenuation bit model for a context."""
+    f1 = _NF_ATT_FREQ[ctx]
     return [RANS_M - f1, f1], [0, RANS_M - f1, RANS_M]
 
 

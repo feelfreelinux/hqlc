@@ -33,7 +33,6 @@ GAIN_RC_MAX = GAIN_BIAS + GAIN_Q * 6  # cap: gain = 64 (6 octaves above unity)
 NF_SEED_BIAS = 0x9E3779B9
 NF_SEED_CH = 0x51ED
 NF_SEED_MUL = 0x01000193  # 32-bit FNV prime
-NF_START_BIN = 75  # ~3.5 kHz, below this the holes are left alone
 
 
 def quantize_gain(gain):
@@ -83,11 +82,27 @@ def dequantize(q, step):
 # this rounded to Q8 (quant.c NF_LEVEL_Q8).
 NF_LEVEL = 0.22
 
-# First coarse band the NF kill mask is coded for (band 10 starts at NF_START_BIN)
+# First coarse band eligible for noise fill, ~2 kHz at low rates, ~3.5 kHz above
 NF_FIRST_BAND = 10
+NF_FIRST_BAND_LOW = 7
 
 # A zero bin overshoots when the fill is more than this many times its true magnitude
 NF_KILL_BIN_RATIO = 2
+
+# Per-band NF mode, transmitted from NF_FIRST_BAND up
+NF_FILL, NF_ATT, NF_OFF = 0, 1, 2
+
+# From this gain code up killed bands are never filled and the fill starts higher
+NF_ATT_GAIN_MAX = 49
+
+
+def nf_first_band(gain_code):
+    return NF_FIRST_BAND_LOW if gain_code < NF_ATT_GAIN_MAX else NF_FIRST_BAND
+
+# A killed band keeps an attenuated fill (-9 dB) when at least half of its zero bins
+# sit within this ratio of the estimate (roughly 15 dB)
+NF_ATT_BIN_RATIO = 6
+NF_ATT_LEVEL = 0.355
 
 
 def _nf_band_factor(nz, width):
@@ -100,42 +115,51 @@ def _nf_band_factor(nz, width):
     return NF_LEVEL * excess if excess > 0.0 else 0.0
 
 
-def nf_kill_mask(X, q, step):
+def nf_kill_mask(X, q, step, gain_code):
     """Encoder-side NF kill mask: bands where the decoder's fill would overshoot.
 
     Mirrors the decoder level estimate, a band is killed when more than half of its
-    zero bins would be filled above NF_KILL_BIN_RATIO x their true magnitude.
+    zero bins would be filled above NF_KILL_BIN_RATIO x their true magnitude. Below
+    NF_ATT_GAIN_MAX a killed band keeps an attenuated fill when at least half of its
+    zero bins are within NF_ATT_BIN_RATIO of the estimate.
     """
-    mask = np.zeros(N_BANDS, dtype=bool)
+    mask = np.zeros(N_BANDS, dtype=np.uint8)
     for b in range(N_BANDS):
         s, e = BAND_EDGES[b], BAND_EDGES[b + 1]
-        if s < NF_START_BIN:
+        if b < nf_first_band(gain_code):
             continue
         zeros = [i for i in range(s, e) if q[i] == 0]
         factor = _nf_band_factor(len(zeros), e - s)
         if factor == 0.0:
             continue
         overshoot = sum(1 for i in zeros if factor > NF_KILL_BIN_RATIO * abs(X[i]) / step[i])
-        mask[b] = 2 * overshoot > len(zeros)
+        if 2 * overshoot <= len(zeros):
+            continue
+        mask[b] = NF_OFF
+        if gain_code < NF_ATT_GAIN_MAX:
+            near = sum(1 for i in zeros if NF_ATT_BIN_RATIO * abs(X[i]) / step[i] > factor)
+            if 2 * near >= len(zeros):
+                mask[b] = NF_ATT
     return mask
 
 
-def noise_fill(X_hat, q, step, seed, skip_bands=None):
-    """Replace zeroed bins above NF_START_BIN with pseudorandom noise, in place.
+def noise_fill(X_hat, q, step, seed, gain_code, band_mode=None):
+    """Replace zeroed bins from nf_first_band(gain_code) up with pseudorandom noise, in place.
 
     The fill level comes from each band's zero occupancy (see _nf_band_factor).
 
-    skip_bands (bool per band) leaves bands as exact zeros, used for the M/S side
-    bands and the NF kill mask
+    band_mode (per band) leaves NF_OFF bands as exact zeros, used for the M/S side
+    bands and the NF kill mask, and attenuates NF_ATT bands
     """
     for b in range(N_BANDS):
         s, e = BAND_EDGES[b], BAND_EDGES[b + 1]
-        # NF_START_BIN sits on a band edge, so partial bands never occur
-        if s < NF_START_BIN or (skip_bands is not None and skip_bands[b]):
+        if b < nf_first_band(gain_code) or (band_mode is not None and band_mode[b] == NF_OFF):
             continue
 
         zeros = [i for i in range(s, e) if q[i] == 0]
         factor = _nf_band_factor(len(zeros), e - s)
+        if band_mode is not None and band_mode[b] == NF_ATT:
+            factor *= NF_ATT_LEVEL
         if factor == 0.0:
             continue
 

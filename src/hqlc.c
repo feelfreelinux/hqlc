@@ -24,8 +24,8 @@ hqlc_bench_ctx *hqlc_bench = NULL;
 
 #define GAIN_CODE_MAX ((1 << QUANT_GAIN_BITS) - 1)
 
-// The public fixed-mode gain is converted once at the encoder boundary. The
-// codec pipeline and bitstream use gain codes exclusively.
+// Convert from the float gain that users might provide
+// All the code further just uses gain codes and no floats
 static int gain_code_from_float(float gain) {
   float code = log2f(gain) * QUANT_GAIN_Q;
   int rounded = (int)(code >= 0.0f ? code + 0.5f : code - 0.5f);
@@ -494,21 +494,22 @@ hqlc_error hqlc_encode_frame(hqlc_encoder *enc,
   }
   HQLC_BENCH_END(HQLC_BENCH_ENC_QUANT_FWD);
 
-  // NF kill mask marks the bands that NF is disabled for
-  bool nf_mask[HQLC_MAX_CHANNELS][PSY_N_BANDS];
+  // NF kill mask marks the bands that NF is disabled or attenuated for
+  nf_mode nf_mask[HQLC_MAX_CHANNELS][PSY_N_BANDS];
   for (int ch = 0; ch < n_ch; ch++) {
-    noise_fill_refinement_mask(&spectra[ch],
-                               &quant[ch * HQLC_FRAME_SAMPLES],
-                               &exp_indices[ch * PSY_N_BANDS],
-                               gain_code,
-                               nf_mask[ch]);
+    noise_fill_calculate_mask(&spectra[ch],
+                              &quant[ch * HQLC_FRAME_SAMPLES],
+                              &exp_indices[ch * PSY_N_BANDS],
+                              gain_code,
+                              nf_mask[ch]);
   }
   // S bands are never noise filled, so the mask just takes a previous value
   // as this is the cheapest in the model
   if (n_ch == 2) {
-    for (int b = NF_FIRST_BAND; b < PSY_N_BANDS; b++) {
+    int first = nf_first_band(gain_code);
+    for (int b = first; b < PSY_N_BANDS; b++) {
       if (enc->ms_flags[b]) {
-        nf_mask[1][b] = (b > NF_FIRST_BAND) ? nf_mask[1][b - 1] : false;
+        nf_mask[1][b] = (b > first) ? nf_mask[1][b - 1] : NF_FILL;
       }
     }
   }
@@ -671,7 +672,7 @@ hqlc_error hqlc_decode_frame(hqlc_decoder *dec,
   }
 
   // NF kill mask and exponents are decoded from the rANS stream
-  bool nf_mask[HQLC_MAX_CHANNELS][PSY_N_BANDS];
+  nf_mode nf_mask[HQLC_MAX_CHANNELS][PSY_N_BANDS];
   memset(nf_mask, 0, sizeof(nf_mask));
 
   // Byte-align to find rANS stream start
@@ -725,11 +726,11 @@ hqlc_error hqlc_decode_frame(hqlc_decoder *dec,
     }
 
     // Skip flagged S bands (ch 1 of M/S) and nf kill masked bands
-    bool skip[PSY_N_BANDS];
+    nf_mode mode[PSY_N_BANDS];
     for (int b = 0; b < PSY_N_BANDS; b++) {
-      skip[b] = nf_mask[ch][b] || (ch == 1 && ms_flags[b]);
+      mode[b] = (ch == 1 && ms_flags[b]) ? NF_OFF : nf_mask[ch][b];
     }
-    noise_fill(ch_quant, ch_exp, gain_code, nf_seed, skip, spectrum);
+    noise_fill_apply(ch_quant, ch_exp, gain_code, nf_seed, mode, spectrum);
     HQLC_BENCH_END(HQLC_BENCH_DEC_NF);
 
     // TNS synthesis / inverse filter

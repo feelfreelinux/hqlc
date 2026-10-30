@@ -42,7 +42,7 @@ static const char *g_train_path = NULL;
 //
 // Header (16 bytes):
 //   [0..3]   magic "HQLC"
-//   [4]      version (7)
+//   [4]      version (8)
 //   [5]      channels (1 or 2)
 //   [6..7]   zero padding in the last audio frame (LE16, 0..511)
 //   [8..11]  sample_rate (LE32)
@@ -52,7 +52,7 @@ static const char *g_train_path = NULL;
 //   [0..1]   payload_len (LE16)
 //   [2..]    payload
 
-#define HQLC_FILE_VERSION  7
+#define HQLC_FILE_VERSION  8
 #define HQLC_FILE_HDR_SIZE 16
 
 // Buffered frames per block, 32 x 512 x 2ch x 2B = 64 KB
@@ -531,6 +531,30 @@ do_encode(const char *in, const char *out, hqlc_mode mode, uint32_t bitrate, flo
         }
       }
       fclose(th);
+      // NF flag and attenuation bit counts per context, two files next to it
+      char path[4096];
+      snprintf(path, sizeof(path), "%s.flag", g_train_path);
+      th = fopen(path, "w");
+      if (th) {
+        for (int c = 0; c < 400; c++) {
+          fprintf(th,
+                  "%llu %llu\n",
+                  (unsigned long long)rans_train_nf_flag_hist[c][0],
+                  (unsigned long long)rans_train_nf_flag_hist[c][1]);
+        }
+        fclose(th);
+      }
+      snprintf(path, sizeof(path), "%s.att", g_train_path);
+      th = fopen(path, "w");
+      if (th) {
+        for (int c = 0; c < 9; c++) {
+          fprintf(th,
+                  "%llu %llu\n",
+                  (unsigned long long)rans_train_nf_att_hist[c][0],
+                  (unsigned long long)rans_train_nf_att_hist[c][1]);
+        }
+        fclose(th);
+      }
     } else {
       fprintf(stderr, "warning: cannot write training histogram '%s'\n", g_train_path);
     }

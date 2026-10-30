@@ -4,6 +4,7 @@
 #include <string.h>
 
 #include "entropy.h"
+#include "quant.h"
 #include "entropy_tables.h"
 #include "hqlc.h"
 #include "psy.h"
@@ -112,11 +113,12 @@ void test_rans_highlevel_roundtrip(void) {
   quant[s10 + 3] = 100; // ESC + EG(0) overflow=85
 
   uint8_t out[4096];
-  size_t len = rans_encode_payload(quant, 1, gain_code, NULL, NULL, out, sizeof(out));
+  size_t len =
+      rans_encode_payload(quant, 1, gain_code, NULL, NULL, NULL, out, sizeof(out));
   TEST_ASSERT_GREATER_THAN(0, len);
 
   int16_t decoded[HQLC_FRAME_SAMPLES];
-  rans_decode_payload(out, len, decoded, 1, gain_code, NULL, NULL);
+  rans_decode_payload(out, len, decoded, 1, gain_code, NULL, NULL, NULL);
 
   for (int b = 0; b < PSY_N_BANDS; b++) {
     int s = psy_band_edges[b];
@@ -136,18 +138,19 @@ void test_rans_corrupt_input_safe(void) {
   }
 
   uint8_t buf[4096];
-  size_t len = rans_encode_payload(quant, 1, gain_code, NULL, NULL, buf, sizeof(buf));
+  size_t len =
+      rans_encode_payload(quant, 1, gain_code, NULL, NULL, NULL, buf, sizeof(buf));
   TEST_ASSERT_GREATER_THAN(4, len);
 
   int16_t decoded[HQLC_FRAME_SAMPLES];
 
   // Hard truncation: the decoder runs out of bytes and must report corruption.
-  TEST_ASSERT_FALSE(rans_decode_payload(buf, 3, decoded, 1, gain_code, NULL, NULL));
+  TEST_ASSERT_FALSE(rans_decode_payload(buf, 3, decoded, 1, gain_code, NULL, NULL, NULL));
 
   // Pure garbage at full length: must return without overreading or hanging.
   uint8_t junk[64];
   memset(junk, 0xA5, sizeof(junk));
-  (void)rans_decode_payload(junk, sizeof(junk), decoded, 1, gain_code, NULL, NULL);
+  (void)rans_decode_payload(junk, sizeof(junk), decoded, 1, gain_code, NULL, NULL, NULL);
 }
 
 void test_rans_exponent_roundtrip(void) {
@@ -165,15 +168,27 @@ void test_rans_exponent_roundtrip(void) {
     exp_in[PSY_N_BANDS + b] = exp_in[b] + ((b % 3) - 1) * (b == 9 ? 14 : 2);
     ms[b] = (b % 4) == 0;
   }
+  nf_mode nf_in[2 * PSY_N_BANDS], nf_out[2 * PSY_N_BANDS];
+  int first = nf_first_band(gain_code);
+  for (int i = 0; i < 2 * PSY_N_BANDS; i++) {
+    nf_in[i] = (i % PSY_N_BANDS) >= first ? (nf_mode)((i * 7) % 3) : NF_FILL;
+  }
+  for (int b = first; b < PSY_N_BANDS; b++) {
+    if (ms[b]) { // S bands are not coded, the encoder repeats the band below
+      nf_in[PSY_N_BANDS + b] = (b > first) ? nf_in[PSY_N_BANDS + b - 1] : NF_FILL;
+    }
+  }
   uint8_t out[8192];
-  size_t len = rans_encode_payload(quant, 2, gain_code, ms, exp_in, out, sizeof(out));
+  size_t len =
+      rans_encode_payload(quant, 2, gain_code, ms, exp_in, nf_in, out, sizeof(out));
   TEST_ASSERT_GREATER_THAN(0, len);
 
   int16_t decoded[2 * HQLC_FRAME_SAMPLES];
   TEST_ASSERT_TRUE(
-      rans_decode_payload(out, len, decoded, 2, gain_code, ms, exp_out));
+      rans_decode_payload(out, len, decoded, 2, gain_code, ms, exp_out, nf_out));
   for (int i = 0; i < 2 * PSY_N_BANDS; i++) {
     TEST_ASSERT_EQUAL_INT32(exp_in[i], exp_out[i]);
+    TEST_ASSERT_EQUAL(nf_in[i], nf_out[i]);
   }
   int active = psy_band_edges[PSY_N_BANDS];
   for (int ch = 0; ch < 2; ch++) {
@@ -194,6 +209,12 @@ void test_rans_freq_tables_normalized(void) {
       TEST_ASSERT_TRUE(rans_cf[t][s] <= rans_cf[t][s + 1]);
     }
     TEST_ASSERT_EQUAL_UINT32(RANS_M, rans_cf[t][RANS_MAX_SYM]);
+  }
+  for (int i = 0; i < 16; i++) {
+    TEST_ASSERT_TRUE(rans_nf_flag_lut[i] > 0 && rans_nf_flag_lut[i] < RANS_M);
+  }
+  for (int i = 0; i < RANS_NF_ATT_NCTX; i++) {
+    TEST_ASSERT_TRUE(rans_nf_att_freq[i] > 0 && rans_nf_att_freq[i] < RANS_M);
   }
 }
 

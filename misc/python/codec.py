@@ -43,6 +43,7 @@ from .quantizer import (
     GAIN_RC_MAX,
     NF_SEED_BIAS,
     NF_SEED_CH,
+    NF_OFF,
     NF_SEED_MUL,
     dequantize,
     dequantize_gain,
@@ -127,20 +128,20 @@ def _quantize_frame(Xs, exp_indices, gain, ms_flags):
         all_quants.append(
             [q[BAND_EDGES[b] : BAND_EDGES[b + 1]].copy() for b in range(N_BANDS)]
         )
-        nf_kill.append(nf_kill_mask(Xs[ch], q, step))
-    nf_kill_fill_s_bands(nf_kill, ms_flags)
+        nf_kill.append(nf_kill_mask(Xs[ch], q, step, quantize_gain(gain)))
+    nf_kill_fill_s_bands(nf_kill, ms_flags, quantize_gain(gain))
     return all_quants, nf_kill
 
 
-def _dequant_and_fill(q, gain, env_dq, seed, active, skip_bands):
+def _dequant_and_fill(q, gain, env_dq, seed, active, band_mode):
     """Dequantize, then fill the quantized-away noise floor back in.
 
-    skip_bands (bool per band) skips NF in given bands
+    band_mode (per band) skips or attenuates NF in given bands
     """
     step = env_dq / gain
     X_hat = np.zeros(N_BINS)
     X_hat[:active] = dequantize(q, step)
-    noise_fill(X_hat, q, step, seed, skip_bands)
+    noise_fill(X_hat, q, step, seed, quantize_gain(gain), band_mode)
     return X_hat
 
 
@@ -286,8 +287,8 @@ def decode(payloads, n_channels, n_samples):
             for ei in exp_indices[ch]:
                 seed = (seed * NF_SEED_MUL + int(ei)) & 0xFFFFFFFF
             # Skip NF on killed bands and flagged S bands
-            skip = (nf_kill[ch] | ms_flags) if ch == 1 else nf_kill[ch]
-            X_hat = _dequant_and_fill(q_flat, gain, env_dq, seed, active, skip)
+            mode = np.where(ms_flags, NF_OFF, nf_kill[ch]) if ch == 1 else nf_kill[ch]
+            X_hat = _dequant_and_fill(q_flat, gain, env_dq, seed, active, mode)
 
             if tns_orders[ch] > 0:
                 X_hat = lattice_iir(X_hat, tns_ks[ch])

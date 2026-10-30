@@ -1,17 +1,22 @@
 #include "quant.h"
 
+#include <limits.h>
+
 #include "fxp.h"
 #include "hqlc.h"
 #include "hqlc_bench.h"
 #include "psy.h"
 
-// Bin at which we start to trigger NF - roughly ~3.5kHz
-// Tuned empirically, but seems to match what other codecs do too
-#define NF_START_BIN 75
-
 // A zeroed bin counts as overfilled when the estimator overshoots its energy by this
 // ratio (equals to 6dB)
-#define NF_FLAG_BIN_RATIO 2
+#define NF_KILL_BIN_RATIO 2
+
+// A killed band keeps an attenuated fill when at least half of its zero bins sit
+// within this ratio of the estimate (~15dB)
+#define NF_ATT_BIN_RATIO 6
+
+// Attenuated fill level, -9dB
+#define NF_ATT_Q8 FXP_Q8(0.355)
 
 // Quantizer scale: step = 2^(E/8), E = 2*exp - gain_code - 59
 #define QUANT_EXP_OFFSET 59
@@ -119,7 +124,7 @@ void quant_forward(const bfp_i32 *spectrum,
     quant_scale scale = quant_forward_scale((int)be, gain_code, spectrum->exp2);
 
     if (scale.product_rshift >= 64) {
-      // Step too coarse: the whole run quantizes to zero
+      // Step too coarse, quantizes to all zeros
       for (; i < run_end; i++) {
         quant_bin(&quant_out[i], 0, 0);
       }
@@ -249,8 +254,7 @@ static uint32_t nf_band_factor_q8(int nz, int bincount) {
   return (uint32_t)fxp_mul_rshift_rnd_i32(NF_LEVEL_Q8, excess_q15, 15);
 }
 
-// Per-bin |X| in quantizer step units (Q8). quant_forward hoists this ladder
-// out of its hot loop per bin_exp run; this is the cold per-bin form
+// Per-bin |X| in quantizer step units (Q8)
 static int32_t quant_abs_scaled_q8(int32_t abs_spec, quant_scale scale) {
   if (scale.product_rshift >= 64) {
     return 0;
@@ -266,19 +270,19 @@ static int32_t quant_abs_scaled_q8(int32_t abs_spec, quant_scale scale) {
                             << (-scale.product_rshift));
 }
 
-void noise_fill_refinement_mask(const bfp_i32 *spectrum,
-                                const int16_t *quant,
-                                const int32_t *exp_indices,
-                                int gain_code,
-                                bool *mask) {
+void noise_fill_calculate_mask(const bfp_i32 *spectrum,
+                               const int16_t *quant,
+                               const int32_t *exp_indices,
+                               int gain_code,
+                               nf_mode *mask) {
   const int32_t *spec_q31 = spectrum->data;
   // Same per-bin exponents the decoder fill will use
   int32_t bin_exp[PSY_ACTIVE_BINS];
   bin_exp_interp(exp_indices, bin_exp);
 
   for (int b = 0; b < PSY_N_BANDS; b++) {
-    mask[b] = false;
-    if (psy_band_edges[b] < NF_START_BIN) {
+    mask[b] = NF_FILL;
+    if (b < nf_first_band(gain_code)) {
       continue;
     }
     int s = psy_band_edges[b];
@@ -313,24 +317,41 @@ void noise_fill_refinement_mask(const bfp_i32 *spectrum,
     int bins_overshoot = 0;
 
     // Count the amount of bins that have overshooted the energy by factor of
-    // NF_FLAG_BIN_RATIO
+    // NF_KILL_BIN_RATIO
     for (int i = 0; i < nz; i++) {
-      if ((int32_t)factor_q8 > NF_FLAG_BIN_RATIO * true_nf_factor_q8[i]) {
+      if ((int32_t)factor_q8 > NF_KILL_BIN_RATIO * true_nf_factor_q8[i]) {
         bins_overshoot++;
       }
     }
 
     // We skip the band when move than half the bins overshooted
-    mask[b] = 2 * bins_overshoot > nz;
+    if (2 * bins_overshoot <= nz) {
+      continue;
+    }
+    mask[b] = NF_OFF;
+
+    // At low rates the band is still filled, attenuated, when at least half of its
+    // zero bins are within NF_ATT_BIN_RATIO of the estimate
+    if (gain_code < NF_ATT_GAIN_MAX) {
+      int bins_near = 0;
+      for (int i = 0; i < nz; i++) {
+        if (NF_ATT_BIN_RATIO * true_nf_factor_q8[i] > (int32_t)factor_q8) {
+          bins_near++;
+        }
+      }
+      if (2 * bins_near >= nz) {
+        mask[b] = NF_ATT;
+      }
+    }
   }
 }
 
-void noise_fill(const int16_t *quant,
-                const int32_t *exp_indices,
-                int gain_code,
-                uint32_t seed,
-                const bool *skip_bands,
-                bfp_i32 *spectrum) {
+void noise_fill_apply(const int16_t *quant,
+                      const int32_t *exp_indices,
+                      int gain_code,
+                      uint32_t seed,
+                      const nf_mode *band_mode,
+                      bfp_i32 *spectrum) {
   int32_t *spec_q31 = spectrum->data;
   int32_t bin_exp[PSY_ACTIVE_BINS];
   bin_exp_interp(exp_indices, bin_exp);
@@ -338,10 +359,9 @@ void noise_fill(const int16_t *quant,
   // We derive the level from the zero occupancy in each band's quantized bins
   uint8_t factor_q8[PSY_N_BANDS] = {0};
   bool has_fill = false;
-  int max_fill_oct = -32767;
+  int max_fill_oct = INT_MIN;
   for (int b = 0; b < PSY_N_BANDS; b++) {
-    // NF_START_BIN sits on a band edge, so partial bands never occur
-    if (psy_band_edges[b] < NF_START_BIN || (skip_bands && skip_bands[b])) {
+    if (b < nf_first_band(gain_code) || (band_mode && band_mode[b] == NF_OFF)) {
       continue;
     }
     int s = psy_band_edges[b];
@@ -361,6 +381,9 @@ void noise_fill(const int16_t *quant,
     }
     // Every zero bin is filled at the band's occupancy-derived level
     factor_q8[b] = (uint8_t)nf_band_factor_q8(nz, e - s);
+    if (band_mode && band_mode[b] == NF_ATT) {
+      factor_q8[b] = (uint8_t)((factor_q8[b] * NF_ATT_Q8) >> 8);
+    }
     if (factor_q8[b] == 0) {
       continue;
     }

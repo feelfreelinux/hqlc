@@ -23,9 +23,11 @@ extern const uint16_t rans_exp_cf[RANS_EXP_NTABLES][RANS_EXP_NSLOTS + 1];
 extern const uint32_t rans_exp_rcp[RANS_EXP_NTABLES][RANS_EXP_NSLOTS];
 extern const int16_t rans_exp_cost_q8[RANS_EXP_NTABLES][RANS_EXP_NSLOTS];
 
-#define RANS_NF_FLAG_NCTX 200
+#define RANS_NF_FLAG_NCTX 400
+#define RANS_NF_ATT_NCTX  9
 
 extern const uint16_t rans_nf_flag_lut[16];
 extern const uint8_t rans_nf_flag_q4[RANS_NF_FLAG_NCTX / 2];
+extern const uint16_t rans_nf_att_freq[RANS_NF_ATT_NCTX];
 
 #endif // HQLC_ENTROPY_TABLES_H

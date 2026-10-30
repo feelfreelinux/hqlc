@@ -27,8 +27,23 @@ extern "C" {
 // See https://en.wikipedia.org/wiki/Fowler–Noll–Vo_hash_function
 #define NF_SEED_MUL  0x01000193u
 
-// First coarse band eligible for noise fill
-#define NF_FIRST_BAND 10
+// Per-band noise fill mode, transmitted from nf_first_band() up
+typedef enum {
+  NF_FILL = 0, // a cleared mask fills everywhere
+  NF_ATT,      // attenuated fill (used for lower bitrates)
+  NF_OFF,
+} nf_mode;
+
+// From this gain code up (around 90kbps) killed bands never get filled
+#define NF_ATT_GAIN_MAX 49
+
+// First coarse band eligible for noise fill, ~2 kHz at low rates, ~3.5 kHz above
+#define NF_FIRST_BAND     10
+#define NF_FIRST_BAND_LOW 7
+
+static inline int nf_first_band(int gain_code) {
+  return gain_code < NF_ATT_GAIN_MAX ? NF_FIRST_BAND_LOW : NF_FIRST_BAND;
+}
 
 /** Scaling needed to convert a BFP spectrum magnitude to quantizer Q8. */
 typedef struct {
@@ -73,7 +88,7 @@ void quant_inverse(const int16_t *quant_in,
                    bfp_i32 *spectrum);
 
 /**
- * @brief Transmitted NF refinement mask, used to skip NF where it overshoots
+ * @brief Transmitted NF kill mask, used to skip NF where it overshoots
  *
  * Encoder side, mirrors the decoder NF logic so the estimates match exactly
  *
@@ -81,13 +96,13 @@ void quant_inverse(const int16_t *quant_in,
  * @param quant Quantized coefficients
  * @param exp_indices Per-band exponent indices
  * @param gain_code Quantizer gain code
- * @param mask Destination, one flag per coarse band. Pre nf-band flags will stay false
+ * @param mask Destination, one NF mode per coarse band. Pre nf-band modes stay NF_FILL
  */
-void noise_fill_refinement_mask(const bfp_i32 *spectrum,
-                                const int16_t *quant,
-                                const int32_t *exp_indices,
-                                int gain_code,
-                                bool *mask);
+void noise_fill_calculate_mask(const bfp_i32 *spectrum,
+                               const int16_t *quant,
+                               const int32_t *exp_indices,
+                               int gain_code,
+                               nf_mode *mask);
 
 /**
  * @brief Reconstruct a sparse noise floor from decoded zero occupancy
@@ -96,16 +111,16 @@ void noise_fill_refinement_mask(const bfp_i32 *spectrum,
  * @param exp_indices Per-band exponent indices.
  * @param gain_code Quantizer gain code.
  * @param seed Seed for the noise generator.
- * @param skip_bands Optional per-band skip mask (flagged M/S side bands and the nf
- * kill mask)
+ * @param band_mode Optional per-band NF mode (NF_OFF for flagged M/S side bands and
+ * killed bands, NF_ATT for the attenuated fill)
  * @param spectrum Dequantized Q31 BFP spectrum to update.
  */
-void noise_fill(const int16_t *quant,
-                const int32_t *exp_indices,
-                int gain_code,
-                uint32_t seed,
-                const bool *skip_bands,
-                bfp_i32 *spectrum);
+void noise_fill_apply(const int16_t *quant,
+                      const int32_t *exp_indices,
+                      int gain_code,
+                      uint32_t seed,
+                      const nf_mode *band_mode,
+                      bfp_i32 *spectrum);
 
 #ifdef __cplusplus
 }

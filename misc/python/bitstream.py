@@ -12,7 +12,8 @@ rANS payload, one stream:
   coefficients, then the NF kill mask. Per channel the envelope is:
     Ch0: DPCM from the previous band
     Ch1+: [model flag: 1b] then either DPCM or the delta from ch0
-  The kill mask is one binary symbol per band (from NF_FIRST_BAND) and channel,
+  The kill mask is one binary symbol per band (from nf_first_band) and channel,
+  plus an attenuation bit after a set flag below NF_ATT_GAIN_MAX,
   context-coded on the decoded envelope and coefficients. Flagged S bands are
   never filled, so they are skipped and repeat the previous band's flag.
 
@@ -40,6 +41,7 @@ from .entropy import (
     exp_channel_cost_q8,
     get_rans_exp_tables,
     get_rans_tables,
+    nf_att_tables,
     nf_flag_ctx,
     nf_flag_tables,
     rans_exp_table_idx,
@@ -48,7 +50,16 @@ from .entropy import (
     write_binary_rle,
 )
 from .ms import MS_RANS_ALPHA_SHIFT
-from .quantizer import GAIN_BITS, NF_FIRST_BAND, dequantize_gain, quantize_gain
+from .quantizer import (
+    GAIN_BITS,
+    NF_ATT,
+    NF_ATT_GAIN_MAX,
+    NF_FILL,
+    NF_OFF,
+    dequantize_gain,
+    nf_first_band,
+    quantize_gain,
+)
 from .tns import TNS_K_BITS, TNS_LAR_MAX
 
 
@@ -176,18 +187,28 @@ def _nf_survivors(q_flat, band):
 
 def _nf_flags_nearby(nf_kill, ch, band):
     """Kill flags set in the two bands below (and the other channel's decoded ones)."""
-    n = int(nf_kill[ch][band - 1]) + int(nf_kill[ch][band - 2])
+    n = int(nf_kill[ch][band - 1] != NF_FILL) + int(nf_kill[ch][band - 2] != NF_FILL)
     if len(nf_kill) == 2:
         other = nf_kill[1 - ch]
-        n += int(other[band - 1]) + (int(other[band]) if ch == 1 else 0)
+        n += int(other[band - 1] != NF_FILL) + (int(other[band] != NF_FILL) if ch == 1 else 0)
     return n
 
 
-def _nf_kill_ctx(q_flats, exp_indices, nf_kill, ch, band):
+def _nf_att_ctx(nf_kill, ch, band):
+    """Attenuation bit context: mode of the band below and, for ch 1, of the other channel's band."""
+    other = int(nf_kill[0][band]) if ch == 1 else NF_FILL
+    return int(nf_kill[ch][band - 1]) * 3 + other
+
+
+def _nf_kill_ctx(q_flats, exp_indices, nf_kill, ch, band, gain_code):
     """Context of one kill flag, the same on both sides."""
     dexp = int(exp_indices[ch][band]) - int(exp_indices[ch][band - 1])
     return nf_flag_ctx(
-        band, dexp, _nf_survivors(q_flats[ch], band), _nf_flags_nearby(nf_kill, ch, band)
+        band,
+        dexp,
+        _nf_survivors(q_flats[ch], band),
+        _nf_flags_nearby(nf_kill, ch, band),
+        gain_code,
     )
 
 
@@ -195,13 +216,14 @@ def _is_s_band(ch, band, ms_flags):
     return ch == 1 and ms_flags is not None and ms_flags[band]
 
 
-def nf_kill_fill_s_bands(nf_kill, ms_flags):
+def nf_kill_fill_s_bands(nf_kill, ms_flags, gain_code):
     """S bands are never filled, so they repeat the previous band's flag, cheapest value under the model."""
     if ms_flags is None:
         return
-    for b in range(NF_FIRST_BAND, N_BANDS):
+    first = nf_first_band(gain_code)
+    for b in range(first, N_BANDS):
         if ms_flags[b]:
-            nf_kill[1][b] = nf_kill[1][b - 1] if b > NF_FIRST_BAND else False
+            nf_kill[1][b] = nf_kill[1][b - 1] if b > first else NF_FILL
 
 
 def encode_frame(
@@ -275,13 +297,17 @@ def encode_frame(
                     rans_enc.put(0 if int(v) > 0 else 1, _SIGN_FREQ, _SIGN_CF)
 
     # NF kill mask last, its contexts need the coefficients
-    for b in range(NF_FIRST_BAND, N_BANDS):
+    for b in range(nf_first_band(gain_code), N_BANDS):
         for ch in range(n_ch):
             if _is_s_band(ch, b, ms_flags):
                 continue
-            ctx = _nf_kill_ctx(q_flats, exp_indices, nf_kill, ch, b)
+            ctx = _nf_kill_ctx(q_flats, exp_indices, nf_kill, ch, b, gain_code)
             freq, cf = nf_flag_tables(ctx)
-            rans_enc.put(int(bool(nf_kill[ch][b])), freq, cf)
+            mode = int(nf_kill[ch][b])
+            rans_enc.put(int(mode != NF_FILL), freq, cf)
+            if mode != NF_FILL and gain_code < NF_ATT_GAIN_MAX:
+                freq, cf = nf_att_tables(_nf_att_ctx(nf_kill, ch, b))
+                rans_enc.put(int(mode == NF_ATT), freq, cf)
 
     payload = side_bytes + rans_enc.finish()
     return len(payload) * 8, payload
@@ -368,15 +394,20 @@ def decode_frame(payload, n_channels, has_ms=False):
             all_quants[ch].append(q)
 
     # NF kill mask, contexts mirror encode_frame
-    nf_kill = [np.zeros(N_BANDS, dtype=bool) for _ in range(n_channels)]
-    for b in range(NF_FIRST_BAND, N_BANDS):
+    nf_kill = [np.zeros(N_BANDS, dtype=np.uint8) for _ in range(n_channels)]
+    first = nf_first_band(gain_code)
+    for b in range(first, N_BANDS):
         for ch in range(n_channels):
             if _is_s_band(ch, b, ms_flags):
-                nf_kill[ch][b] = nf_kill[ch][b - 1] if b > NF_FIRST_BAND else False
+                nf_kill[ch][b] = nf_kill[ch][b - 1] if b > first else NF_FILL
                 continue
-            ctx = _nf_kill_ctx(q_flats, exp_indices, nf_kill, ch, b)
+            ctx = _nf_kill_ctx(q_flats, exp_indices, nf_kill, ch, b, gain_code)
             freq, cf = nf_flag_tables(ctx)
-            nf_kill[ch][b] = bool(rans_dec.get(freq, cf))
+            nf_kill[ch][b] = NF_OFF if rans_dec.get(freq, cf) else NF_FILL
+            if nf_kill[ch][b] == NF_OFF and gain_code < NF_ATT_GAIN_MAX:
+                freq, cf = nf_att_tables(_nf_att_ctx(nf_kill, ch, b))
+                if rans_dec.get(freq, cf):
+                    nf_kill[ch][b] = NF_ATT
 
     # Reconstruct reflection coefficients
     tns_ks = []
