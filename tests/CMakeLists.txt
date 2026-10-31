@@ -3,10 +3,11 @@ target_include_directories(unity PUBLIC ${CMAKE_SOURCE_DIR}/external/Unity/src)
 
 set(HQLC_TESTS
     test_roundtrip   # end-to-end encode/decode integration
-    test_mdct        # MDCT forward/inverse transform identity
-    test_entropy     # bitstream, Rice, zigzag, rANS roundtrip + table invariants
+    test_mdct        # MDCT forward/inverse transform
+    test_entropy     # bitstream, Rice, zigzag, rANS roundtrip
     test_quant       # quantizer scale decomposition
     test_tns         # TNS filtering and BFP exponent tracking
+    test_container   # .hqlc container, seeking, tags, damage recovery
 )
 
 foreach(TEST_NAME ${HQLC_TESTS})
@@ -21,3 +22,4 @@ foreach(TEST_NAME ${HQLC_TESTS})
 endforeach()
 
 target_include_directories(test_entropy PRIVATE ${CMAKE_SOURCE_DIR}/src)
+target_link_libraries(test_container PRIVATE hqlc_container)
