@@ -12,7 +12,6 @@ from .constants import (
     EXP_INDEX_BIAS,
     EXP_INDEX_MAX,
     EXP_INDEX_MIN,
-    FB_COARSE,
     FINE_BAND_EDGES,
     FINE_TILT_DB,
     N_ACTIVE_FINE,
@@ -35,101 +34,77 @@ def tilt_step(tilt_db):
     """Per-fine-band tilt increment, in exponent-index units.
 
     The tilt is spread evenly over the active fine bands, at DB_PER_EXP_INDEX
-    per exponent index. The C reference keeps the same step in EXP_Q7.
+    per exponent index, rounded to Q7 like the C psy_tilt_step_q7 (step = tilt_db * 1.81)
     """
-    return tilt_db / (N_ACTIVE_FINE * DB_PER_EXP_INDEX)
+    return round(tilt_db / (N_ACTIVE_FINE * DB_PER_EXP_INDEX) * 128) / 128
 
 
 _LOG_FLOOR = -400.0  # 2*log2 of an empty band: drives the exponent to the floor
 
 
-def compute_exponents(X, tilt_db=FINE_TILT_DB, transient=False):
+def fine_band_psd(X):
+    """Per-fine-band mean energy (PSD), 1-2-1 smoothed across bands with the edges
+    replicated (C psy_fine_band_psd + psy_fine_band_psd_smooth)"""
+    edges = FINE_BAND_EDGES
+    psd = [
+        float((X[edges[fb] : edges[fb + 1]] ** 2).sum())
+        / float(edges[fb + 1] - edges[fb])
+        for fb in range(N_ACTIVE_FINE)
+    ]
+
+    prev = psd[0]
+    for fb in range(N_ACTIVE_FINE):
+        nxt = psd[fb + 1] if fb + 1 < N_ACTIVE_FINE else psd[fb]
+        sm = (prev + 2.0 * psd[fb] + nxt) / 4.0
+        prev = psd[fb]
+        psd[fb] = sm
+    return psd
+
+
+def compute_exponents(X, tilt_db=FINE_TILT_DB):
     """Compute 20 coarse-band exponent indices from the MDCT spectrum.
 
-    For non-transient / steady frames, we use apply the 1-2-1 PSD smoothing, and do the "hat-basis" aggregation
-    (so the fine bands are used to better model the signal, this is the same idea behind interpolation in the quantizer)
-
-    Transient frames use a plain geometric mean for the coarse bands. This is due to the fact that transients are sharp by definition, we do not want to model it's finer structure, or smooth its attack.
+    See the C code for context
     """
     edges = FINE_BAND_EDGES
-
-    # Per-fine-band mean energy (PSD)
-    psd = [0.0] * N_ACTIVE_FINE
-    for fb in range(N_ACTIVE_FINE):
-        s, e = edges[fb], edges[fb + 1]
-        psd[fb] = float((X[s:e] ** 2).sum()) / float(e - s)
-
-    if not transient:
-        # 1-2-1 low-pass across fine-band PSDs (linear domain, edges replicated)
-        prev = psd[0]
-        for fb in range(N_ACTIVE_FINE):
-            nxt = psd[fb + 1] if fb + 1 < N_ACTIVE_FINE else psd[fb]
-            sm = (prev + 2.0 * psd[fb] + nxt) / 4.0
-            prev = psd[fb]
-            psd[fb] = sm
+    psd = fine_band_psd(X)
 
     # Tilt increment per fine band, in exponent-index units
     tilt_per_fb = tilt_step(tilt_db)
 
-    if not transient:
-        # Hat-basis: each fine band's tilted log-PSD is split between its two
-        # nearest coarse centers, weighted by distance. wl/ws accumulate the
-        # weighted log-sum and total weight per coarse band. exp = wl/ws.
-        centers = [(BAND_EDGES[b] + BAND_EDGES[b + 1] + 2) >> 1 for b in range(N_BANDS)]
-        wl = [0.0] * N_BANDS
-        ws = [0.0] * N_BANDS
-        tilt_acc = 0.0
-        k = 0
-        exp = np.zeros(N_BANDS, dtype=np.int32)
-        for fb in range(N_ACTIVE_FINE):
-            # psd==0 must go to the FLOOR, not lg=0 to match python
-            lg = (2.0 * math.log2(psd[fb]) if psd[fb] > 0.0 else _LOG_FLOOR) + tilt_acc
-            tilt_acc += tilt_per_fb
-            x = (edges[fb] + edges[fb + 1]) >> 1  # fine-band center bin
-            if x <= centers[0]:
-                wl[0] += lg
-                ws[0] += 1.0
-            elif x >= centers[-1]:
-                wl[-1] += lg
-                ws[-1] += 1.0
-            else:
-                while x >= centers[k + 1]:
-                    k += 1
-                t = (x - centers[k]) / float(centers[k + 1] - centers[k])
-                wl[k] += (1.0 - t) * lg
-                ws[k] += 1.0 - t
-                wl[k + 1] += t * lg
-                ws[k + 1] += t
-        for b in range(N_BANDS):
-            v = wl[b] / ws[b] if ws[b] > 0.0 else 0.0
-            exp[b] = int(
-                np.clip(
-                    math.floor(v + EXP_INDEX_BIAS + 0.5),
-                    EXP_INDEX_MIN,
-                    EXP_INDEX_MAX,
-                )
-            )
-        return exp
-
-    # Transient path - simple geometric mean per coarse band
-    log_sum = [0.0] * N_BANDS
-    cnt = [0] * N_BANDS
+    # each fine band's tilted log-PSD is split between its two earest coarse centers, weighted by distance.
+    centers = [(BAND_EDGES[b] + BAND_EDGES[b + 1] + 2) >> 1 for b in range(N_BANDS)]
+    wl = [0.0] * N_BANDS
+    ws = [0.0] * N_BANDS
     tilt_acc = 0.0
-    for fb in range(N_ACTIVE_FINE):
-        b = FB_COARSE[fb]
-        log_idx = 2.0 * math.log2(psd[fb]) if psd[fb] > 0.0 else _LOG_FLOOR
-        log_sum[b] += log_idx + tilt_acc
-        cnt[b] += 1
-        tilt_acc += tilt_per_fb
-
+    k = 0
     exp = np.zeros(N_BANDS, dtype=np.int32)
+    for fb in range(N_ACTIVE_FINE):
+        # psd==0 must go to the FLOOR, not lg=0 to match python
+        lg = (2.0 * math.log2(psd[fb]) if psd[fb] > 0.0 else _LOG_FLOOR) + tilt_acc
+        tilt_acc += tilt_per_fb
+        x = (edges[fb] + edges[fb + 1]) >> 1  # fine-band center bin
+        if x <= centers[0]:
+            wl[0] += lg
+            ws[0] += 1.0
+        elif x >= centers[-1]:
+            wl[-1] += lg
+            ws[-1] += 1.0
+        else:
+            while x >= centers[k + 1]:
+                k += 1
+            t = (x - centers[k]) / float(centers[k + 1] - centers[k])
+            wl[k] += (1.0 - t) * lg
+            ws[k] += 1.0 - t
+            wl[k + 1] += t * lg
+            ws[k + 1] += t
     for b in range(N_BANDS):
-        if cnt[b] > 0:
-            exp[b] = int(
-                np.clip(
-                    math.floor(log_sum[b] / cnt[b] + EXP_INDEX_BIAS + 0.5),
-                    EXP_INDEX_MIN,
-                    EXP_INDEX_MAX,
-                )
+        v = wl[b] / ws[b] if ws[b] > 0.0 else 0.0
+        exp[b] = int(
+            np.clip(
+                math.floor(v + EXP_INDEX_BIAS + 0.5),
+                EXP_INDEX_MIN,
+                EXP_INDEX_MAX,
             )
+        )
     return exp

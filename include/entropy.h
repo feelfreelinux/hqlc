@@ -5,20 +5,22 @@
 #include <stddef.h>
 #include <stdint.h>
 
+#include "quant.h"
+
 #ifdef __cplusplus
 extern "C" {
 #endif
 
 // M=1024 (10-bit), provides enough precision without blowing up the LUTs
-#define RANS_M       1024
-#define RANS_M_BITS  10
-#define RANS_L       (1u << 16)
-#define RANS_MAX_SYM 16 // 0-14 magnitudes + 15 ESC
+#define RANS_M           1024
+#define RANS_M_BITS      10
+#define RANS_L           (1u << 16)
+#define RANS_MAX_SYM     16 // 0-14 magnitudes + 15 ESC
 #define RANS_COEF_NPAIRS 10
 
-// rANS probability tables: 12 alpha x 4 activity = 48 tables
-#define RANS_ALPHA_NBINS 12
-#define RANS_ACT_NBINS   4
+// rANS probability tables 12 alpha x 4 activity = 48 tables
+#define RANS_ALPHA_NBINS  12
+#define RANS_ACT_NBINS    4
 #define RANS_COEF_NTABLES (RANS_ALPHA_NBINS * RANS_ACT_NBINS)
 
 // Trained alpha-bin range, Q8
@@ -378,14 +380,14 @@ int rans_activity_bin(const int16_t *quant, int band);
  *
  * This is shared by rate control and the rANS encoder's mode selection.
  */
-int rans_exp_payload_cost_q8(const int32_t *exp_indices,
-                             int n_ch,
-                             const bool *ms_flags);
+int rans_exp_payload_cost_q8(const int32_t *exp_indices, int n_ch, const bool *ms_flags);
 
 #ifdef HQLC_TRAIN_TABLES
 // Accumulates magnitude-symbol counts by final rANS table index
 // Used for training static entropy tables
 extern uint64_t rans_train_hist[RANS_COEF_NTABLES][RANS_MAX_SYM];
+extern uint64_t rans_train_nf_flag_hist[400][2];
+extern uint64_t rans_train_nf_att_hist[9][2];
 extern int rans_train_enabled;
 void rans_train_reset(void);
 #endif
@@ -398,6 +400,9 @@ void rans_train_reset(void);
  * @param gain_code Quantizer gain code
  * @param ms_flags Per-band M/S flags (null or zero for dual mono)
  * @param exp_indices Pointer to the exponent envelope, needs to be of size PSY_N_BANDS
+ * @param nf_mask Per-channel noise-fill mode [n_ch][PSY_N_BANDS] (NF_FILL / NF_ATT /
+ *                NF_OFF), or null. Bands below nf_first_band() are not coded
+ * @param header_crc Header CRC value, used as initial rANS state
  * @param out Output buffer.
  * @param out_cap Output buffer capacity in bytes.
  * @return Number of encoded bytes written.
@@ -407,6 +412,8 @@ size_t rans_encode_payload(const int16_t *quant,
                            int gain_code,
                            const bool *ms_flags,
                            const int32_t *exp_indices,
+                           const nf_mode *nf_mask,
+                           uint8_t header_crc,
                            uint8_t *out,
                            size_t out_cap);
 
@@ -419,7 +426,11 @@ size_t rans_encode_payload(const int16_t *quant,
  * @param n_ch Number of channels.
  * @param gain_code Quantizer gain code.
  * @param ms_flags Per-band M/S flags (null or zero for dual mono)
- * @param exp_indices pointer to an array where exponents will be decoded too. Needs to be of size PSY_N_BANDS
+ * @param exp_indices pointer to an array where exponents will be decoded too. Needs to be
+ * of size PSY_N_BANDS
+ * @param nf_mask Destination for the noise-fill mode [n_ch][PSY_N_BANDS],
+ *                or null. Bands below nf_first_band() are set to NF_FILL.
+ * @param header_crc Receives the header CRC stored in the initial rANS state
  * @return True on success, or false if the stream is corrupt or truncated.
  */
 bool rans_decode_payload(const uint8_t *data,
@@ -428,7 +439,9 @@ bool rans_decode_payload(const uint8_t *data,
                          int n_ch,
                          int gain_code,
                          const bool *ms_flags,
-                         int32_t *exp_indices);
+                         int32_t *exp_indices,
+                         nf_mode *nf_mask,
+                         uint32_t *header_crc);
 
 #ifdef __cplusplus
 }

@@ -1,7 +1,5 @@
 """Per-band M/S stereo coding, implements the same logic as ms.c"""
 
-import math
-
 from .constants import BAND_EDGES, EXP_INDEX_MAX, N_BANDS
 
 # include/ms.h constants
@@ -9,9 +7,10 @@ MS_BIAS_GAP = 2
 MS_BIAS_CAP = 6
 MS_RANS_ALPHA_SHIFT = 2
 
-# Gate thresholds in dB (C uses side/mid energy ratios 1/4 and 13/32).
-MS_GATE_ENTER_DB = -6.0
-MS_GATE_RESET_DB = -4.0
+# Gate thresholds as side/mid energy ratios
+# enter 1/4 (-6.02 dB), reset 13/32 (-3.91 dB)
+MS_GATE_ENTER = 1.0 / 4.0
+MS_GATE_RESET = 13.0 / 32.0
 
 
 def ms_gate(XL, XR, ms_flags):
@@ -30,12 +29,10 @@ def ms_gate(XL, XR, ms_flags):
 
         if mid_e == 0.0:
             ms_flags[b] = False
-        else:
-            ratio_db = 10.0 * math.log10((side_e + 1e-20) / mid_e)
-            if ratio_db < MS_GATE_ENTER_DB:
-                ms_flags[b] = True
-            elif ratio_db > MS_GATE_RESET_DB:
-                ms_flags[b] = False
+        elif side_e < MS_GATE_ENTER * mid_e:
+            ms_flags[b] = True
+        elif side_e > MS_GATE_RESET * mid_e:
+            ms_flags[b] = False
 
         any_ms = any_ms or ms_flags[b]
     return any_ms

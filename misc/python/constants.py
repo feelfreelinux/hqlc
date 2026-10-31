@@ -99,19 +99,6 @@ N_ACTIVE_FINE = N_FINE_BANDS - 1
 FINE_TILT_DB = 35.0
 
 
-# Precomputed fine band to coarse mapping
-_FINE_CENTERS = [
-    (FINE_BAND_EDGES[i] + FINE_BAND_EDGES[i + 1]) / 2.0 for i in range(N_FINE_BANDS)
-]
-FB_COARSE = []
-for _fc in _FINE_CENTERS:
-    for _b in range(N_BANDS):
-        if BAND_EDGES[_b] <= _fc < BAND_EDGES[_b + 1]:
-            FB_COARSE.append(_b)
-            break
-    else:
-        FB_COARSE.append(N_BANDS - 1)
-
 # Exponent value is a log-domain energy descriptor, used to scale the quantizer accordingly
 # step = 2^((idx - BIAS) / 4)
 EXP_INDEX_BIAS = 43

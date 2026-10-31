@@ -123,6 +123,94 @@ static inline uint8_t rans_dec_sym(hqlc_rans_dec *dec, const uint16_t *cf) {
   return (uint8_t)s;
 }
 
+// Select context of the nf kill flags for a band
+// @param band actual exponent index
+// @param dexp difference from the last exponent (used for the drop calculation)
+// @param survivors surviving bins in the current band
+// @param flags_nearby
+// @param gain_code low rates (below NF_ATT_GAIN_MAX) have their own half of the table
+static inline int
+nf_flag_ctx(int band, int32_t dexp, int survivors, int flags_nearby, int gain_code) {
+  // Envelope drop into the band, in 1.5 dB exponent steps
+  int step;
+
+  if (dexp <= -8) {
+    step = 0; // cliff, a lowpass or silence edge
+  } else if (dexp <= -4) {
+    step = 1; // mild drop
+  } else if (dexp <= -1) {
+    step = 2; // any drop
+  } else {
+    step = 3; // flat or rising
+  }
+
+  if (band == PSY_N_BANDS - 1) {
+    step += 4; // the top band has its own four classes
+  }
+  if (gain_code < NF_ATT_GAIN_MAX) {
+    step += 8; // different table for lower rates
+  }
+  // survivors and flags_nearby are 0..4 each
+  return (step * 5 + survivors) * 5 + flags_nearby;
+}
+
+// Frequency of a set flag in RANS_M units, from the packed 4-bit table
+static inline uint16_t nf_flag_freq(int ctx) {
+  return rans_nf_flag_lut[(rans_nf_flag_q4[ctx >> 1] >> ((ctx & 1) * 4)) & 15];
+}
+
+// Nonzero coefficients in the band, up to four
+static inline int nf_band_survivors(const int16_t *ch_q, int band) {
+  int nonzero = 0;
+  for (int i = psy_band_edges[band]; i < psy_band_edges[band + 1] && nonzero < 4; i++) {
+    nonzero += (ch_q[i] != 0);
+  }
+  return nonzero;
+}
+
+// Returns the count of nf flag set nearby (n-2 both channels) max 4
+// This is used as the nf flag context is dependent on whether closeby bands have been
+// vetoed
+static inline int nf_flags_nearby(const nf_mode *nf_mask, int n_ch, int ch, int band) {
+  const nf_mode *own = &nf_mask[ch * PSY_N_BANDS];
+  int sum = (own[band - 1] != NF_FILL) + (own[band - 2] != NF_FILL);
+  if (n_ch == 2) {
+    const nf_mode *other = &nf_mask[(1 - ch) * PSY_N_BANDS];
+    sum += (other[band - 1] != NF_FILL) + (ch == 1 ? other[band] != NF_FILL : 0);
+  }
+  return sum;
+}
+
+// Context for the NF attenuation bit
+static inline int nf_att_ctx(const nf_mode *nf_mask, int ch, int band) {
+  int other = (ch == 1) ? nf_mask[band] : NF_FILL; // For CH1 just use the other channel's
+  return nf_mask[ch * PSY_N_BANDS + band - 1] * 3 + other; // mode of the band below
+}
+
+// Binary symbol, freq_set = frequency of a 1 in RANS_M units
+static inline void rans_enc_bit(hqlc_rans_enc *enc, uint16_t freq_set, bool value) {
+  uint16_t freq_clear = (uint16_t)(RANS_M - freq_set);
+  uint16_t freq = value ? freq_set : freq_clear;
+  rans_enc_sym(enc, freq, 0xFFFFFFFFu / freq, value ? freq_clear : 0);
+}
+
+// Decode a single bit from state
+static inline bool rans_dec_bit(hqlc_rans_dec *dec, uint16_t freq_set) {
+  uint32_t state = dec->state;
+  uint32_t slot = state & (RANS_M - 1);
+  uint32_t freq_clear = RANS_M - freq_set;
+  bool bit = slot >= freq_clear;
+  uint32_t f = bit ? freq_set : freq_clear;
+  dec->state = f * (state >> RANS_M_BITS) + slot - (bit ? freq_clear : 0);
+  if (dec->state < RANS_L) {
+    dec->state = (dec->state << 8) | rans_dec_byte(dec);
+    if (dec->state < RANS_L) {
+      dec->state = (dec->state << 8) | rans_dec_byte(dec);
+    }
+  }
+  return bit;
+}
+
 static inline int rans_exp_table_index(rans_exp_model model, int band) {
   return (int)model * 4 + rans_exp_group[band];
 }
@@ -314,10 +402,14 @@ void br_read_binary_rle(hqlc_bitreader *r, bool *flags, int n_flags, int rice_k)
 #ifdef HQLC_TRAIN_TABLES
 // Optional rANS training histogram, used to adjust the entropy tables
 uint64_t rans_train_hist[RANS_COEF_NTABLES][RANS_MAX_SYM];
+uint64_t rans_train_nf_flag_hist[RANS_NF_FLAG_NCTX][2];
+uint64_t rans_train_nf_att_hist[RANS_NF_ATT_NCTX][2];
 int rans_train_enabled = 0;
 
 void rans_train_reset(void) {
   memset(rans_train_hist, 0, sizeof(rans_train_hist));
+  memset(rans_train_nf_flag_hist, 0, sizeof(rans_train_nf_flag_hist));
+  memset(rans_train_nf_att_hist, 0, sizeof(rans_train_nf_att_hist));
   rans_train_enabled = 1;
 }
 
@@ -327,9 +419,27 @@ void rans_train_reset(void) {
       rans_train_hist[(tidx)][(sym)]++; \
     }                                   \
   } while (0)
+#define RANS_TRAIN_FLAG(ctx, bit)              \
+  do {                                         \
+    if (rans_train_enabled) {                  \
+      rans_train_nf_flag_hist[(ctx)][(bit)]++; \
+    }                                          \
+  } while (0)
+#define RANS_TRAIN_ATT(ctx, bit)              \
+  do {                                        \
+    if (rans_train_enabled) {                 \
+      rans_train_nf_att_hist[(ctx)][(bit)]++; \
+    }                                         \
+  } while (0)
 #else
 #define RANS_TRAIN_COUNT(tidx, sym) \
   do {                              \
+  } while (0)
+#define RANS_TRAIN_FLAG(ctx, bit) \
+  do {                            \
+  } while (0)
+#define RANS_TRAIN_ATT(ctx, bit) \
+  do {                           \
   } while (0)
 #endif
 
@@ -412,10 +522,44 @@ size_t rans_encode_payload(const int16_t *quant,
                            int gain_code,
                            const bool *ms_flags,
                            const int32_t *exp_indices,
+                           const nf_mode *nf_mask,
+                           uint8_t header_crc,
                            uint8_t *out,
                            size_t out_cap) {
   hqlc_rans_enc enc;
   rans_enc_init(&enc, out, out_cap);
+  enc.state += header_crc; // the decoder ends on this state
+
+  // Noise-fill flags go in first so decoder reads it last
+  // While the coefficients (and the bands survivors) are known
+  // This is needed for picking the right context
+  if (nf_mask) {
+    int first = nf_first_band(gain_code);
+    for (int b = PSY_N_BANDS - 1; b >= first; b--) {
+      for (int ch = n_ch - 1; ch >= 0; ch--) {
+        if (ch == 1 && ms_flags && ms_flags[b]) {
+          continue; // S band, never filled, not coded
+        }
+        const int32_t *ex = exp_indices ? &exp_indices[ch * PSY_N_BANDS] : NULL;
+        int survivors = nf_band_survivors(&quant[ch * HQLC_FRAME_SAMPLES], b);
+        int ctx = nf_flag_ctx(b,
+                              ex ? ex[b] - ex[b - 1] : 0,
+                              survivors,
+                              nf_flags_nearby(nf_mask, n_ch, ch, b),
+                              gain_code);
+        nf_mode mode = nf_mask[ch * PSY_N_BANDS + b];
+        // The attenuation bit is after the set flag, hence code it in reverse
+        // This only applies for lower rates
+        if (mode != NF_FILL && gain_code < NF_ATT_GAIN_MAX) {
+          int att_ctx = nf_att_ctx(nf_mask, ch, b);
+          RANS_TRAIN_ATT(att_ctx, mode == NF_ATT);
+          rans_enc_bit(&enc, rans_nf_att_freq[att_ctx], mode == NF_ATT);
+        }
+        RANS_TRAIN_FLAG(ctx, mode != NF_FILL);
+        rans_enc_bit(&enc, nf_flag_freq(ctx), mode != NF_FILL);
+      }
+    }
+  }
 
   // rANS encodes in reverse order, the decoder reads forward
   for (int ch = n_ch - 1; ch >= 0; ch--) {
@@ -519,9 +663,15 @@ bool rans_decode_payload(const uint8_t *data,
                          int n_ch,
                          int gain_code,
                          const bool *ms_flags,
-                         int32_t *exp_indices) {
+                         int32_t *exp_indices,
+                         nf_mode *nf_mask,
+                         uint32_t *header_crc) {
+  *header_crc = 0;
   if (len == 0) {
     memset(quant_out, 0, (size_t)n_ch * HQLC_FRAME_SAMPLES * sizeof(int16_t));
+    if (nf_mask) {
+      memset(nf_mask, 0, (size_t)n_ch * PSY_N_BANDS * sizeof(nf_mode));
+    }
     return true;
   }
 
@@ -611,5 +761,39 @@ bool rans_decode_payload(const uint8_t *data,
     }
   }
 
+  // Noise-fill flags, contexts mirror the rans encode payload
+  if (nf_mask) {
+    memset(nf_mask, 0, (size_t)n_ch * PSY_N_BANDS * sizeof(nf_mode));
+    int first = nf_first_band(gain_code);
+    for (int b = first; b < PSY_N_BANDS; b++) {
+      for (int ch = 0; ch < n_ch; ch++) {
+        nf_mode *mask = &nf_mask[ch * PSY_N_BANDS];
+        if (ch == 1 && ms_flags && ms_flags[b]) {
+          // S band, never filled, not coded
+          mask[b] = (b > first) ? mask[b - 1] : NF_FILL;
+          continue;
+        }
+        const int32_t *ex = exp_indices ? &exp_indices[ch * PSY_N_BANDS] : NULL;
+        int survivors = nf_band_survivors(&quant_out[ch * HQLC_FRAME_SAMPLES], b);
+        int ctx = nf_flag_ctx(b,
+                              ex ? ex[b] - ex[b - 1] : 0,
+                              survivors,
+                              nf_flags_nearby(nf_mask, n_ch, ch, b),
+                              gain_code);
+        if (!rans_dec_bit(&dec, nf_flag_freq(ctx))) {
+          continue; // stays NF_FILL
+        }
+        mask[b] = NF_OFF;
+        if (gain_code < NF_ATT_GAIN_MAX) {
+          int att_ctx = nf_att_ctx(nf_mask, ch, b);
+          if (rans_dec_bit(&dec, rans_nf_att_freq[att_ctx])) {
+            mask[b] = NF_ATT;
+          }
+        }
+      }
+    }
+  }
+
+  *header_crc = dec.state - RANS_L; // the decoder ends on the encoder's initial state
   return !dec.overrun;
 }

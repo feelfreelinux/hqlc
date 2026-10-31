@@ -217,6 +217,61 @@ void test_decode_corrupt_frames(void) {
   free(dec_scratch);
 }
 
+void test_decode_detects_header_damage(void) {
+  // The header CRC in the rANS state must catch every single-bit error in the
+  // first byte, which is always side info
+  const int n_frames = 4;
+  const int n_samples = n_frames * HQLC_FRAME_SAMPLES;
+
+  int16_t *pcm_orig = (int16_t *)calloc((size_t)n_samples * 2, sizeof(int16_t));
+  gen_sine_pcm16(pcm_orig, n_samples, 2, 700.0f, 0.4f);
+
+  hqlc_encoder *enc = (hqlc_encoder *)calloc(1, hqlc_encoder_size());
+  hqlc_decoder *dec = (hqlc_decoder *)calloc(1, hqlc_decoder_size());
+  hqlc_encoder_config cfg = {
+      .channels = 2, .sample_rate = HQLC_SAMPLE_RATE, .mode = HQLC_MODE_RC};
+  cfg.bitrate = 96000;
+  hqlc_encoder_init(enc, &cfg);
+  hqlc_decoder_init(dec, 2, HQLC_SAMPLE_RATE);
+  void *enc_scratch = calloc(1, hqlc_encoder_scratch_size());
+  void *dec_scratch = calloc(1, hqlc_decoder_scratch_size());
+
+  uint8_t compressed[HQLC_MAX_FRAME_BYTES];
+  int16_t pcm_dec[HQLC_FRAME_SAMPLES * 2];
+
+  for (int f = 0; f < n_frames; f++) {
+    const uint8_t *fp = (const uint8_t *)&pcm_orig[f * HQLC_FRAME_SAMPLES * 2];
+    size_t comp_len = 0;
+    TEST_ASSERT_EQUAL(HQLC_OK,
+                      hqlc_encode_frame(enc,
+                                        fp,
+                                        HQLC_PCM16,
+                                        compressed,
+                                        HQLC_MAX_FRAME_BYTES,
+                                        &comp_len,
+                                        enc_scratch));
+    TEST_ASSERT_EQUAL(
+        HQLC_OK,
+        hqlc_decode_frame(
+            dec, compressed, comp_len, (uint8_t *)pcm_dec, HQLC_PCM16, dec_scratch));
+
+    for (int bit = 0; bit < 8; bit++) {
+      compressed[0] ^= (uint8_t)(1u << bit);
+      TEST_ASSERT_EQUAL(
+          HQLC_ERR_BITSTREAM_CORRUPT,
+          hqlc_decode_frame(
+              dec, compressed, comp_len, (uint8_t *)pcm_dec, HQLC_PCM16, dec_scratch));
+      compressed[0] ^= (uint8_t)(1u << bit);
+    }
+  }
+
+  free(pcm_orig);
+  free(enc);
+  free(dec);
+  free(enc_scratch);
+  free(dec_scratch);
+}
+
 void test_roundtrip_rc_mode(void) {
   const int n_frames = 10;
   const int n_samples = n_frames * HQLC_FRAME_SAMPLES;
@@ -245,5 +300,6 @@ int main(void) {
   RUN_TEST(test_roundtrip_silence);
   RUN_TEST(test_roundtrip_rc_mode);
   RUN_TEST(test_decode_corrupt_frames);
+  RUN_TEST(test_decode_detects_header_damage);
   return UNITY_END();
 }

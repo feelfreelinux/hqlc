@@ -17,6 +17,9 @@ extern "C" {
 // Upper bound on compressed frame size
 #define HQLC_MAX_FRAME_BYTES 2048
 
+// Bitstream version, carried by containers so decoders can reject newer streams
+#define HQLC_BITSTREAM_VERSION 1
+
 // Error code enumeration
 typedef enum {
   HQLC_OK = 0,                   /**< Success */
