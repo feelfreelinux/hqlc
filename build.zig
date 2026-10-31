@@ -2,10 +2,9 @@
 const std = @import("std");
 
 const c_sources = [_][]const u8{
-    "src/hqlc.c",           "src/mdct.c",           "src/mdct_tables.c",
-    "src/ms.c",             "src/psy.c",            "src/quant.c",
-    "src/entropy.c",        "src/entropy_tables.c", "src/tns.c",
-    "src/hqlc_cli.c",
+    "src/hqlc.c",           "src/hqlc_container.c", "src/mdct.c",     "src/mdct_tables.c",
+    "src/ms.c",             "src/psy.c",            "src/quant.c",    "src/entropy.c",
+    "src/entropy_tables.c", "src/tns.c",            "src/hqlc_cli.c",
 };
 
 const c_flags = [_][]const u8{ "-std=c11", "-DNDEBUG" };

@@ -23,6 +23,10 @@ add_library(hqlc STATIC
 
 target_include_directories(hqlc PUBLIC include)
 
+# .hqlc container, independent of the codec itself
+add_library(hqlc_container STATIC src/hqlc_container.c)
+target_include_directories(hqlc_container PUBLIC include)
+
 # Enables the unit tests from tests/ folder
 option(HQLC_TESTS "Build Unity unit tests" OFF)
 
