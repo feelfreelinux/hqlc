@@ -2,12 +2,18 @@
 const std = @import("std");
 
 const c_sources = [_][]const u8{
-    "src/hqlc.c",           "src/hqlc_container.c", "src/mdct.c",     "src/mdct_tables.c",
-    "src/ms.c",             "src/psy.c",            "src/quant.c",    "src/entropy.c",
-    "src/entropy_tables.c", "src/tns.c",            "src/hqlc_cli.c",
+    "src/hqlc.c",           "src/mdct.c",           "src/mdct_tables.c",
+    "src/ms.c",             "src/psy.c",            "src/quant.c",
+    "src/entropy.c",        "src/entropy_tables.c", "src/tns.c",
+    "src/hqlc_container.c", "src/cli/main.c",       "src/cli/audio_in.c",
+    "src/cli/wav_out.c",    "src/cli/ape_tags.c",   "src/cli/file_reader.c",
+    "src/cli/platform.c",   "external/speex/resample.c",
 };
 
-const c_flags = [_][]const u8{ "-std=c11", "-DNDEBUG" };
+const c_flags = [_][]const u8{
+    "-std=c11",           "-DNDEBUG",
+    "-DOUTSIDE_SPEEX",    "-DFLOATING_POINT", "-DRANDOM_PREFIX=hqlc",
+};
 
 const ReleaseTarget = struct {
     name: []const u8,
@@ -53,6 +59,9 @@ fn makeExe(
     mod.addCSourceFiles(.{ .files = &c_sources, .flags = &c_flags });
     mod.addIncludePath(b.path("include"));
     mod.addIncludePath(b.path("external"));
+    mod.addIncludePath(b.path("external/speex"));
+
+    if (target.result.os.tag == .windows) mod.linkSystemLibrary("shell32", .{});
 
     const exe = b.addExecutable(.{ .name = "hqlc", .root_module = mod });
     if (static) exe.linkage = .static;

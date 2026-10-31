@@ -46,8 +46,21 @@ if (HQLC_TESTS)
 endif()
 
 if (HQLC_TOOLS)
-    add_executable(hqlc_cli src/hqlc_cli.c)
+    add_executable(hqlc_cli
+        src/cli/main.c
+        src/cli/audio_in.c
+        src/cli/wav_out.c
+        src/cli/ape_tags.c
+        src/cli/file_reader.c
+        src/cli/platform.c
+    )
     set_target_properties(hqlc_cli PROPERTIES OUTPUT_NAME hqlc)
     target_include_directories(hqlc_cli PRIVATE external)
-    target_link_libraries(hqlc_cli PRIVATE hqlc m)
+    target_link_libraries(hqlc_cli PRIVATE hqlc_container hqlc m)
+    target_sources(hqlc_cli PRIVATE external/speex/resample.c)
+    target_include_directories(hqlc_cli PRIVATE external/speex)
+    target_compile_definitions(hqlc_cli PRIVATE OUTSIDE_SPEEX FLOATING_POINT RANDOM_PREFIX=hqlc)
+    if (WIN32)
+        target_link_libraries(hqlc_cli PRIVATE shell32)
+    endif()
 endif()

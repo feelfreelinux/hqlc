@@ -3762,7 +3762,8 @@ DRWAV_PRIVATE drwav_bool32 drwav_init__internal(drwav* pWav, drwav_chunk_proc on
     going to have to calculate the size by reading and discarding bytes, and then seeking back. We
     cannot do this in sequential mode. We just assume that the rest of the file is audio data.
     */
-    if (dataChunkSize == 0xFFFFFFFF && (pWav->container == drwav_container_riff || pWav->container == drwav_container_rifx) && pWav->isSequentialWrite == DRWAV_FALSE) {
+    /* HQLC FIX skipped in sequential mode too, which cannot seek back (piped WAVs from ffmpeg). TODO: maybe upstream? */
+    if (dataChunkSize == 0xFFFFFFFF && (pWav->container == drwav_container_riff || pWav->container == drwav_container_rifx) && pWav->isSequentialWrite == DRWAV_FALSE && !sequential) {
         dataChunkSize = 0;
 
         for (;;) {
@@ -6405,7 +6406,7 @@ DRWAV_PRIVATE drwav_uint64 drwav_read_pcm_frames_s16__msadpcm(drwav* pWav, drwav
                     newSample0  = drwav_clamp(newSample0, -32768, 32767);
 
                     pWav->msadpcm.delta[0] = (drwav_int32)drwav_clamp(((drwav_int64)adaptationTable[((nibbles & 0xF0) >> 4)] * pWav->msadpcm.delta[0]) >> 8, 16, 0x7FFFFFFF);
- 
+
                     pWav->msadpcm.prevFrames[0][0] = pWav->msadpcm.prevFrames[0][1];
                     pWav->msadpcm.prevFrames[0][1] = newSample0;
 

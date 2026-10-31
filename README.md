@@ -19,16 +19,24 @@ mkdir build && cd build
 cmake .. -DHQLC_TOOLS=ON -DCMAKE_BUILD_TYPE=Release -GNinja && ninja
 ```
 
-This produces `hqlc`, the CLI tool:
+This produces `hqlc`, the CLI encoder / decoder tool.
 
 ```
-hqlc input.wav output.wav -b 96000         # roundtrip at 96 kbps (for ABX testing)
-hqlc -e input.wav output.hqlc -b 128000    # encode to bitstream
-hqlc -d output.hqlc decoded.wav            # decode bitstream to WAV
-ffmpeg -i in.flac -f wav - | hqlc - out.wav  # pipe from ffmpeg
+hqlc input.wav output.wav -b 96000             # roundtrip / encode and decode at 96kbps
+hqlc -e input.flac output.hqlc -b 128000       # encode from FLAC
+hqlc -e input.wav output.hqlc -t Title="..."   # encoe from WAV, adding apev2 tags
+hqlc -d output.hqlc decoded.wav [-s 12.5]      # decode, optionally from 12.5 s
+hqlc -i output.hqlc                            # print stream info and tags
+ffmpeg -i in.m4a -ar 48000 -f wav - | hqlc -e - out.hqlc  # pipe from ffmpeg
 ```
 
-The public API is in [`include/hqlc.h`](include/hqlc.h) and should be self-explanatory. See [`src/hqlc_cli.c`](src/hqlc_cli.c) for a complete usage example. For ESP-IDF integration, there's a sample component and linker script in `misc/esp-benchmark/hqlc`.
+The cli tool handles resampling from other sample rates automatically, using speex resampler.
+
+The `.hqlc` container spec is described in [`HQLC_CONTAINER.md`](HQLC_CONTAINER.md).
+
+The codec API is in [`include/hqlc.h`](include/hqlc.h) and should be self-explanatory. The container optional, included as s a separate library, [`include/hqlc_container.h`](include/hqlc_container.h). 
+
+For ESP-IDF integration, there's a sample component and linker script in `misc/esp-benchmark/hqlc`.
 
 ## Python reference
 
