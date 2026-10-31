@@ -156,15 +156,27 @@ hqlc_error hqlc_encoder_init(hqlc_encoder *enc, const hqlc_encoder_config *cfg) 
   return HQLC_OK;
 }
 
-// Cost (Q8 bits) of the EG(0) escape for magnitudes past the rANS alphabet:
-// (nbits+1) unary + nbits binary, matching rans_encode_payload
+// Calculates the CRC-8 of a given buffer, used in the rANS initial state as frame header
+// crc Poly 0x07
+static uint8_t calculate_crc8(const uint8_t *data, size_t len) {
+  uint8_t crc = 0;
+  for (size_t i = 0; i < len; i++) {
+    crc ^= data[i];
+    for (int bit = 0; bit < 8; bit++) {
+      crc = (uint8_t)((crc & 0x80) ? (crc << 1) ^ 0x07 : crc << 1);
+    }
+  }
+  return crc;
+}
+
+// Calculates the cost of the EG0 / overflow symbols in the rANS state
 static inline int32_t eg0_overflow_cost_q8(int q) {
   int bit_count = 2 * rans_eg0_nbits(q - (RANS_MAX_SYM - 1)) + 1;
   return fxp_rescale_i32(bit_count, 0, 8);
 }
 
-// Estimate the rANS payload cost (bits) at a candidate gain_code without quantizing. Uses
-// flat per-band steps, as the interp quantizer does not affect the cost too much.
+// Estimate gain_code without quantizing,
+// Uses flat per-band steps, as the interp quantizer does not affect the cost too much.
 static int probe_frame_bits(const bfp_i32 *spectra,
                             const int32_t *exp_indices,
                             int gain_code,
@@ -259,15 +271,14 @@ static int probe_frame_bits(const bfp_i32 *spectra,
     HQLC_BENCH_END(HQLC_BENCH_ENC_RC_QUANT);
   }
 
-  // Exponents share the rANS payload with coefficients; estimate their cost
-  // for this frame rather than carrying the previous frame's estimate.
+  // Estimate the exponent cost
   total_q8 += rans_exp_payload_cost_q8(exp_indices, n_ch, ms_flags);
 
   return fxp_rescale_i32(total_q8, 8, 0);
 }
 
 // Estimate how many gain-code steps to adjust, based on the ratio of
-// target bits to probed bits. Returns a signed delta in gain-code units.
+// target bits to probed bits, erturns a delta for the signed code
 static int estimate_gain_delta(int effective_target, int probed_bits) {
   uint32_t t_clamped = (uint32_t)(effective_target > 0 ? effective_target : 1);
   uint32_t b_clamped = (uint32_t)(probed_bits > 0 ? probed_bits : 1);
@@ -544,6 +555,8 @@ hqlc_error hqlc_encode_frame(hqlc_encoder *enc,
   // Exponents and the NF kill mask mask are rANS-coded inside the coefficient stream
   bw_flush(&bw);
   size_t side_bytes = bw_bytes(&bw);
+  uint8_t header_crc = calculate_crc8(out, side_bytes);
+
   HQLC_BENCH_END(HQLC_BENCH_ENC_SIDE_INFO);
 
   // rANS encode coefficients (+ exponents in the same stream)
@@ -554,6 +567,7 @@ hqlc_error hqlc_encode_frame(hqlc_encoder *enc,
                                         (n_ch == 2) ? enc->ms_flags : NULL,
                                         exp_indices,
                                         &nf_mask[0][0],
+                                        header_crc,
                                         rans_tmp,
                                         HQLC_MAX_FRAME_BYTES);
   HQLC_BENCH_END(HQLC_BENCH_ENC_RANS_ENC);
@@ -580,7 +594,7 @@ hqlc_error hqlc_encode_frame(hqlc_encoder *enc,
       enc->ema_gain_q8 += (gain_code_q8 - enc->ema_gain_q8) >> 4;
     }
     enc->prev_gain_code = gain_code;
-    // +24: rANS state flush; exponent cost is estimated per candidate frame
+    // +24 for exponent state flush
     enc->prev_overhead_bits = (int)(side_bytes * 8) + 24;
   }
 
@@ -648,8 +662,8 @@ hqlc_error hqlc_decode_frame(hqlc_decoder *dec,
     br_read_binary_rle(&br, ms_flags, PSY_N_BANDS, 1); // Rice k=1
   }
 
-  // TNS per channel. A valid stream never codes order > TNS_MAX_ORDER or
-  // LAR code 15 (q = 8) reject instead of overrunning the tns_info arrays.
+  // Code TNS flags per channel - bit for active, then if active
+  // the order and LAR coeffs go in
   tns_info tns[HQLC_MAX_CHANNELS];
   for (int ch = 0; ch < n_ch; ch++) {
     tns[ch].order = 0;
@@ -657,6 +671,7 @@ hqlc_error hqlc_decode_frame(hqlc_decoder *dec,
     if (active) {
       int order = (int)br_read(&br, 3) + 1;
       if (order > TNS_MAX_ORDER) {
+        // Real straem never codes TNS over the max order
         return HQLC_ERR_BITSTREAM_CORRUPT;
       }
       tns[ch].order = order;
@@ -689,14 +704,18 @@ hqlc_error hqlc_decode_frame(hqlc_decoder *dec,
 
   memset(quant_buf, 0, (size_t)n_ch * HQLC_FRAME_SAMPLES * sizeof(int16_t));
 
-  if (rans_len == 0 || !rans_decode_payload(rans_data,
-                                            rans_len,
-                                            quant_buf,
-                                            n_ch,
-                                            gain_code,
-                                            (n_ch == 2) ? ms_flags : NULL,
-                                            exp_indices,
-                                            &nf_mask[0][0])) {
+  uint32_t header_crc;
+  if (rans_len == 0 ||
+      !rans_decode_payload(rans_data,
+                           rans_len,
+                           quant_buf,
+                           n_ch,
+                           gain_code,
+                           (n_ch == 2) ? ms_flags : NULL,
+                           exp_indices,
+                           &nf_mask[0][0],
+                           &header_crc) ||
+      header_crc != calculate_crc8(payload, rans_start)) {
     return HQLC_ERR_BITSTREAM_CORRUPT;
   }
   HQLC_BENCH_END(HQLC_BENCH_DEC_ENTROPY);

@@ -523,10 +523,12 @@ size_t rans_encode_payload(const int16_t *quant,
                            const bool *ms_flags,
                            const int32_t *exp_indices,
                            const nf_mode *nf_mask,
+                           uint8_t header_crc,
                            uint8_t *out,
                            size_t out_cap) {
   hqlc_rans_enc enc;
   rans_enc_init(&enc, out, out_cap);
+  enc.state += header_crc; // the decoder ends on this state
 
   // Noise-fill flags go in first so decoder reads it last
   // While the coefficients (and the bands survivors) are known
@@ -662,7 +664,9 @@ bool rans_decode_payload(const uint8_t *data,
                          int gain_code,
                          const bool *ms_flags,
                          int32_t *exp_indices,
-                         nf_mode *nf_mask) {
+                         nf_mode *nf_mask,
+                         uint32_t *header_crc) {
+  *header_crc = 0;
   if (len == 0) {
     memset(quant_out, 0, (size_t)n_ch * HQLC_FRAME_SAMPLES * sizeof(int16_t));
     if (nf_mask) {
@@ -790,5 +794,6 @@ bool rans_decode_payload(const uint8_t *data,
     }
   }
 
+  *header_crc = dec.state - RANS_L; // the decoder ends on the encoder's initial state
   return !dec.overrun;
 }

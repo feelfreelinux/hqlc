@@ -114,11 +114,12 @@ void test_rans_highlevel_roundtrip(void) {
 
   uint8_t out[4096];
   size_t len =
-      rans_encode_payload(quant, 1, gain_code, NULL, NULL, NULL, out, sizeof(out));
+      rans_encode_payload(quant, 1, gain_code, NULL, NULL, NULL, 0, out, sizeof(out));
   TEST_ASSERT_GREATER_THAN(0, len);
 
   int16_t decoded[HQLC_FRAME_SAMPLES];
-  rans_decode_payload(out, len, decoded, 1, gain_code, NULL, NULL, NULL);
+  uint32_t header_crc;
+  rans_decode_payload(out, len, decoded, 1, gain_code, NULL, NULL, NULL, &header_crc);
 
   for (int b = 0; b < PSY_N_BANDS; b++) {
     int s = psy_band_edges[b];
@@ -139,18 +140,25 @@ void test_rans_corrupt_input_safe(void) {
 
   uint8_t buf[4096];
   size_t len =
-      rans_encode_payload(quant, 1, gain_code, NULL, NULL, NULL, buf, sizeof(buf));
+      rans_encode_payload(quant, 1, gain_code, NULL, NULL, NULL, 0, buf, sizeof(buf));
   TEST_ASSERT_GREATER_THAN(4, len);
 
   int16_t decoded[HQLC_FRAME_SAMPLES];
+  uint32_t header_crc;
 
-  // Hard truncation: the decoder runs out of bytes and must report corruption.
-  TEST_ASSERT_FALSE(rans_decode_payload(buf, 3, decoded, 1, gain_code, NULL, NULL, NULL));
+  // Decoder runs out of bytes, should report error on truncation
+  TEST_ASSERT_FALSE(rans_decode_payload(buf, 3, decoded, 1, gain_code, NULL, NULL, NULL, &header_crc));
+
+  // The decoder returns the value stored in the initial state
+  len = rans_encode_payload(quant, 1, gain_code, NULL, NULL, NULL, 0x5A, buf, sizeof(buf));
+  TEST_ASSERT_TRUE(
+      rans_decode_payload(buf, len, decoded, 1, gain_code, NULL, NULL, NULL, &header_crc));
+  TEST_ASSERT_EQUAL_UINT32(0x5A, header_crc);
 
   // Pure garbage at full length: must return without overreading or hanging.
   uint8_t junk[64];
   memset(junk, 0xA5, sizeof(junk));
-  (void)rans_decode_payload(junk, sizeof(junk), decoded, 1, gain_code, NULL, NULL, NULL);
+  (void)rans_decode_payload(junk, sizeof(junk), decoded, 1, gain_code, NULL, NULL, NULL, &header_crc);
 }
 
 void test_rans_exponent_roundtrip(void) {
@@ -180,12 +188,13 @@ void test_rans_exponent_roundtrip(void) {
   }
   uint8_t out[8192];
   size_t len =
-      rans_encode_payload(quant, 2, gain_code, ms, exp_in, nf_in, out, sizeof(out));
+      rans_encode_payload(quant, 2, gain_code, ms, exp_in, nf_in, 0, out, sizeof(out));
   TEST_ASSERT_GREATER_THAN(0, len);
 
   int16_t decoded[2 * HQLC_FRAME_SAMPLES];
+  uint32_t header_crc;
   TEST_ASSERT_TRUE(
-      rans_decode_payload(out, len, decoded, 2, gain_code, ms, exp_out, nf_out));
+      rans_decode_payload(out, len, decoded, 2, gain_code, ms, exp_out, nf_out, &header_crc));
   for (int i = 0; i < 2 * PSY_N_BANDS; i++) {
     TEST_ASSERT_EQUAL_INT32(exp_in[i], exp_out[i]);
     TEST_ASSERT_EQUAL(nf_in[i], nf_out[i]);
