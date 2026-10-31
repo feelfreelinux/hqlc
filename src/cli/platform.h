@@ -53,4 +53,16 @@ bool platform_is_file(FILE *file, int64_t *size);
  */
 int platform_seek(FILE *file, int64_t offset);
 
+/**
+ * @brief Expand * and ? wildcards in the last component of a path
+ *
+ * A path without wildcards comes back as its own single match
+ *
+ * @param pattern UTF-8 path, possibly with wildcards.
+ * @param paths Receives a malloc'd array of malloc'd paths, free both.
+ * @param count Receives the number of paths, 0 when nothing matched.
+ * @return 0 on success, -1 on failure.
+ */
+int platform_glob(const char *pattern, char ***paths, size_t *count);
+
 #endif /* HQLC_CLI_PLATFORM_H */

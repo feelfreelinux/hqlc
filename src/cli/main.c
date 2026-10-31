@@ -37,8 +37,9 @@ typedef struct {
   float start_seconds;    // decode start
   const char *train_path; // rANS histogram output, with HQLC_TRAIN_TABLES
   ape_tag_list tags;
-  const char *in_path;
-  const char *out_path;
+  char **inputs; // expanded input paths, owned
+  size_t input_count;
+  const char *out_path; // NULL derives one per input
 } options;
 
 // fwrite with a status return
@@ -295,7 +296,7 @@ static int decoder_close(decoder *dec) {
   return 0;
 }
 
-static int handle_encode(const options *opts) {
+static int handle_encode(const options *opts, const char *in_path, const char *out_path) {
   audio_in input;
   encoder enc = {0};
   // Allocate the container handler
@@ -304,11 +305,11 @@ static int handle_encode(const options *opts) {
   uint8_t out[HQLC_CONTAINER_MAX_WRITE_BYTES];
   uint8_t frame[HQLC_MAX_FRAME_BYTES];
   size_t len, size;
-  if (audio_in_open(&input, opts->in_path) != 0) {
+  if (audio_in_open(&input, in_path) != 0) {
     return 1;
   }
   train_begin(opts);
-  FILE *file = platform_open(opts->out_path, true);
+  FILE *file = platform_open(out_path, true);
   bool ok =
       file && writer && encoder_open(&enc, &input, opts) == 0 &&
       hqlc_container_writer_init(writer, (uint8_t)input.info.channels, PRE_SKIP, out) ==
@@ -334,13 +335,10 @@ static int handle_encode(const options *opts) {
   ok = ok && fflush(file) == 0;
   if (ok) {
     train_end(opts);
-    print_stats(opts->in_path,
-                opts->out_path,
-                enc.samples_read,
-                enc.bytes_encoded,
-                input.info.channels);
+    print_stats(
+        in_path, out_path, enc.samples_read, enc.bytes_encoded, input.info.channels);
   } else {
-    fprintf(stderr, "error: cannot encode '%s' to '%s'\n", opts->in_path, opts->out_path);
+    fprintf(stderr, "error: cannot encode '%s' to '%s'\n", in_path, out_path);
   }
   platform_close(file);
   free(writer);
@@ -350,18 +348,19 @@ static int handle_encode(const options *opts) {
 }
 
 // Decodes each frame as it is encoded, trimmed like the container reader would
-static int handle_roundtrip(const options *opts) {
+static int
+handle_roundtrip(const options *opts, const char *in_path, const char *out_path) {
   audio_in input;
   encoder enc = {0};
   decoder dec = {0};
   uint8_t frame[HQLC_MAX_FRAME_BYTES];
   size_t len, skip, keep;
-  if (audio_in_open(&input, opts->in_path) != 0) {
+  if (audio_in_open(&input, in_path) != 0) {
     return 1;
   }
   bool ok = encoder_open(&enc, &input, opts) == 0;
   ok = ok && decoder_open(&dec,
-                          opts->out_path,
+                          out_path,
                           input.info.channels,
                           opts->out_bits,
                           input.info.total_frames) == 0;
@@ -373,11 +372,8 @@ static int handle_roundtrip(const options *opts) {
   ok = ok && status == 0;
   ok = decoder_close(&dec) == 0 && ok;
   if (ok) {
-    print_stats(opts->in_path,
-                opts->out_path,
-                enc.samples_read,
-                enc.bytes_encoded,
-                input.info.channels);
+    print_stats(
+        in_path, out_path, enc.samples_read, enc.bytes_encoded, input.info.channels);
   }
   encoder_close(&enc);
   audio_in_close(&input);
@@ -434,11 +430,11 @@ open_stream(hqlc_container_reader *reader, file_reader *file, const char *path) 
 }
 
 // Decodes an hqlc file to a given format
-static int handle_decode(const options *opts) {
+static int handle_decode(const options *opts, const char *in_path, const char *out_path) {
   file_reader file;
   hqlc_container_reader *reader =
       (hqlc_container_reader *)malloc(hqlc_container_reader_size());
-  if (open_stream(reader, &file, opts->in_path) != 0) {
+  if (open_stream(reader, &file, in_path) != 0) {
     free(reader);
     return 1;
   }
@@ -449,7 +445,7 @@ static int handle_decode(const options *opts) {
   if (start) {
     ok = hqlc_container_seek(reader, start) == HQLC_CONTAINER_OK;
     if (!ok) {
-      fprintf(stderr, "error: '%s' is not seekable\n", opts->in_path);
+      fprintf(stderr, "error: '%s' is not seekable\n", in_path);
     }
     if (frames != HQLC_CONTAINER_UNKNOWN_SAMPLES) {
       if (start < frames) {
@@ -461,8 +457,7 @@ static int handle_decode(const options *opts) {
   }
 
   decoder dec = {0};
-  ok = ok &&
-       decoder_open(&dec, opts->out_path, info->channels, opts->out_bits, frames) == 0;
+  ok = ok && decoder_open(&dec, out_path, info->channels, opts->out_bits, frames) == 0;
   uint8_t frame[HQLC_MAX_FRAME_BYTES];
   hqlc_container_frame frame_info;
   hqlc_container_error status = HQLC_CONTAINER_OK;
@@ -486,19 +481,18 @@ static int handle_decode(const options *opts) {
     ok = result >= 0;
   }
   if (ok && status != HQLC_CONTAINER_END) {
-    fprintf(stderr, "error: read error in '%s'\n", opts->in_path);
+    fprintf(stderr, "error: read error in '%s'\n", in_path);
     ok = false;
   }
   ok = decoder_close(&dec) == 0 && ok;
   if (damaged) {
     fprintf(stderr,
             "warning: '%s' is damaged, skipped %llu bad spots\n",
-            opts->in_path,
+            in_path,
             (unsigned long long)damaged);
   }
   if (ok) {
-    print_stats(
-        opts->in_path, opts->out_path, dec.wav.frames_written, bytes, info->channels);
+    print_stats(in_path, out_path, dec.wav.frames_written, bytes, info->channels);
   }
   file_reader_close(&file);
   free(reader);
@@ -506,17 +500,17 @@ static int handle_decode(const options *opts) {
 }
 
 // Print info about the file, including ape tags
-static int handle_info(const options *opts) {
+static int handle_info(const char *in_path) {
   file_reader file;
   hqlc_container_reader *reader =
       (hqlc_container_reader *)malloc(hqlc_container_reader_size());
-  if (open_stream(reader, &file, opts->in_path) != 0) {
+  if (open_stream(reader, &file, in_path) != 0) {
     free(reader);
     return 1;
   }
   const hqlc_container_info *info = hqlc_container_reader_info(reader);
   printf("%s\n  %s, %d Hz\n",
-         opts->in_path,
+         in_path,
          info->channels == 2 ? "stereo" : "mono",
          HQLC_SAMPLE_RATE);
   if (info->seekable) {
@@ -555,7 +549,10 @@ static int handle_info(const options *opts) {
 
 static void print_usage(const char *program) {
   fprintf(stderr,
-          "Usage: %s [options] input [output]\n"
+          "Usage: %s [options] input... [output]\n"
+          "\n"
+          "Inputs take * and ? wildcards. Several inputs write next to each one,\n"
+          "as .hqlc, .wav, or .hqlc.wav for a roundtrip.\n"
           "\n"
           "Modes:\n"
           "  (default)     Roundtrip: encode+decode to WAV for quality evaluation\n"
@@ -577,12 +574,62 @@ static void print_usage(const char *program) {
           program);
 }
 
+// Input path with the extension replaced, "-" stays stdout
+static char *derive_output(const char *input, const char *extension) {
+  const char *end = strrchr(input, '.');
+  if (strcmp(input, "-") == 0) {
+    extension = "-";
+    end = input;
+  } else if (!end || strpbrk(end, "/\\")) {
+    end = input + strlen(input);
+  }
+  size_t stem_len = (size_t)(end - input);
+  char *path = (char *)malloc(stem_len + strlen(extension) + 1);
+  if (path) {
+    memcpy(path, input, stem_len);
+    strcpy(path + stem_len, extension);
+  }
+  return path;
+}
+
+// Expand one positional into the input list
+static int add_inputs(options *opts, const char *pattern) {
+  char **paths = NULL;
+  size_t count = 0;
+  if (platform_glob(pattern, &paths, &count) != 0 || count == 0) {
+    fprintf(stderr, "error: no input matches '%s'\n", pattern);
+    return -2;
+  }
+  char **grown =
+      (char **)realloc(opts->inputs, (opts->input_count + count) * sizeof(char *));
+  if (!grown) {
+    free(paths);
+    return -2;
+  }
+  memcpy(grown + opts->input_count, paths, count * sizeof(char *));
+  opts->inputs = grown;
+  opts->input_count += count;
+  free(paths);
+  return 0;
+}
+
+static void options_free(options *opts) {
+  for (size_t i = 0; i < opts->input_count; i++) {
+    free(opts->inputs[i]);
+  }
+  free(opts->inputs);
+  ape_tags_free(&opts->tags);
+}
+
 /**
- * @brief Parse the command line into opts.
+ * @brief Parse the command line into opts
  *
- * @param argc Argument count
- * @param argv UTF-8 arguments
- * @param opts Receives the options, tags included, free with ape_tags_free().
+ * Positionals are inputs, the second of exactly two is the output unless it
+ * has wildcards
+ *
+ * @param argc Argument count.
+ * @param argv UTF-8 arguments.
+ * @param opts Receives the options, free with options_free().
  * @return 0 on success, -1 for a usage error, -2 for an error already reported.
  */
 static int parse_args(int argc, char **argv, options *opts) {
@@ -590,6 +637,8 @@ static int parse_args(int argc, char **argv, options *opts) {
   opts->mode = HQLC_MODE_RC;
   opts->bitrate = 128000;
   opts->out_bits = 16;
+  const char *positionals[argc];
+  size_t positional_count = 0;
   for (int i = 1; i < argc; i++) {
     const char *arg = argv[i];
     bool has_value = i + 1 < argc;
@@ -630,18 +679,52 @@ static int parse_args(int argc, char **argv, options *opts) {
 #endif
     } else if (arg[0] == '-' && arg[1] != '\0') {
       return -1;
-    } else if (!opts->in_path) {
-      opts->in_path = arg;
-    } else if (!opts->out_path) {
-      opts->out_path = arg;
     } else {
-      return -1;
+      positionals[positional_count++] = arg;
     }
   }
-  if (!opts->in_path || (!opts->out_path && opts->op != OP_INFO)) {
+  size_t input_count = positional_count;
+  if (opts->op != OP_INFO && positional_count == 2 && !strpbrk(positionals[1], "*?")) {
+    opts->out_path = positionals[1];
+    input_count = 1;
+  }
+  for (size_t i = 0; i < input_count; i++) {
+    if (add_inputs(opts, positionals[i]) != 0) {
+      return -2;
+    }
+  }
+  if (opts->input_count == 0) {
     return -1;
   }
   return 0;
+}
+
+// One input through the selected mode
+static int run_input(const options *opts, const char *in_path) {
+  static const char *extensions[] = {
+      [OP_ROUNDTRIP] = ".hqlc.wav", [OP_ENCODE] = ".hqlc", [OP_DECODE] = ".wav"};
+  if (opts->op == OP_INFO) {
+    return handle_info(in_path);
+  }
+  char *derived = NULL;
+  const char *out_path = opts->out_path;
+  if (!out_path) {
+    derived = derive_output(in_path, extensions[opts->op]);
+    if (!derived) {
+      return 1;
+    }
+    out_path = derived;
+  }
+  int ret = 1;
+  if (opts->op == OP_ENCODE) {
+    ret = handle_encode(opts, in_path, out_path);
+  } else if (opts->op == OP_DECODE) {
+    ret = handle_decode(opts, in_path, out_path);
+  } else if (opts->op == OP_ROUNDTRIP) {
+    ret = handle_roundtrip(opts, in_path, out_path);
+  }
+  free(derived);
+  return ret;
 }
 
 int main(int argc, char **argv) {
@@ -649,28 +732,19 @@ int main(int argc, char **argv) {
   options opts;
   int status = parse_args(argc, argv, &opts);
   int ret = 1;
-  if (status == 0) {
-    switch (opts.op) {
-    case OP_ENCODE:
-      ret = handle_encode(&opts);
-      break;
-    case OP_DECODE:
-      ret = handle_decode(&opts);
-      break;
-    case OP_INFO:
-      ret = handle_info(&opts);
-      break;
-    case OP_ROUNDTRIP:
-      ret = handle_roundtrip(&opts);
-      break;
-    case OP_HELP:
-      print_usage(argv[0]);
-      ret = 0;
-      break;
+  if (status == 0 && opts.op == OP_HELP) {
+    print_usage(argv[0]);
+    ret = 0;
+  } else if (status == 0) {
+    ret = 0;
+    for (size_t i = 0; i < opts.input_count; i++) {
+      if (run_input(&opts, opts.inputs[i]) != 0) {
+        ret = 1;
+      }
     }
   } else if (status == -1) {
     print_usage(argv[0]);
   }
-  ape_tags_free(&opts.tags);
+  options_free(&opts);
   return ret;
 }
