@@ -28,6 +28,7 @@ hqlc -e input.wav output.hqlc -t Title="..."   # encoe from WAV, adding apev2 ta
 hqlc -d output.hqlc decoded.wav [-s 12.5]      # decode, optionally from 12.5 s
 hqlc -i output.hqlc                            # print stream info and tags
 ffmpeg -i in.m4a -ar 48000 -f wav - | hqlc -e - out.hqlc  # pipe from ffmpeg
+hqlc -e "music/*.flac" -b 128000               # batch, writes music/*.hqlc
 ```
 
 The cli tool handles resampling from other sample rates automatically, using speex resampler.
