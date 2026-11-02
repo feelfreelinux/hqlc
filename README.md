@@ -4,11 +4,13 @@
 > Try it out in your browser: you can do an ABX test with your own files at [feelfreelinux.github.io/hqlc](https://feelfreelinux.github.io/hqlc)
 
 
-A low-complexity MDCT audio codec targeting 96 kbps+ stereo at 48 kHz, designed to run comfortably on embedded targets like the ESP32 while staying competitive with established codecs in audio quality.
+A low-complexity MDCT audio codec targeting 64 kbps+* stereo at 48 kHz, designed to run comfortably on embedded targets like the ESP32 while staying competitive with established codecs in audio quality.
 
 The codec supports 48 kHz sample rate only, with PCM16 or PCM24 input, at a fixed frame size of 512 samples (~10.67 ms).
 
 See [HQLC_DESIGN.md](HQLC_DESIGN.md) for a detailed write-up of the codec internals and design rationale. This readme only covers the build instructions & some benchmarks.
+
+* While 64kbps+ is tested as a stable operating point in recent versions, I recommend 128kbps+ for high quality use cases.
 
 ## Building
 
@@ -48,6 +50,14 @@ python -m misc.python input.wav output.wav -b 96000
 ```
 
 Take care that it might be out of sync with the C version, and is not optimized.
+
+## Third party integrations
+
+### Foobar2000
+
+https://www.foobar2000.org/components/view/foo_input_hqlc
+
+You can decode HQLC files in foobar2000, through a plugin maintained by Case.
 
 ## Benchmarks
 
