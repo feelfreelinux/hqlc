@@ -10,7 +10,7 @@ The codec supports 48 kHz sample rate only, with PCM16 or PCM24 input, at a fixe
 
 See [HQLC_DESIGN.md](HQLC_DESIGN.md) for a detailed write-up of the codec internals and design rationale. This readme only covers the build instructions & some benchmarks.
 
-* While 64kbps+ is tested as a stable operating point in recent versions, I recommend 128kbps+ for high quality use cases.
+\* While 64kbps+ is tested as a stable operating point, I recommend 128kbps+ for high quality use cases.
 
 ## Building
 
