@@ -1,6 +1,7 @@
 #include "quant.h"
 
 #include <limits.h>
+#include <stdint.h>
 
 #include "fxp.h"
 #include "hqlc.h"
@@ -129,7 +130,6 @@ void quant_forward(const bfp_i32 *spectrum,
         quant_bin(&quant_out[i], 0, 0);
       }
     } else if (scale.product_rshift >= 32) {
-      // Common case: only the high word of the product is needed
       int small_shift = scale.product_rshift - 32;
       for (; i < run_end; i++) {
         int32_t x = spec_q31[i];
@@ -166,7 +166,6 @@ void quant_forward(const bfp_i32 *spectrum,
   HQLC_BENCH_END(HQLC_BENCH_ENC_QLOOP);
 }
 
-// Inverse quantizer: integer symbols to reconstructed BFP spectrum
 void quant_inverse(const int16_t *quant_in,
                    const int32_t *exp_indices,
                    int gain_code,
@@ -180,12 +179,19 @@ void quant_inverse(const int16_t *quant_in,
   }
   int max_oct = (2 * max_exp - gain_code - QUANT_EXP_OFFSET) >> 3;
 
-  // Interpolated exponents never exceed the band max, so max_oct holds
   int32_t bin_exp[PSY_ACTIVE_BINS];
   bin_exp_interp(exp_indices, bin_exp);
 
-  // Find the max dequantized magnitude (for BFP headroom)
-  uint64_t max_val = 0;
+  // A bin dequantizes to (dq * step) >> oct_shift, a 64-bit product with its
+  // own shift. The block is then normalized so its largest bin sits just below
+  // full scale, which means that it has to be known first.
+  //
+  // This is optimized by first left-aligning each product to 32 bits and keeping the
+  // mantissa in the output, noting how many bits the bin would have after the shift. Then
+  // we shift each mantissa down so the largest bin has a single bit of headroom
+  uint8_t bin_bits[PSY_ACTIVE_BINS];
+  int max_bits = 0;
+
   for (int i = 0; i < PSY_ACTIVE_BINS; i++) {
     if (quant_in[i] == 0) {
       continue;
@@ -195,23 +201,29 @@ void quant_inverse(const int16_t *quant_in,
     int32_t step_m = quant_pow2_eighth_q30[E & 7] >> 2;
     int oct_shift = max_oct - (E >> 3);
     int32_t dq_q8 = fxp_rescale_i32(mag, 0, 8) + QUANT_CENTROID_Q8;
-    uint64_t val =
-        (oct_shift < 63) ? (uint64_t)((int64_t)dq_q8 * step_m >> oct_shift) : 0;
-    if (val > max_val) {
-      max_val = val;
+    // Always >= 2^36, so the high word is never zero and clz is safe
+    uint64_t product = (uint64_t)((int64_t)dq_q8 * step_m);
+    uint32_t product_hi = (uint32_t)(product >> 32);
+    int product_bits = 64 - __builtin_clz(product_hi);
+
+    // Get the mantissa
+    spec_q31[i] = (int32_t)(uint32_t)(product >> (product_bits - 32));
+
+    // get size of this bin (bins left in the priduct after the shift)
+    int bits = product_bits - oct_shift;
+    bin_bits[i] = (uint8_t)bits;
+    if (bits > max_bits) {
+      max_bits = bits;
     }
   }
 
-  if (max_val == 0) {
+  if (max_bits == 0) {
     for (int i = 0; i < HQLC_FRAME_SAMPLES; i++) {
       spec_q31[i] = 0;
     }
     spectrum->exp2 = 0;
     return;
   }
-
-  int headroom = (int)__builtin_clzll(max_val) - 1;
-  int norm_shift = 32 - headroom;
 
   for (int i = PSY_ACTIVE_BINS; i < HQLC_FRAME_SAMPLES; i++) {
     spec_q31[i] = 0;
@@ -222,17 +234,15 @@ void quant_inverse(const int16_t *quant_in,
       spec_q31[i] = 0;
       continue;
     }
-    int sign = (quant_in[i] > 0) ? 1 : -1;
-    int mag = (quant_in[i] > 0) ? quant_in[i] : -quant_in[i];
-    int E = 2 * (int)bin_exp[i] - gain_code - QUANT_EXP_OFFSET;
-    int32_t step_m = quant_pow2_eighth_q30[E & 7] >> 2;
-    int total_shift = (max_oct - (E >> 3)) + norm_shift;
-    int32_t dq_q8 = fxp_rescale_i32(mag, 0, 8) + QUANT_CENTROID_Q8;
-    spec_q31[i] =
-        (total_shift < 63) ? sign * (int32_t)((int64_t)dq_q8 * step_m >> total_shift) : 0;
+    // Mantissas have their top bit at bit 31. The largest bin moves down one
+    // (the headroom bit), a bin n bits smaller moves down n more
+    int rshift = max_bits - (int)bin_bits[i] + 1;
+    int32_t value = (rshift < 32) ? (int32_t)((uint32_t)spec_q31[i] >> rshift) : 0;
+    spec_q31[i] = (quant_in[i] > 0) ? value : -value;
   }
 
-  spectrum->exp2 = max_oct - headroom + 27;
+  // Same as max_oct - headroom + 27, with headroom = 63 - max_bits
+  spectrum->exp2 = max_oct + max_bits - 36;
 }
 
 /**

@@ -679,6 +679,7 @@ bool rans_decode_payload(const uint8_t *data,
   rans_dec_init(&dec, data, len);
 
   // Exponents come first in the stream (see rans_encode_payload)
+  HQLC_BENCH_BEGIN(HQLC_BENCH_DEC_ENT_EXP);
   if (exp_indices) {
     int32_t prev = 0;
     for (int b = 0; b < PSY_N_BANDS; b++) {
@@ -712,6 +713,7 @@ bool rans_decode_payload(const uint8_t *data,
       return false;
     }
   }
+  HQLC_BENCH_END(HQLC_BENCH_DEC_ENT_EXP);
 
   for (int ch = 0; ch < n_ch; ch++) {
     int16_t *ch_q = &quant_out[ch * HQLC_FRAME_SAMPLES];
@@ -734,6 +736,7 @@ bool rans_decode_payload(const uint8_t *data,
       const uint16_t *cf = rans_cf[tidx];
       HQLC_BENCH_END(HQLC_BENCH_DEC_RANS_DEC);
 
+      HQLC_BENCH_BEGIN(HQLC_BENCH_DEC_ENT_COEF);
       for (int i = s; i < e; i++) {
         uint8_t sym = rans_dec_sym(&dec, cf);
         int mag = sym;
@@ -758,10 +761,12 @@ bool rans_decode_payload(const uint8_t *data,
           ch_q[i] = 0;
         }
       }
+      HQLC_BENCH_END(HQLC_BENCH_DEC_ENT_COEF);
     }
   }
 
   // Noise-fill flags, contexts mirror the rans encode payload
+  HQLC_BENCH_BEGIN(HQLC_BENCH_DEC_ENT_NF);
   if (nf_mask) {
     memset(nf_mask, 0, (size_t)n_ch * PSY_N_BANDS * sizeof(nf_mode));
     int first = nf_first_band(gain_code);
@@ -793,6 +798,8 @@ bool rans_decode_payload(const uint8_t *data,
       }
     }
   }
+
+  HQLC_BENCH_END(HQLC_BENCH_DEC_ENT_NF);
 
   *header_crc = dec.state - RANS_L; // the decoder ends on the encoder's initial state
   return !dec.overrun;

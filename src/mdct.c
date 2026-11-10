@@ -1,5 +1,7 @@
 #include "mdct.h"
 
+#include <stdbool.h>
+#include <stdint.h>
 #include <string.h>
 
 #include "fxp.h"
@@ -9,6 +11,9 @@
 
 #define MDCT_DCT_BITS       10
 #define MDCT_MATH_GAIN_BITS 8
+
+// Headroom above PCM full scale in the overlap-add fixed-point domain
+#define MDCT_OLA_HEADROOM_BITS 4
 
 /**
  * @brief Return one sample from the mirrored 1024-point KBD window
@@ -30,54 +35,116 @@ static inline int32_t mul_q31_guard(int32_t a, int32_t b) {
 /**
  * @brief Branchless mag for OR-based headroom measurement.
  *
- * This is not a saturating abs for full int32, but it's good enough for the OR accumulator
- * to find highest occupied magnitude bit
+ * This is not a saturating abs for full int32, but it's good enough for the OR
+ * accumulator to find highest occupied magnitude bit
  */
 static inline uint32_t mag_or_i32(int32_t v) {
   return (uint32_t)(v ^ (v >> 31));
 }
 
 /**
- * @brief Window, align, and overlap-add one previous/current IMDCT pair.
+ * @brief Scale a DCT-IV output sample into the overlap-add fixed-point domain
  *
- * The signs are part of the MDCT unfold formula, callers pass +1 or -1 values
- * for the previous and current terms.
+ * @param shift_left Shift left when true, right otherwise
+ * @param shift Shift amount, 0-31 for left and 1-31 for right
  */
-static inline int32_t ola_mix_q31(int32_t prev_sample,
-                                  int32_t prev_window,
-                                  int prev_sign,
-                                  int prev_shift,
-                                  int32_t curr_sample,
-                                  int32_t curr_window,
-                                  int curr_sign,
-                                  int curr_shift,
-                                  int pcm_exp) {
-  int32_t prev_windowed = mul_q31_guard(prev_sample, prev_window);
-  int32_t curr_windowed = mul_q31_guard(curr_sample, curr_window);
-
-  if (prev_sign < 0) {
-    prev_windowed = -prev_windowed;
+static inline int32_t ola_to_fixed(int32_t v, bool shift_left, int shift) {
+  if (shift_left) {
+    int32_t shifted = (int32_t)((uint32_t)v << shift);
+    // Saturate if the shift dropped any bits
+    if ((shifted >> shift) != v) {
+      return (v < 0) ? INT32_MIN : INT32_MAX;
+    }
+    return shifted;
   }
-  if (curr_sign < 0) {
-    curr_windowed = -curr_windowed;
-  }
+  return (v >> shift) + ((v >> (shift - 1)) & 1);
+}
 
-  // Align the windowed samples to the current bfp domain
-  int32_t prev_aligned =
-      (prev_shift < 31) ? fxp_shr_rnd_i32(prev_windowed, prev_shift) : 0;
-  int32_t curr_aligned =
-      (curr_shift < 31) ? fxp_shr_rnd_i32(curr_windowed, curr_shift) : 0;
-
-  int32_t mixed = fxp_sat_i64_to_i32((int64_t)prev_aligned + curr_aligned);
-
-  // Apply the final PCM exponent after overlap-add
-  if (pcm_exp > 0) {
-    return fxp_shl_sat_i32(mixed, pcm_exp);
+/**
+ * @brief Round, clip and store one overlap-added sample as PCM
+ *
+ * @param base Interleaved PCM output buffer
+ * @param fmt PCM sample format
+ * @param idx Interleaved sample index
+ * @param v Sample in the overlap-add fixed-point domain
+ */
+static inline void ola_store(uint8_t *base, hqlc_pcm_format fmt, int idx, int32_t v) {
+  if (fmt == HQLC_PCM16) {
+    const int rshift = 30 - MDCT_OLA_HEADROOM_BITS - 15;
+    int32_t pcm16 = (v >> rshift) + ((v >> (rshift - 1)) & 1);
+    ((int16_t *)base)[idx] = (int16_t)fxp_clamp_i32(pcm16, INT16_MIN, INT16_MAX);
+  } else {
+    const int rshift = 30 - MDCT_OLA_HEADROOM_BITS - 23;
+    int32_t pcm24 = (v >> rshift) + ((v >> (rshift - 1)) & 1);
+    pcm24 = fxp_clamp_i32(pcm24, -(1 << 23), (1 << 23) - 1);
+    uint8_t *p = base + 3 * idx;
+    p[0] = (uint8_t)(pcm24 & 0xFF);
+    p[1] = (uint8_t)((pcm24 >> 8) & 0xFF);
+    p[2] = (uint8_t)((pcm24 >> 16) & 0xFF);
   }
-  if (pcm_exp < 0) {
-    return fxp_shr_rnd_i32(mixed, -pcm_exp);
+}
+
+/**
+ * @brief Overlap-add loop of ola_block_to_pcm, for one format and shift direction
+ *
+ * Always inlined with constant fmt and shift_left, so neither is tested per sample
+ */
+static inline __attribute__((always_inline)) void ola_block_loop(const int32_t *time,
+                                                                 int32_t *overlap,
+                                                                 bool shift_left,
+                                                                 int shift,
+                                                                 uint8_t *pcm_out,
+                                                                 hqlc_pcm_format fmt,
+                                                                 int stride,
+                                                                 int channel_idx) {
+  const int N = MDCT_N;
+  const int half_n = N / 2;
+  const int32_t *win = kbd_window_half_q31;
+
+  for (int j = 0; j < half_n; j++) {
+    int32_t p = overlap[j];
+    int32_t t = ola_to_fixed(time[N - 1 - j], shift_left, shift);
+    overlap[j] = ola_to_fixed(time[j], shift_left, shift);
+
+    int32_t c = win[half_n - 1 - j];
+    int32_t s = win[half_n + j];
+
+    int32_t first = mul_q31_guard(t, c) - mul_q31_guard(p, s);
+    int32_t second = -(mul_q31_guard(p, c) + mul_q31_guard(t, s));
+
+    ola_store(pcm_out, fmt, (half_n - 1 - j) * stride + channel_idx, first);
+    ola_store(pcm_out, fmt, (half_n + j) * stride + channel_idx, second);
   }
-  return mixed;
+}
+
+/**
+ * @brief Overlap-add one IMDCT block with the stored overlap into PCM
+ *
+ * @param time DCT-IV output of the current block
+ * @param overlap Stored first half of the previous block, replaced with this one's
+ * @param exp2 Block exponent relative to the overlap-add fixed-point domain, -31 to 31
+ * @param pcm_out Interleaved PCM output buffer
+ * @param fmt PCM sample format
+ * @param stride Number of interleaved channels in pcm_out
+ * @param channel_idx Channel to write
+ */
+static void ola_block_to_pcm(const int32_t *time,
+                             int32_t *overlap,
+                             int exp2,
+                             uint8_t *pcm_out,
+                             hqlc_pcm_format fmt,
+                             int stride,
+                             int channel_idx) {
+  // A separate copy of the loop per format and shift direction
+  if (fmt == HQLC_PCM16 && exp2 >= 0) {
+    ola_block_loop(time, overlap, true, exp2, pcm_out, HQLC_PCM16, stride, channel_idx);
+  } else if (fmt == HQLC_PCM16) {
+    ola_block_loop(time, overlap, false, -exp2, pcm_out, HQLC_PCM16, stride, channel_idx);
+  } else if (exp2 >= 0) {
+    ola_block_loop(time, overlap, true, exp2, pcm_out, HQLC_PCM24, stride, channel_idx);
+  } else {
+    ola_block_loop(time, overlap, false, -exp2, pcm_out, HQLC_PCM24, stride, channel_idx);
+  }
 }
 
 /**
@@ -167,21 +234,22 @@ static void fft_scaled(int32_t *buf) {
         int32_t raw2_re = buf[2 * i2], raw2_im = buf[2 * i2 + 1];
         int32_t raw3_re = buf[2 * i3], raw3_im = buf[2 * i3 + 1];
 
-        int32_t x1_re = fxp_mul_q31(raw1_re, w1_re) - fxp_mul_q31(raw1_im, w1_im);
-        int32_t x1_im = fxp_mul_q31(raw1_re, w1_im) + fxp_mul_q31(raw1_im, w1_re);
-        int32_t x2_re = fxp_mul_q31(raw2_re, w2_re) - fxp_mul_q31(raw2_im, w2_im);
-        int32_t x2_im = fxp_mul_q31(raw2_re, w2_im) + fxp_mul_q31(raw2_im, w2_re);
-        int32_t x3_re = fxp_mul_q31(raw3_re, w3_re) - fxp_mul_q31(raw3_im, w3_im);
-        int32_t x3_im = fxp_mul_q31(raw3_re, w3_im) + fxp_mul_q31(raw3_im, w3_re);
+        // >> 32 leaves the twiddled inputs already halved for the butterfly
+        int32_t h1_re = mul_q31_guard(raw1_re, w1_re) - mul_q31_guard(raw1_im, w1_im);
+        int32_t h1_im = mul_q31_guard(raw1_re, w1_im) + mul_q31_guard(raw1_im, w1_re);
+        int32_t h2_re = mul_q31_guard(raw2_re, w2_re) - mul_q31_guard(raw2_im, w2_im);
+        int32_t h2_im = mul_q31_guard(raw2_re, w2_im) + mul_q31_guard(raw2_im, w2_re);
+        int32_t h3_re = mul_q31_guard(raw3_re, w3_re) - mul_q31_guard(raw3_im, w3_im);
+        int32_t h3_im = mul_q31_guard(raw3_re, w3_im) + mul_q31_guard(raw3_im, w3_re);
 
-        int32_t even_sum_re = (x0_re >> 1) + (x2_re >> 1);
-        int32_t even_sum_im = (x0_im >> 1) + (x2_im >> 1);
-        int32_t even_diff_re = (x0_re >> 1) - (x2_re >> 1);
-        int32_t even_diff_im = (x0_im >> 1) - (x2_im >> 1);
-        int32_t odd_sum_re = (x1_re >> 1) + (x3_re >> 1);
-        int32_t odd_sum_im = (x1_im >> 1) + (x3_im >> 1);
-        int32_t odd_diff_re = (x1_re >> 1) - (x3_re >> 1);
-        int32_t odd_diff_im = (x1_im >> 1) - (x3_im >> 1);
+        int32_t even_sum_re = (x0_re >> 1) + h2_re;
+        int32_t even_sum_im = (x0_im >> 1) + h2_im;
+        int32_t even_diff_re = (x0_re >> 1) - h2_re;
+        int32_t even_diff_im = (x0_im >> 1) - h2_im;
+        int32_t odd_sum_re = h1_re + h3_re;
+        int32_t odd_sum_im = h1_im + h3_im;
+        int32_t odd_diff_re = h1_re - h3_re;
+        int32_t odd_diff_im = h1_im - h3_im;
 
         buf[2 * i0] = (even_sum_re >> 1) + (odd_sum_re >> 1);
         buf[2 * i0 + 1] = (even_sum_im >> 1) + (odd_sum_im >> 1);
@@ -197,19 +265,20 @@ static void fft_scaled(int32_t *buf) {
 }
 
 /**
- * @brief In-place DCT-IV implemented with a half-length complex FFT
+ * @brief DCT-IV implemented with a half-length complex FFT
  *
- * @param data Input/output buffer for DCT-IV
+ * @param in Input buffer, may be the same as out
+ * @param out Output buffer
  * @param work Scratch buffer for FFT
  */
-static void dct_iv(int32_t *data, int32_t *work) {
+static void dct_iv(const int32_t *in, int32_t *out, int32_t *work) {
   const int N = MDCT_N;
   const int N_FFT = MDCT_FFT_N;
 
   HQLC_BENCH_BEGIN(HQLC_BENCH_MDCT_PRE_TW);
   for (int k = 0; k < N_FFT; k++) {
-    int32_t even_sample = data[2 * k];
-    int32_t odd_mirror = data[N - 1 - 2 * k];
+    int32_t even_sample = in[2 * k];
+    int32_t odd_mirror = in[N - 1 - 2 * k];
     int32_t tw_re = lut_pre_twiddle_q31[2 * k];
     int32_t tw_im = lut_pre_twiddle_q31[2 * k + 1];
 
@@ -230,8 +299,8 @@ static void dct_iv(int32_t *data, int32_t *work) {
     int32_t tw_re = lut_post_twiddle_q31[2 * k];
     int32_t tw_im = lut_post_twiddle_q31[2 * k + 1];
 
-    data[2 * k] = mul_q31_guard(fft_re, tw_re) - mul_q31_guard(fft_im, tw_im);
-    data[N - 1 - 2 * k] = -(mul_q31_guard(fft_re, tw_im) + mul_q31_guard(fft_im, tw_re));
+    out[2 * k] = mul_q31_guard(fft_re, tw_re) - mul_q31_guard(fft_im, tw_im);
+    out[N - 1 - 2 * k] = -(mul_q31_guard(fft_re, tw_im) + mul_q31_guard(fft_im, tw_re));
   }
   HQLC_BENCH_END(HQLC_BENCH_MDCT_POST_TW);
 }
@@ -349,7 +418,7 @@ hqlc_error mdct_forward(const uint8_t *prev_pcm,
   HQLC_BENCH_END(HQLC_BENCH_MDCT_FOLD);
 
   int32_t *fft_work = (int32_t *)scratch;
-  dct_iv(folded, fft_work);
+  dct_iv(folded, folded, fft_work);
 
   spectrum->exp2 = folded_block.exp2 + MDCT_DCT_BITS;
   return HQLC_OK;
@@ -380,57 +449,24 @@ hqlc_error mdct_inverse_ola(const bfp_i32 *spectrum,
   }
 
   const int N = MDCT_N;
-  const int half_n = N / 2;
 
   int32_t *time = (int32_t *)scratch;
   int32_t *fft_work = &time[N];
-  memcpy(time, spectrum->data, (size_t)N * sizeof(int32_t));
 
-  dct_iv(time, fft_work);
+  dct_iv(spectrum->data, time, fft_work);
 
-  bfp_i32 current =
-      bfp_i32_view(time, N, spectrum->exp2 + MDCT_DCT_BITS - MDCT_MATH_GAIN_BITS);
-  if (!ola->has_overlap) {
-    ola->exp2 = current.exp2;
-    ola->has_overlap = true;
+  // Block exponent relative to the overlap-add fixed-point domain
+  int exp2 =
+      spectrum->exp2 + MDCT_DCT_BITS - MDCT_MATH_GAIN_BITS - MDCT_OLA_HEADROOM_BITS;
+
+  // Clamp the exp
+  if (exp2 > 31) {
+    exp2 = 31;
+  } else if (exp2 < -31) {
+    exp2 = -31;
   }
 
-  bfp_i32 previous = bfp_i32_view(ola->overlap, half_n, ola->exp2);
-  bfp_alignment alignment = bfp_i32_alignment(&previous, &current, 1);
-  int pcm_exp = alignment.common_exp2 + 1;
-
-  const int32_t *win = kbd_window_half_q31;
-  const int32_t *prev_time = ola->overlap;
-
-  for (int n = 0; n < half_n; n++) {
-    int32_t first_pcm = ola_mix_q31(prev_time[half_n - 1 - n],
-                                    win[N - 1 - n],
-                                    -1,
-                                    (int)alignment.a_rshift,
-                                    time[half_n + n],
-                                    win[n],
-                                    1,
-                                    (int)alignment.b_rshift,
-                                    pcm_exp);
-    pcm_store_q31(pcm_out, fmt, n * stride + channel_idx, first_pcm);
-
-    int32_t second_pcm = ola_mix_q31(prev_time[n],
-                                     win[half_n - 1 - n],
-                                     -1,
-                                     (int)alignment.a_rshift,
-                                     time[N - 1 - n],
-                                     win[half_n + n],
-                                     -1,
-                                     (int)alignment.b_rshift,
-                                     pcm_exp);
-    pcm_store_q31(pcm_out, fmt, (half_n + n) * stride + channel_idx, second_pcm);
-  }
-
-  bfp_i32 next_overlap = bfp_i32_view(time, half_n, current.exp2);
-  int overlap_headroom = bfp_i32_headroom(&next_overlap);
-  bfp_i32_renormalize(&next_overlap, (uint8_t)overlap_headroom);
-  memcpy(ola->overlap, next_overlap.data, (size_t)half_n * sizeof(*ola->overlap));
-  ola->exp2 = next_overlap.exp2;
+  ola_block_to_pcm(time, ola->overlap, exp2, pcm_out, fmt, stride, channel_idx);
 
   return HQLC_OK;
 }

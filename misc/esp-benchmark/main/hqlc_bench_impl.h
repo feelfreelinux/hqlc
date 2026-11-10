@@ -36,6 +36,10 @@ enum {
   HQLC_BENCH_ENC_INTERP,
   HQLC_BENCH_ENC_QLOOP,
   HQLC_BENCH_ENC_PROBE_BAND,
+  // Sub-stages of DEC_ENTROPY
+  HQLC_BENCH_DEC_ENT_EXP,
+  HQLC_BENCH_DEC_ENT_COEF,
+  HQLC_BENCH_DEC_ENT_NF,
   HQLC_BENCH_N_STAGES,
 };
 
@@ -86,6 +90,7 @@ static inline void hqlc_bench_init(hqlc_bench_ctx *ctx) {
       "mdct_fold",    "mdct_pre_tw",  "mdct_fft",      "mdct_post_tw",
       "enc_side_info", "enc_rans_enc", "enc_rans_tbl", "dec_rans_dec",
       "enc_interp",   "enc_qloop",    "enc_probe_band",
+      "dec_ent_exp",  "dec_ent_coef", "dec_ent_nf",
   };
   for (int i = 0; i < HQLC_BENCH_N_STAGES; i++) {
     ctx->stages[i].name = names[i];

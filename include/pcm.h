@@ -53,32 +53,6 @@ static inline int32_t pcm_load_native(const uint8_t *base, hqlc_pcm_format fmt, 
   return v;
 }
 
-/**
- * @brief Store a Q31 value as interleaved PCM.
- *
- * The stored value is rounded to the target format. PCM16 output is clamped to
- * the signed 16-bit range.
- *
- * @param base PCM buffer base pointer.
- * @param fmt PCM sample format.
- * @param idx Interleaved sample index.
- * @param val_q31 Q31 sample value to store.
- */
-static inline void
-pcm_store_q31(uint8_t *base, hqlc_pcm_format fmt, int idx, int32_t val_q31) {
-  if (fmt == HQLC_PCM16) {
-    int16_t *p = (int16_t *)base;
-    int32_t pcm16 = fxp_shr_rnd_i32(val_q31, 16);
-    p[idx] = (int16_t)fxp_clamp_i32(pcm16, INT16_MIN, INT16_MAX);
-  } else {
-    int32_t v = fxp_shr_rnd_i32(val_q31, 8);
-    uint8_t *p = base + 3 * idx;
-    p[0] = (uint8_t)(v & 0xFF);
-    p[1] = (uint8_t)((v >> 8) & 0xFF);
-    p[2] = (uint8_t)((v >> 16) & 0xFF);
-  }
-}
-
 #ifdef __cplusplus
 }
 #endif

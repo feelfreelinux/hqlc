@@ -22,9 +22,7 @@ extern "C" {
 
 // Overlap-add state for the decoder IMDCT
 typedef struct {
-  bool has_overlap;
-  int exp2;                    /**< BFP exponent of stored overlap */
-  int32_t overlap[MDCT_N / 2]; /**< first half of previous DCT-IV output */
+  int32_t overlap[MDCT_N / 2]; /**< first half of previous DCT-IV output, fixed point */
 } mdct_ola_state;
 
 /**
@@ -36,8 +34,6 @@ static inline void mdct_ola_init(mdct_ola_state *state) {
   if (!state) {
     return;
   }
-  state->has_overlap = false;
-  state->exp2 = 0;
   for (int i = 0; i < MDCT_N / 2; i++) {
     state->overlap[i] = 0;
   }
